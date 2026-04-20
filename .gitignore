@@ -200,3 +200,7 @@ debug_I2_zero_band
 .idea
 
 outputs/
+trajectories/
+
+# Local Bocconi configs (not for upstream)
+configs/bocconi/
