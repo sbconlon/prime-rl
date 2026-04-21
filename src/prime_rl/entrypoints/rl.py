@@ -70,7 +70,19 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
 
 
 def check_gpus_available(gpu_ids: list[int]) -> None:
-    """Raise error if there are existing processes on the specified GPUs."""
+    """Raise error if there are existing processes on the specified GPUs.
+
+    ``PRIME_RL_SKIP_GPU_CHECK=1`` is an opt-out to bypass the check for
+    MIG-partitioned environments.
+    """
+    if os.environ.get("PRIME_RL_SKIP_GPU_CHECK") == "1":
+        print(
+            "check_gpus_available: skipped (PRIME_RL_SKIP_GPU_CHECK=1). "
+            "Ensure your environment provides hardware-level GPU isolation (e.g. MIG).",
+            flush=True,
+        )
+        return
+
     pynvml.nvmlInit()
 
     occupied = []
@@ -85,7 +97,11 @@ def check_gpus_available(gpu_ids: list[int]) -> None:
         msg = "Existing processes found on GPUs:\n"
         for gpu_id, pids in occupied:
             msg += f"  GPU {gpu_id}: PIDs {pids}\n"
-        msg += "Kill these processes or use different GPUs."
+        msg += (
+            "Kill these processes or use different GPUs. "
+            "On MIG-partitioned systems where adjacent slices are hardware-isolated, "
+            "set PRIME_RL_SKIP_GPU_CHECK=1 to bypass this check."
+        )
         raise RuntimeError(msg)
 
 
