@@ -136,6 +136,27 @@ def train(config: TrainerConfig):
     loading_from_ckpt_later = config.ckpt and checkpoint_step is not None
     model = setup_model(config.model, parallel_dims, loading_from_ckpt_later)
 
+    # [perf-check] One-shot runtime verification of optimization-critical state.
+    # Catches silent regressions where the config claims FA2 / GPU rotary / compile
+    # but the model actually got eager attention / CPU rotary / no compile.
+    try:
+        inner = model
+        while hasattr(inner, "module"):
+            inner = inner.module
+        while hasattr(inner, "_orig_mod"):
+            inner = inner._orig_mod
+        attn_impl = getattr(getattr(inner, "config", None), "_attn_implementation", "unknown")
+        logger.info(f"[perf-check] attn_implementation: {attn_impl}")
+        try:
+            rotary_device = str(inner.model.rotary_emb.inv_freq.device)
+        except AttributeError:
+            rotary_device = "unknown (no inner.model.rotary_emb.inv_freq attr)"
+        logger.info(f"[perf-check] rotary_emb.inv_freq device: {rotary_device}")
+    except Exception as _perf_check_err:
+        logger.warning(f"[perf-check] runtime verification partially failed: {_perf_check_err}")
+    is_compiled = "OptimizedModule" in type(model).__name__ or hasattr(model, "_orig_mod")
+    logger.info(f"[perf-check] model torch.compile'd: {is_compiled}")
+
     logger.info(f"Initializing tokenizer ({config.tokenizer})")
     tokenizer = setup_tokenizer(config.tokenizer)
 
