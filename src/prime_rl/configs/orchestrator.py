@@ -521,6 +521,49 @@ class BufferConfig(BaseConfig):
         ),
     ] = False
 
+    curriculum: Annotated[
+        list[int] | None,
+        Field(
+            description=(
+                "Per-stage step durations for curriculum learning. List length defines "
+                "number of stages; each int is the step duration of that stage. "
+                "When set, the buffer samples each row weighted by "
+                "`row['curriculum_weights'][buffer.stage]`. After the cumulative step "
+                "count exceeds the schedule, the buffer falls back to uniform sampling "
+                "and `online_difficulty_filtering` is auto-enabled. Required: each row "
+                "in the dataset must have a `curriculum_weights` field with at least "
+                "len(curriculum) entries (Environment side annotates this). None "
+                "disables curriculum (legacy uniform-within-env sampling)."
+            ),
+        ),
+    ] = None
+
+    adaptive_advance_threshold: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Rolling solve-rate threshold for adaptive trigger LOGGING. When the "
+                "current stage's rolling solve rate exceeds this, a "
+                "'would-have-advanced' event is logged but no behavior change occurs "
+                "(advances are scheduled). Used only when curriculum is set."
+            ),
+        ),
+    ] = 0.30
+
+    adaptive_window_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Rolling window size (number of rollout groups) for tracking the "
+                "current curriculum stage's solve rate. Used by the adaptive trigger "
+                "logging."
+            ),
+        ),
+    ] = 20
+
     hash_keys: Annotated[
         list[str],
         Field(

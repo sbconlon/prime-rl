@@ -1,7 +1,9 @@
+import bisect
 import hashlib
+import itertools
 import json
 import random
-from collections import defaultdict
+from collections import defaultdict, deque
 from functools import partial
 from pathlib import Path
 from typing import cast
@@ -76,6 +78,145 @@ class Buffer:
         self.rollout_buffer: list[vf.RolloutOutput] = []
 
         self.reset_step_metrics()
+
+        # Curriculum state ----------------------------------------------------
+        # Stage index. Always present (0 if curriculum disabled). Updated by
+        # maybe_advance_stage() based on cumulative step boundaries.
+        self.stage: int = 0
+
+        # True iff curriculum is configured AND we have not yet advanced past
+        # the last scheduled stage. Set False on post-curriculum handoff.
+        self.curriculum_active: bool = bool(self.config.curriculum)
+
+        # Cache of (examples_list, weights) per env, valid for current stage only.
+        # Invalidated on stage advance.
+        self._curriculum_weights_cache: dict[str, tuple[list[dict], list[float]]] = {}
+
+        # Rolling solve-rate window for adaptive-trigger logging.
+        self._stage_solve_rate_window: deque = deque(maxlen=self.config.adaptive_window_size)
+        self._adaptive_already_logged_for_stage: bool = False
+
+        if self.curriculum_active:
+            self.logger.info(
+                f"Curriculum enabled: {len(self.config.curriculum)} stages with "
+                f"durations {self.config.curriculum} steps "
+                f"(adaptive logging threshold={self.config.adaptive_advance_threshold}, "
+                f"window={self.config.adaptive_window_size})"
+            )
+            # Safety: warn loudly if config requested curriculum but no rows have weights.
+            # (Without curriculum_weights on rows, sampling silently falls back to uniform.)
+            has_weights = any(
+                "curriculum_weights" in ex
+                for env_examples in self.example_buffer.values()
+                for ex in env_examples.values()
+            )
+            if not has_weights:
+                self.logger.warning(
+                    "config.curriculum is set but NO rows in the dataset have a "
+                    "`curriculum_weights` field. Buffer will silently fall back to "
+                    "uniform sampling. Did you forget to pass `curriculum=...` to "
+                    "load_environment for the relevant env(s)?"
+                )
+
+    # ------------------------------------------------------------------------
+    # Curriculum stage management
+    # ------------------------------------------------------------------------
+
+    def maybe_advance_stage(self, step: int) -> bool:
+        """Advance curriculum stage if `step` has crossed a stage boundary.
+
+        Called by the orchestrator at the top of each step loop iteration.
+        Computes the new stage from cumulative step boundaries derived from
+        config.curriculum. On a transition, invalidates the per-env weight
+        cache and resets adaptive trigger state for the new stage.
+
+        When the new stage exceeds the configured number of stages (post-
+        curriculum), curriculum_active is set False and online_difficulty_filtering
+        is enabled for the steady-state handoff.
+
+        Returns True if a transition just fired (for logging / metrics).
+        """
+        if not self.config.curriculum:
+            return False
+
+        cumulative_boundaries = list(itertools.accumulate(self.config.curriculum))
+        new_stage = bisect.bisect_right(cumulative_boundaries, step)
+        if new_stage == self.stage:
+            return False
+
+        old_stage = self.stage
+        self.stage = new_stage
+
+        # Invalidate caches and reset adaptive state for the new stage
+        self._curriculum_weights_cache.clear()
+        self._stage_solve_rate_window.clear()
+        self._adaptive_already_logged_for_stage = False
+
+        if new_stage >= len(self.config.curriculum):
+            self.curriculum_active = False
+            self.config.online_difficulty_filtering = True
+            self.logger.info(
+                f"Curriculum complete at step {step} (stage {old_stage} -> "
+                f"post-curriculum). Enabled online_difficulty_filtering for handoff."
+            )
+        else:
+            self.logger.info(
+                f"Curriculum advanced: stage {old_stage} -> {new_stage} at step {step}"
+            )
+        return True
+
+    def _get_curriculum_weighted_examples(
+        self, env_name: str
+    ) -> tuple[list[dict], list[float]]:
+        """Return (examples_list, weights) for an env at the current stage.
+
+        Cached per stage (cache cleared on stage advance). Falls back to
+        uniform weights if every row's stage weight resolves to zero.
+        """
+        if env_name in self._curriculum_weights_cache:
+            return self._curriculum_weights_cache[env_name]
+
+        examples = list(self.example_buffer[env_name].values())
+        weights: list[float] = []
+        for ex in examples:
+            ex_weights = ex.get("curriculum_weights")
+            if ex_weights is None or self.stage >= len(ex_weights):
+                weights.append(1.0)
+            else:
+                w = float(ex_weights[self.stage])
+                weights.append(max(0.0, w))
+
+        if sum(weights) <= 0.0:
+            self.logger.warning(
+                f"All curriculum weights at stage {self.stage} for env "
+                f"'{env_name}' are zero. Falling back to uniform sampling."
+            )
+            weights = [1.0] * len(examples)
+
+        self._curriculum_weights_cache[env_name] = (examples, weights)
+        return examples, weights
+
+    def _maybe_log_adaptive_trigger(self) -> None:
+        """Log a 'would-have-advanced' event once per stage if the rolling
+        solve rate exceeds the configured threshold. Diagnostic only — does
+        not change sampling behavior.
+        """
+        if self._adaptive_already_logged_for_stage:
+            return
+        # Require the window to be at least half-full before evaluating, to
+        # avoid spurious triggers from a few lucky early rollout groups.
+        max_size = self._stage_solve_rate_window.maxlen
+        if max_size is None or len(self._stage_solve_rate_window) < max(1, max_size // 2):
+            return
+        rolling_rate = sum(self._stage_solve_rate_window) / len(self._stage_solve_rate_window)
+        if rolling_rate >= self.config.adaptive_advance_threshold:
+            self.logger.info(
+                f"[curriculum-adaptive] Stage {self.stage} rolling solve rate "
+                f"{rolling_rate:.3f} >= threshold {self.config.adaptive_advance_threshold} "
+                f"(window={len(self._stage_solve_rate_window)}). "
+                f"Would-have-advanced if adaptive trigger were enabled."
+            )
+            self._adaptive_already_logged_for_stage = True
 
     def get_example_hash(self, example: dict) -> str:
         """Returns a hash of the example based on hash keys."""
@@ -192,7 +333,14 @@ class Buffer:
             self.logger.debug("No easy/ hard examples or rollouts found in checkpoint")
 
     def sample_examples(self, n: int) -> list[dict]:
-        """Samples n examples from the buffer, respecting env ratios."""
+        """Samples n examples from the buffer, respecting env ratios.
+
+        When `curriculum_active` is True, the within-env sampling step uses
+        per-row weights from `row["curriculum_weights"][self.stage]` (cached
+        per stage). Otherwise within-env sampling is uniform random (legacy
+        behavior). Env-level sampling (via env_probs) is unchanged in either
+        mode.
+        """
 
         non_empty_envs = [env for env, examples in self.example_buffer.items() if examples]
 
@@ -202,7 +350,11 @@ class Buffer:
         non_empty_env_probs = [self.env_probs[env] for env in non_empty_envs]
         sampled_examples = []
         for sampled_env in random.choices(non_empty_envs, weights=non_empty_env_probs, k=n):
-            sampled_example = random.choice(list(self.example_buffer[sampled_env].values()))
+            if self.curriculum_active:
+                examples, weights = self._get_curriculum_weighted_examples(sampled_env)
+                sampled_example = random.choices(examples, weights=weights, k=1)[0]
+            else:
+                sampled_example = random.choice(list(self.example_buffer[sampled_env].values()))
             sampled_examples.append(sampled_example)
 
         return sampled_examples
@@ -217,6 +369,12 @@ class Buffer:
         for example_id, example_rollouts in rollouts_by_example.items():
             avg_reward = mean([r["reward"] for r in example_rollouts])
             env_name = example_rollouts[0]["task"]
+
+            # Curriculum: track rolling solve rate at current stage and log
+            # adaptive-trigger events. Diagnostic only.
+            if self.curriculum_active:
+                self._stage_solve_rate_window.append(float(avg_reward))
+                self._maybe_log_adaptive_trigger()
 
             if self.config.easy_threshold is not None and avg_reward >= self.config.easy_threshold:
                 pool = "easy"

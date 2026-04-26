@@ -449,6 +449,9 @@ async def orchestrate(config: OrchestratorConfig):
         if config.max_steps and progress.step >= config.max_steps:
             break
 
+        # Advance curriculum stage if step has crossed a boundary (no-op if curriculum disabled)
+        buffer.maybe_advance_stage(progress.step)
+
         logger.info(f"Starting orchestrator step {progress.step}")
         step_start_time = time.perf_counter()
 
