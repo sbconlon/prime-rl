@@ -649,6 +649,10 @@ def test_arm_q_plus_target_phi_plus_g():
         g[0] = gamma^0 * 1.0 + gamma^1 * 0 = 1.0
         Q+=0.5, V=0.2 -> phi = max(0, 0.3) = 0.3
         q_plus_target = 0.3 + 1.0 = 1.3
+
+    Sampled value 0.5 is placed in slot 0 of the candidates so the upstream
+    invariant `q_plus_sampled[k] in q_plus_candidates[k, :]` (Phase 5 sampled-
+    action substitution) holds.
     """
     sample = _make_sample(completion_len=1)
     out = arm_regret_matching_advantage_fn(
@@ -660,6 +664,7 @@ def test_arm_q_plus_target_phi_plus_g():
             n_step=5,
             v_all=torch.tensor([0.2]),
             q_plus_sampled_all=torch.tensor([0.5]),
+            q_plus_candidates=torch.tensor([[0.5, 0.0, 0.0, 0.0]]),
             K=4,
         )
     )
@@ -672,6 +677,9 @@ def test_arm_q_plus_target_phi_clipped_when_negative():
 
     Setup: same as above but Q+=0.1, V=0.4 -> phi = max(0, -0.3) = 0.
         q_plus_target = 0 + 1.0 = 1.0 (only g contributes; phi was clipped out).
+
+    Sampled value 0.1 is placed in slot 0 of the candidates so the upstream
+    invariant `q_plus_sampled[k] in q_plus_candidates[k, :]` holds.
     """
     sample = _make_sample(completion_len=1)
     out = arm_regret_matching_advantage_fn(
@@ -683,6 +691,7 @@ def test_arm_q_plus_target_phi_clipped_when_negative():
             n_step=5,
             v_all=torch.tensor([0.4]),
             q_plus_sampled_all=torch.tensor([0.1]),
+            q_plus_candidates=torch.tensor([[0.1, 0.0, 0.0, 0.0]]),
             K=4,
         )
     )
