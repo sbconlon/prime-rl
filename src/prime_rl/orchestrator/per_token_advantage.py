@@ -63,41 +63,36 @@ class ArmAdvantageInputs:
     view of one rollout's interleaved samples. All per-token tensors are
     pre-computed by the Advantage Server's compute layer (Phase 6.5)
     before this function is called -- including the K candidate Q+
-    evaluations at every completion-mask=True position AND the previous
-    iteration's V/Q+ at the sampled action (needed for the CFR+
-    accumulation term phi).
+    evaluations at every completion-mask=True position.
 
     Lengths:
         Let `N_active = sum(sum(s.completion_mask) for s in samples)`.
-        `v_all`, `v_target_all`, `v_prev_all`, `q_plus_sampled_all`, and
-        `q_plus_prev_sampled_all` are all length `N_active`.
-        `q_plus_candidates` is shape `[N_active, K]` where K is fixed
-        (32 per Phase 5's commitment) and each row's K values match the
-        order of `samples[i].completion_top_k_token_ids[k]` (Phase 5).
+        `v_all`, `v_target_all`, `q_plus_sampled_all` are all length
+        `N_active`. `q_plus_candidates` is shape `[N_active, K]` where K
+        is fixed (32 per Phase 5's commitment) and each row's K values
+        match the order of `samples[i].completion_top_k_token_ids[k]`
+        (Phase 5).
 
     Iteration semantics:
-        `v_all` and `q_plus_*_all` (without `_prev`) are CURRENT iteration
-        network outputs (theta_t, omega_t).
-        `v_prev_all` and `q_plus_prev_sampled_all` are PREVIOUS iteration
-        network outputs (theta_{t-1}, omega_{t-1}). They participate only
-        in the phi (CFR+ accumulation) term of q_plus_target; advantages
-        and v_target use only the current iteration's tensors.
-        `v_target_all` is the slow-Polyak-copy of V (phi parameter), used
-        only for n-step return bootstrapping.
+        ARM's regret-matching policy and CFR+ accumulation both reference
+        the V/Q+ network at iteration t-1 (the "before-this-step" weights).
+        In our prime-rl pipeline that is exactly the V/Q+ at
+        advantage-computation time -- the Advantage Server queries its
+        ValueNetworkBackbone before the Advantage Trainer's update for
+        this step has run. So `v_all` and `q_plus_*` are simultaneously
+        "previous iteration" values (per the ARM paper's notation) and
+        the only V/Q+ snapshot available at this point in the pipeline.
+        `v_target_all` is the slow-Polyak-copy of V (mu parameter in
+        Algorithm 1), used only for n-step return bootstrapping.
     """
 
     samples: list[TrainingSample]
     episodic_reward: float
     is_terminal: bool
-    # current iteration
-    v_all: Tensor                           # [N_active] -- V(o_k; theta_t)
-    q_plus_sampled_all: Tensor              # [N_active] -- Q+(o_k, a_k; omega_t)
-    q_plus_candidates: Tensor               # [N_active, K] -- Q+(o_k, a; omega_t) for K candidates
-    # slow target (Polyak-averaged)
-    v_target_all: Tensor                    # [N_active] -- V_target(o_k; phi)
-    # previous iteration (for CFR+ accumulation)
-    v_prev_all: Tensor                      # [N_active] -- V(o_k; theta_{t-1})
-    q_plus_prev_sampled_all: Tensor         # [N_active] -- Q+(o_k, a_k; omega_{t-1})
+    v_all: Tensor                           # [N_active] -- V(o_k)
+    q_plus_sampled_all: Tensor              # [N_active] -- Q+(o_k, a_k)
+    q_plus_candidates: Tensor               # [N_active, K] -- Q+(o_k, a) for K candidates
+    v_target_all: Tensor                    # [N_active] -- V_target(o_k; mu)
     gamma: float = 0.99
     n_step: int = 5                         # n-step return horizon
 
@@ -282,40 +277,40 @@ def _n_step_return(
 def arm_regret_matching_advantage_fn(inputs: ArmAdvantageInputs) -> PerTokenAdvantageOutputs:
     """Token-level CFR+-style regret-matching advantage for ARM.
 
-    For each completion-mask=True position k, with current-iter networks
-    (theta_t, omega_t), previous-iter networks (theta_{t-1}, omega_{t-1}),
-    and Polyak-target network (phi):
+    For each completion-mask=True position k (with V/Q+ from the single
+    pre-trainer-update network snapshot, and V_target = mu the slow Polyak
+    copy):
 
         # 1. n-step return using V_target for stable bootstrapping
         g_k = sum_{k'=k}^{k+n-1} gamma^(k'-k) * r_{k'}
-              + gamma^n * V_target(o_{k+n}; phi)
+              + gamma^h * V_target_at_horizon(o_{k+h}; mu)
+        where h = min(n_step, N_active - k); for interior horizons the
+        bootstrap is v_target_all[k+n_step], at the trajectory boundary
+        it is 0 (terminal) or v_target_all[-1] (truncated).
 
-        # 2. Previous iteration's clipped advantage (CFR+ accumulation)
-        phi_k = max(0, Q_plus(o_k, a_k; omega_{t-1}) - V(o_k; theta_{t-1}))
+        # 2. CFR+ accumulation term
+        phi_k = max(0, Q_plus(o_k, a_k) - V(o_k))
 
         # 3. Regression targets for the Advantage Trainer (Phase 7)
         q_plus_target_k = phi_k + g_k    # historical clip + fresh n-step return
         v_target_k      = g_k
 
-        # 4. Current advantage for regret matching (raw, value-relative)
-        A_plus = Q_plus(o_k, a_k; omega_t) - V(o_k; theta_t)
-
-        # 5. Normalize over the K-candidate action set (centered policy advantage)
-        q_vals = [max(0, Q_plus(o_k, a; omega_t) - V(o_k; theta_t)) for a in S_k]
+        # 4. Regret-matching normalized advantage
+        A_plus = Q_plus(o_k, a_k) - V(o_k)
+        q_vals = [max(0, Q_plus(o_k, a) - V(o_k)) for a in S_k]
         total  = sum(q_vals)
         adv = max(0, A_plus) / total - 1/K       if total >= 1e-8
         adv = 0.0                                 otherwise (cold-start)
 
-    Why phi uses *previous* iteration's networks: that's what makes Q+
-    target a CFR+ recurrence (target = historical clipped advantage +
-    fresh return), which is what gives ARM its O(sqrt(T)) regret bound.
-    Without the phi term Q+ would just be regressing against the n-step
-    return and would have no memory of past iterations.
-
-    Why advantage uses *current* iteration's V baseline: A_plus is the
-    quantity the policy update consumes. It must be computed against the
-    networks the policy is being optimized against (current iter), not
-    against historical networks.
+    Why this single set of V/Q+ values serves both phi (CFR+ accumulation)
+    and the regret-matching policy: at advantage-computation time, only
+    one snapshot of the network exists -- the weights that the
+    Advantage Server's ValueNetworkBackbone holds, which were broadcast
+    from the Advantage Trainer's previous update. Per the ARM paper's
+    notation these are theta_{t-1} / omega_{t-1}; ARM uses these for
+    both the phi term and the regret-matching policy. The Advantage
+    Trainer has not yet run *this* step's update, so theta_t / omega_t
+    do not yet exist. We collapse the algorithmic distinction.
 
     Output is per-completion-token (NOT per-mask=True): mask=False positions
     receive 0.0 for all three outputs.
@@ -336,17 +331,13 @@ def arm_regret_matching_advantage_fn(inputs: ArmAdvantageInputs) -> PerTokenAdva
 
     v_all = inputs.v_all
     v_target_all = inputs.v_target_all
-    v_prev_all = inputs.v_prev_all
     q_plus_sampled = inputs.q_plus_sampled_all
-    q_plus_prev_sampled = inputs.q_plus_prev_sampled_all
     q_plus_candidates = inputs.q_plus_candidates
 
     for name, t in [
         ("v_all", v_all),
         ("v_target_all", v_target_all),
-        ("v_prev_all", v_prev_all),
         ("q_plus_sampled_all", q_plus_sampled),
-        ("q_plus_prev_sampled_all", q_plus_prev_sampled),
     ]:
         if tuple(t.shape) != (n_active,):
             raise ValueError(f"{name} shape {tuple(t.shape)} != ({n_active},)")
@@ -369,8 +360,8 @@ def arm_regret_matching_advantage_fn(inputs: ArmAdvantageInputs) -> PerTokenAdva
         rewards[-1] = inputs.episodic_reward
     g = _n_step_return(rewards, v_target_all, n_step, gamma, inputs.is_terminal)
 
-    # ----- 2. CFR+ accumulation term phi_k from previous iteration's networks -----
-    phi = torch.clamp(q_plus_prev_sampled - v_prev_all, min=0.0)
+    # ----- 2. CFR+ accumulation term phi_k -----
+    phi = torch.clamp(q_plus_sampled - v_all, min=0.0)
 
     # ----- 3. Regression targets -----
     q_plus_targets_active = phi + g

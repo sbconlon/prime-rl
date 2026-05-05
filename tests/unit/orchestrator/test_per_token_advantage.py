@@ -72,9 +72,7 @@ def _arm_inputs(
     is_terminal: bool = True,
     v_all: torch.Tensor | None = None,
     v_target_all: torch.Tensor | None = None,
-    v_prev_all: torch.Tensor | None = None,
     q_plus_sampled_all: torch.Tensor | None = None,
-    q_plus_prev_sampled_all: torch.Tensor | None = None,
     q_plus_candidates: torch.Tensor | None = None,
     gamma: float = 0.99,
     n_step: int = 5,
@@ -88,12 +86,8 @@ def _arm_inputs(
         is_terminal=is_terminal,
         v_all=torch.zeros(n_active) if v_all is None else v_all,
         v_target_all=torch.zeros(n_active) if v_target_all is None else v_target_all,
-        v_prev_all=torch.zeros(n_active) if v_prev_all is None else v_prev_all,
         q_plus_sampled_all=(
             torch.zeros(n_active) if q_plus_sampled_all is None else q_plus_sampled_all
-        ),
-        q_plus_prev_sampled_all=(
-            torch.zeros(n_active) if q_plus_prev_sampled_all is None else q_plus_prev_sampled_all
         ),
         q_plus_candidates=(
             torch.zeros(n_active, K) if q_plus_candidates is None else q_plus_candidates
@@ -555,50 +549,6 @@ def test_arm_advantage_uses_v_baseline_subtraction():
     assert abs(out_v0.advantages[0][0] - out_v04.advantages[0][0]) > 1e-3
 
 
-def test_arm_advantage_uses_current_v_not_v_prev():
-    """v_prev_all participates only in q_plus_target's phi term, not in advantages.
-
-    Two runs differ only in v_prev_all; advantages must be identical (because
-    the regret-matching denominator/numerator use v_all, not v_prev_all).
-    q_plus_targets WILL differ between the two runs -- that's expected.
-
-    Setup: hold q_plus_prev_sampled fixed at non-zero so phi is genuinely
-    sensitive to v_prev_all. With phi = max(0, q_plus_prev - v_prev):
-      - run a: v_prev=0.0 -> phi = max(0, 1.0 - 0.0) = 1.0
-      - run b: v_prev=0.5 -> phi = max(0, 1.0 - 0.5) = 0.5
-    """
-    sample = _make_sample(completion_len=2)
-    q_cand = torch.tensor([[2.0, 0.0, 0.0, 0.0], [1.5, 0.5, 0.0, 0.0]])
-    q_samp = torch.tensor([2.0, 1.5])
-    q_prev = torch.tensor([1.0, 1.0])  # non-zero so phi is sensitive to v_prev
-    out_a = arm_regret_matching_advantage_fn(
-        _arm_inputs(
-            [sample],
-            v_all=torch.tensor([0.0, 0.0]),
-            v_prev_all=torch.tensor([0.0, 0.0]),
-            q_plus_sampled_all=q_samp.clone(),
-            q_plus_prev_sampled_all=q_prev.clone(),
-            q_plus_candidates=q_cand.clone(),
-            K=4,
-        )
-    )
-    out_b = arm_regret_matching_advantage_fn(
-        _arm_inputs(
-            [sample],
-            v_all=torch.tensor([0.0, 0.0]),
-            v_prev_all=torch.tensor([0.5, 0.5]),  # different from run a
-            q_plus_sampled_all=q_samp.clone(),
-            q_plus_prev_sampled_all=q_prev.clone(),
-            q_plus_candidates=q_cand.clone(),
-            K=4,
-        )
-    )
-    # advantages must be identical -- v_prev_all does not affect them.
-    assert out_a.advantages == out_b.advantages
-    # q_plus_targets DO depend on v_prev_all via phi.
-    assert out_a.q_plus_targets != out_b.q_plus_targets
-
-
 # ---- Cold-start degenerate branch ---------------------------------------
 
 
@@ -693,11 +643,11 @@ def test_arm_advantage_sum_to_zero_across_action_set():
 
 
 def test_arm_q_plus_target_phi_plus_g():
-    """q_plus_target = phi + g, where phi = max(0, Q+_prev - V_prev), g = n-step return.
+    """q_plus_target = phi + g, where phi = max(0, Q+ - V), g = n-step return.
 
     Setup: 1 position, terminal, ep_r=1.0, gamma=0.99, n_step=5 (>= N=1 so g hits boundary).
         g[0] = gamma^0 * 1.0 + gamma^1 * 0 = 1.0
-        Q+_prev=0.5, V_prev=0.2 -> phi = max(0, 0.3) = 0.3
+        Q+=0.5, V=0.2 -> phi = max(0, 0.3) = 0.3
         q_plus_target = 0.3 + 1.0 = 1.3
     """
     sample = _make_sample(completion_len=1)
@@ -708,8 +658,8 @@ def test_arm_q_plus_target_phi_plus_g():
             is_terminal=True,
             gamma=0.99,
             n_step=5,
-            v_prev_all=torch.tensor([0.2]),
-            q_plus_prev_sampled_all=torch.tensor([0.5]),
+            v_all=torch.tensor([0.2]),
+            q_plus_sampled_all=torch.tensor([0.5]),
             K=4,
         )
     )
@@ -718,9 +668,9 @@ def test_arm_q_plus_target_phi_plus_g():
 
 
 def test_arm_q_plus_target_phi_clipped_when_negative():
-    """phi is clipped to zero when Q+_prev - V_prev < 0; only g contributes.
+    """phi is clipped to zero when Q+ - V < 0; only g contributes.
 
-    Setup: same as above but Q+_prev=0.1, V_prev=0.4 -> phi = max(0, -0.3) = 0.
+    Setup: same as above but Q+=0.1, V=0.4 -> phi = max(0, -0.3) = 0.
         q_plus_target = 0 + 1.0 = 1.0 (only g contributes; phi was clipped out).
     """
     sample = _make_sample(completion_len=1)
@@ -731,8 +681,8 @@ def test_arm_q_plus_target_phi_clipped_when_negative():
             is_terminal=True,
             gamma=0.99,
             n_step=5,
-            v_prev_all=torch.tensor([0.4]),
-            q_plus_prev_sampled_all=torch.tensor([0.1]),
+            v_all=torch.tensor([0.4]),
+            q_plus_sampled_all=torch.tensor([0.1]),
             K=4,
         )
     )
@@ -888,8 +838,6 @@ def test_arm_deterministic_inputs_yield_deterministic_output():
     q_samp = q_cand[:, 0].clone()
     v_target = torch.rand(5)
     v_curr = torch.rand(5)
-    v_prev = torch.rand(5)
-    q_prev = torch.rand(5)
 
     def run() -> PerTokenAdvantageOutputs:
         return arm_regret_matching_advantage_fn(
@@ -899,9 +847,7 @@ def test_arm_deterministic_inputs_yield_deterministic_output():
                 is_terminal=True,
                 v_all=v_curr.clone(),
                 v_target_all=v_target.clone(),
-                v_prev_all=v_prev.clone(),
                 q_plus_sampled_all=q_samp.clone(),
-                q_plus_prev_sampled_all=q_prev.clone(),
                 q_plus_candidates=q_cand.clone(),
                 gamma=0.97,
                 n_step=3,
