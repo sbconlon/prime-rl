@@ -28,6 +28,14 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
 
     routed_experts: list[list[list[int]]] | None = None  # [seq_len, layers, topk]
 
+    # Phase 5: per-completion-token top-K candidate token IDs for ARM regret
+    # matching. When non-None: outer length == len(completion_ids); inner
+    # length == top_k_action_set_size from the rollout config; the sampled
+    # token at position i is guaranteed present in completion_top_k_token_ids[i]
+    # (Phase 5's substitute_sampled_into_top_k upholds this invariant). None
+    # for GRPO and PPO.
+    completion_top_k_token_ids: list[list[int]] | None = None
+
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A batch of training examples with metadata for transport."""

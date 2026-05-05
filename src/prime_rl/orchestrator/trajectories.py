@@ -305,6 +305,13 @@ def interleave_rollout(
             len(tokens["prompt_ids"]) + len(tokens["completion_ids"]),
         )
 
+        # Phase 5: copy per-token top-K candidate IDs if present in the rollout
+        # output. None for GRPO; populated for ARM/PPO when the inference path
+        # produces it (Phase 5b wires the verifiers / vLLM extraction).
+        completion_top_k_token_ids = tokens.get("completion_top_k_token_ids")
+        if completion_top_k_token_ids is not None:
+            completion_top_k_token_ids = [list(row) for row in completion_top_k_token_ids]
+
         return TrainingSample(
             prompt_ids=list(tokens["prompt_ids"]),
             prompt_mask=[bool(i) for i in tokens["prompt_mask"]],
@@ -315,6 +322,7 @@ def interleave_rollout(
             teacher_logprobs=None,
             advantages=None,
             routed_experts=routed_experts,
+            completion_top_k_token_ids=completion_top_k_token_ids,
         )
 
     def extend_sample(sample: TrainingSample, prefix_len: int, step_idx: int) -> None:
@@ -327,6 +335,10 @@ def interleave_rollout(
         sample.completion_mask.extend([False] * len(new_prompt_ids))
         sample.completion_logprobs.extend([0.0] * len(new_prompt_ids))
         sample.completion_temperatures.extend([temperature] * len(new_prompt_ids))
+        # Phase 5: extend top-K with empty rows for the bridge prompt tokens; the
+        # new turn's completion top-K is appended below alongside completion_ids.
+        if sample.completion_top_k_token_ids is not None:
+            sample.completion_top_k_token_ids.extend([[] for _ in new_prompt_ids])
 
         # Extend with new completion tokens
         completion_ids = tokens["completion_ids"]
@@ -336,6 +348,24 @@ def interleave_rollout(
         else:
             sample.completion_mask.extend(bool(i) for i in tokens["completion_mask"])
         sample.completion_logprobs.extend(tokens["completion_logprobs"])
+        # Phase 5: append the new turn's per-completion-token top-K, if both the
+        # existing sample and the new turn carry it. If only the existing sample
+        # has it, pad the new turn's slot with [] rows. If only the new turn has
+        # it, lift the field by retroactively filling earlier turns with [] (rare
+        # path -- only happens if extend_sample is called on a sample whose first
+        # turn pre-dated top-K extraction, which shouldn't occur in practice).
+        new_top_k = tokens.get("completion_top_k_token_ids")
+        new_completion_len = len(tokens["completion_ids"])
+        if sample.completion_top_k_token_ids is not None:
+            if new_top_k is not None:
+                sample.completion_top_k_token_ids.extend(list(row) for row in new_top_k)
+            else:
+                sample.completion_top_k_token_ids.extend([[] for _ in range(new_completion_len)])
+        elif new_top_k is not None:
+            existing_len = len(sample.completion_ids) - new_completion_len
+            sample.completion_top_k_token_ids = (
+                [[] for _ in range(existing_len)] + [list(row) for row in new_top_k]
+            )
         sample.completion_temperatures.extend([temperature] * len(completion_ids))
 
         if tokens.get("routed_experts") is not None and sample.routed_experts is not None:

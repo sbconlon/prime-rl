@@ -158,6 +158,34 @@ class SamplingConfig(BaseConfig):
         ),
     ] = {}
 
+    # Phase 5: top-K candidate action set extraction (for ARM regret matching).
+    return_top_k_token_ids: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether to extract and return top-K candidate token IDs at each "
+                "generated position. Required for ARM's regret-matching action set; "
+                "not used by GRPO or PPO. When True, get_sampling_args adds "
+                "`extra_body['logprobs']=top_k_action_set_size` so vLLM returns "
+                "top-K logprobs alongside the sampled token."
+            ),
+        ),
+    ] = False
+
+    top_k_action_set_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Action set size K. vLLM is asked for top-K candidates; the "
+                "orchestrator's substitute_sampled_into_top_k helper guarantees "
+                "the sampled action is among them by replacing the K-th candidate "
+                "in the rare case it wasn't naturally in the top-K. Only consulted "
+                "when return_top_k_token_ids is True."
+            ),
+        ),
+    ] = 32
+
 
 class EvalSamplingConfig(BaseConfig):
     """Configures how tokens are sampled from the model for evaluation. Largely follows the vLLM sampling parameters."""
