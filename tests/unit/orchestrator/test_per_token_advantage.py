@@ -455,3 +455,349 @@ def test_deterministic_inputs_yield_deterministic_output():
     out_b = run()
     assert out_a.advantages == out_b.advantages
     assert out_a.v_targets == out_b.v_targets
+
+
+# ===========================================================================
+# Phase 3 -- ARM regret-matching advantage tests
+# ===========================================================================
+
+from prime_rl.orchestrator.per_token_advantage import (
+    ArmAdvantageInputs,
+    arm_regret_matching_advantage_fn,
+)
+
+
+def _arm_inputs(
+    samples: list[TrainingSample],
+    *,
+    episodic_reward: float = 1.0,
+    is_terminal: bool = True,
+    v_all: torch.Tensor | None = None,
+    v_target_all: torch.Tensor | None = None,
+    q_plus_sampled_all: torch.Tensor | None = None,
+    q_plus_candidates: torch.Tensor | None = None,
+    gamma: float = 0.99,
+    K: int = 4,
+) -> ArmAdvantageInputs:
+    """Helper: ArmAdvantageInputs with sensible zero defaults for unused tensors."""
+    n_active = sum(sum(s.completion_mask) for s in samples)
+    return ArmAdvantageInputs(
+        samples=samples,
+        episodic_reward=episodic_reward,
+        is_terminal=is_terminal,
+        v_all=torch.zeros(n_active) if v_all is None else v_all,
+        v_target_all=torch.zeros(n_active) if v_target_all is None else v_target_all,
+        q_plus_sampled_all=(
+            torch.zeros(n_active) if q_plus_sampled_all is None else q_plus_sampled_all
+        ),
+        q_plus_candidates=(
+            torch.zeros(n_active, K) if q_plus_candidates is None else q_plus_candidates
+        ),
+        gamma=gamma,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regret-matching arithmetic correctness
+# ---------------------------------------------------------------------------
+
+
+def test_arm_single_position_single_positive_q_plus():
+    """K=4, only the sampled action has positive Q+ -> A = Q+/Q+ - 1/K = 1 - 1/4 = 0.75."""
+    sample = _make_sample(completion_len=1)
+    out = arm_regret_matching_advantage_fn(
+        _arm_inputs(
+            [sample],
+            q_plus_sampled_all=torch.tensor([2.0]),
+            q_plus_candidates=torch.tensor([[2.0, 0.0, 0.0, 0.0]]),
+            K=4,
+        )
+    )
+    assert abs(out.advantages[0][0] - 0.75) < 1e-6
+
+
+def test_arm_single_position_uniform_positive_q_plus():
+    """K=4, all candidates equal -> A = 1/K - 1/K = 0 (uniform regret-matching policy)."""
+    sample = _make_sample(completion_len=1)
+    out = arm_regret_matching_advantage_fn(
+        _arm_inputs(
+            [sample],
+            q_plus_sampled_all=torch.tensor([1.0]),
+            q_plus_candidates=torch.tensor([[1.0, 1.0, 1.0, 1.0]]),
+            K=4,
+        )
+    )
+    assert abs(out.advantages[0][0] - 0.0) < 1e-6
+
+
+def test_arm_single_position_mixed_positive_negative_q_plus():
+    """K=4, q_plus_candidates=[2, -1, 1, 3]: clipped=[2,0,1,3], denom=6, A=2/6-1/4."""
+    sample = _make_sample(completion_len=1)
+    out = arm_regret_matching_advantage_fn(
+        _arm_inputs(
+            [sample],
+            q_plus_sampled_all=torch.tensor([2.0]),
+            q_plus_candidates=torch.tensor([[2.0, -1.0, 1.0, 3.0]]),
+            K=4,
+        )
+    )
+    expected = 2.0 / 6.0 - 1.0 / 4.0
+    assert abs(out.advantages[0][0] - expected) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Cold-start degenerate branch
+# ---------------------------------------------------------------------------
+
+
+def test_arm_cold_start_all_zero_q_plus():
+    """All Q+ zero at every position -> A = 0 (no division by zero)."""
+    sample = _make_sample(completion_len=3)
+    out = arm_regret_matching_advantage_fn(
+        _arm_inputs(
+            [sample],
+            q_plus_sampled_all=torch.zeros(3),
+            q_plus_candidates=torch.zeros(3, 4),
+            K=4,
+        )
+    )
+    assert all(abs(a) < 1e-9 for a in out.advantages[0])
+
+
+def test_arm_cold_start_all_negative_q_plus():
+    """All Q+ non-positive (clipped to zero) -> degenerate branch -> A = 0."""
+    sample = _make_sample(completion_len=1)
+    out = arm_regret_matching_advantage_fn(
+        _arm_inputs(
+            [sample],
+            q_plus_sampled_all=torch.tensor([-1.0]),
+            q_plus_candidates=torch.tensor([[-1.0, -2.0, -0.5, -3.0]]),
+            K=4,
+        )
+    )
+    assert abs(out.advantages[0][0] - 0.0) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Bounds and invariants
+# ---------------------------------------------------------------------------
+
+
+def test_arm_advantage_bounded():
+    """For random Q+ inputs at K=32, every advantage is in [-1/K, 1 - 1/K]."""
+    K = 32
+    n_pos = 5
+    sample = _make_sample(completion_len=n_pos)
+    torch.manual_seed(123)
+    for trial in range(5):
+        # Mix positive and negative Q+ values across candidates.
+        q_plus_candidates = (torch.rand(n_pos, K) - 0.5) * 4.0
+        # Sampled-action Q+ matches one of the candidates per position.
+        sampled_idx = torch.randint(0, K, (n_pos,))
+        q_plus_sampled = torch.stack(
+            [q_plus_candidates[k, sampled_idx[k]] for k in range(n_pos)]
+        )
+        out = arm_regret_matching_advantage_fn(
+            _arm_inputs(
+                [sample],
+                q_plus_sampled_all=q_plus_sampled,
+                q_plus_candidates=q_plus_candidates,
+                K=K,
+            )
+        )
+        for a in out.advantages[0]:
+            assert -1.0 / K - 1e-6 <= a <= 1.0 - 1.0 / K + 1e-6, (
+                f"trial={trial}: advantage {a} out of [-1/K, 1-1/K]"
+            )
+
+
+def test_arm_advantage_sum_to_zero_across_action_set():
+    """Sum of advantages over the K candidates (each treated as sampled) is ~0."""
+    K = 32
+    sample = _make_sample(completion_len=1)
+    torch.manual_seed(7)
+    q_plus_candidates_row = (torch.rand(K) - 0.3) * 5.0  # mix of positive/negative
+
+    advantages_per_candidate = []
+    for i in range(K):
+        out = arm_regret_matching_advantage_fn(
+            _arm_inputs(
+                [sample],
+                q_plus_sampled_all=q_plus_candidates_row[i : i + 1].clone(),
+                q_plus_candidates=q_plus_candidates_row.unsqueeze(0).clone(),
+                K=K,
+            )
+        )
+        advantages_per_candidate.append(out.advantages[0][0])
+
+    assert abs(sum(advantages_per_candidate)) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# q_plus_target correctness
+# ---------------------------------------------------------------------------
+
+
+def test_arm_q_plus_target_cfr_plus_recurrence():
+    """q_plus_target = max(0, Q+_sampled + A). Hand-construct Q+_sampled=0.5 -> A=0.3 -> 0.8."""
+    # Construct candidates s.t. with K=2 and q_plus_sampled=0.5 we get A=0.3:
+    #   A = 0.5 / denom - 1/2 = 0.3 -> denom = 0.5/0.8 = 0.625
+    #   candidates = [0.5, 0.125] -> denom = 0.625, sampled = 0.5 -> A = 0.8 - 0.5 = 0.3
+    sample = _make_sample(completion_len=1)
+    out = arm_regret_matching_advantage_fn(
+        _arm_inputs(
+            [sample],
+            q_plus_sampled_all=torch.tensor([0.5]),
+            q_plus_candidates=torch.tensor([[0.5, 0.125]]),
+            K=2,
+        )
+    )
+    # Sanity-check the construction first.
+    assert abs(out.advantages[0][0] - 0.3) < 1e-6
+    # The CFR+ target.
+    assert abs(out.q_plus_targets[0][0] - 0.8) < 1e-6
+
+
+def test_arm_q_plus_target_clipped_when_negative():
+    """q_plus_target = max(0, 0.1 + (-0.3)) = 0 -- the CFR+ clip distinguishes from raw CFR."""
+    # K=2 with q_plus_sampled=0.1 and A=-0.3:
+    #   -0.3 = 0.1/denom - 1/2 -> denom = 0.5
+    #   candidates = [0.1, 0.4] -> denom = 0.5, A = 0.2 - 0.5 = -0.3
+    sample = _make_sample(completion_len=1)
+    out = arm_regret_matching_advantage_fn(
+        _arm_inputs(
+            [sample],
+            q_plus_sampled_all=torch.tensor([0.1]),
+            q_plus_candidates=torch.tensor([[0.1, 0.4]]),
+            K=2,
+        )
+    )
+    assert abs(out.advantages[0][0] - (-0.3)) < 1e-6
+    assert abs(out.q_plus_targets[0][0] - 0.0) < 1e-6
+
+
+def test_arm_q_plus_targets_length_matches_completion_length():
+    """len(q_plus_targets[i]) == len(samples[i].completion_ids) for every sample."""
+    s0 = _make_sample(completion_len=8)
+    s1 = _make_sample(completion_len=2)
+    out = arm_regret_matching_advantage_fn(_arm_inputs([s0, s1], K=4))
+    assert out.q_plus_targets is not None
+    assert len(out.q_plus_targets[0]) == len(s0.completion_ids)
+    assert len(out.q_plus_targets[1]) == len(s1.completion_ids)
+
+
+# ---------------------------------------------------------------------------
+# v_target correctness
+# ---------------------------------------------------------------------------
+
+
+def test_arm_v_target_uses_v_target_all_not_v_all():
+    """Truncated rollout: changing v_all does not change v_targets (only v_target_all does)."""
+    sample = _make_sample(completion_len=3)
+
+    out_a = arm_regret_matching_advantage_fn(
+        _arm_inputs(
+            [sample],
+            episodic_reward=0.0,
+            is_terminal=False,  # bootstrap from v_target_all[-1]
+            v_all=torch.tensor([0.1, 0.2, 0.3]),
+            v_target_all=torch.tensor([0.5, 0.5, 0.5]),
+            K=4,
+        )
+    )
+    out_b = arm_regret_matching_advantage_fn(
+        _arm_inputs(
+            [sample],
+            episodic_reward=0.0,
+            is_terminal=False,
+            v_all=torch.tensor([100.0, 200.0, 300.0]),  # wildly different
+            v_target_all=torch.tensor([0.5, 0.5, 0.5]),  # same as run a
+            K=4,
+        )
+    )
+    assert out_a.v_targets == out_b.v_targets
+
+
+def test_arm_v_target_matches_n_step_return():
+    """Terminal rollout: v_target[k] = gamma^(N-1-k) * episodic_reward."""
+    sample = _make_sample(completion_len=4)
+    gamma = 0.99
+    out = arm_regret_matching_advantage_fn(
+        _arm_inputs([sample], episodic_reward=1.0, is_terminal=True, gamma=gamma, K=4)
+    )
+    expected = [gamma**3, gamma**2, gamma**1, 1.0]
+    for e, g in zip(expected, out.v_targets[0]):
+        assert abs(e - g) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Joint recursion across fragmented samples
+# ---------------------------------------------------------------------------
+
+
+def test_arm_two_samples_joint_v_target_recursion():
+    """Two samples, terminal: v_target propagates correctly across the boundary."""
+    s0 = _make_sample(completion_len=2)
+    s1 = _make_sample(completion_len=3)
+    gamma = 0.99
+    out = arm_regret_matching_advantage_fn(
+        _arm_inputs([s0, s1], episodic_reward=1.0, is_terminal=True, gamma=gamma, K=4)
+    )
+    expected_joint = [gamma**4, gamma**3, gamma**2, gamma**1, 1.0]
+    got_flat = out.v_targets[0] + out.v_targets[1]
+    for e, g in zip(expected_joint, got_flat):
+        assert abs(e - g) < 1e-6
+    assert len(out.v_targets[0]) == 2
+    assert len(out.v_targets[1]) == 3
+
+
+# ---------------------------------------------------------------------------
+# Output shape and determinism
+# ---------------------------------------------------------------------------
+
+
+def test_arm_advantages_length_matches_completion_length():
+    """len(advantages[i]) == len(samples[i].completion_ids)."""
+    s0 = _make_sample(completion_len=7)
+    s1 = _make_sample(completion_len=4)
+    out = arm_regret_matching_advantage_fn(_arm_inputs([s0, s1], K=4))
+    assert len(out.advantages[0]) == len(s0.completion_ids)
+    assert len(out.advantages[1]) == len(s1.completion_ids)
+
+
+def test_arm_q_plus_targets_populated():
+    """ARM populates q_plus_targets (distinguishes from PPO's None)."""
+    sample = _make_sample(completion_len=3)
+    out = arm_regret_matching_advantage_fn(_arm_inputs([sample], K=4))
+    assert out.q_plus_targets is not None
+    assert len(out.q_plus_targets) == 1
+
+
+def test_arm_deterministic_inputs_yield_deterministic_output():
+    """Same inputs -> bit-identical outputs (no hidden internal state)."""
+    K = 8
+    sample = _make_sample(completion_len=5)
+    torch.manual_seed(99)
+    q_cand = (torch.rand(5, K) - 0.4) * 3.0
+    q_sampled = q_cand[:, 0].clone()
+    v_target = torch.rand(5)
+
+    def run() -> PerTokenAdvantageOutputs:
+        return arm_regret_matching_advantage_fn(
+            ArmAdvantageInputs(
+                samples=[sample],
+                episodic_reward=0.7,
+                is_terminal=True,
+                v_all=torch.zeros(5),
+                v_target_all=v_target.clone(),
+                q_plus_sampled_all=q_sampled.clone(),
+                q_plus_candidates=q_cand.clone(),
+                gamma=0.97,
+            )
+        )
+
+    out_a = run()
+    out_b = run()
+    assert out_a.advantages == out_b.advantages
+    assert out_a.v_targets == out_b.v_targets
+    assert out_a.q_plus_targets == out_b.q_plus_targets
