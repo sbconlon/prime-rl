@@ -417,7 +417,7 @@ dependencies = [
     { name = "verifiers", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://hub.primeintellect.ai/primeintellect/code-env/@905f3374/code_env-0.1.1-py3-none-any.whl", hash = "sha256:52e88748eeee933add11e3f485e2d9e4d4515cdc609acbd5789862adbd541ac8" },
+    { url = "https://hub.primeintellect.ai/primeintellect/code-env/@2e4fb479/code_env-0.1.1-py3-none-any.whl", hash = "sha256:42a5c0b9bf6d858ff1f71a779d38e5268fb03f63ed347a736eb6938859303177" },
 ]
 
 [[package]]
@@ -429,7 +429,7 @@ dependencies = [
     { name = "verifiers", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://hub.primeintellect.ai/primeintellect/color-codeword/@80a7a5ac/color_codeword-0.1.0-py3-none-any.whl", hash = "sha256:c8be97a91ca823074bfdd2756803d74833fe43b0d09c755b96fb432f9c0d3047" },
+    { url = "https://hub.primeintellect.ai/primeintellect/color-codeword/@828f24c5/color_codeword-0.1.0-py3-none-any.whl", hash = "sha256:5bf72f74d6ee001b6be96768dd269e8762617dd3644238bda7623f58a6bc069a" },
 ]
 
 [[package]]
@@ -1041,14 +1041,14 @@ wheels = [
 
 [[package]]
 name = "hf-xet"
-version = "1.3.0b0"
+version = "1.4.3"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/41/4b/59c9a123813f1db5441f037d9a0e9171bd480c4ff3a9562976a8bf8e49ad/hf_xet-1.3.0b0.tar.gz", hash = "sha256:ece497f54c80992e1b145a89065443f6acf9a6b51d8e4648e53e3ad650fbec06", size = 615265, upload-time = "2026-01-28T20:37:21.892Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/53/92/ec9ad04d0b5728dca387a45af7bc98fbb0d73b2118759f5f6038b61a57e8/hf_xet-1.4.3.tar.gz", hash = "sha256:8ddedb73c8c08928c793df2f3401ec26f95be7f7e516a7bee2fbb546f6676113", size = 670477, upload-time = "2026-03-31T22:40:07.874Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7e/34/a16aa436c3e59007678cee07f5cf3929ba053b14ae16dffd3be1270d3927/hf_xet-1.3.0b0-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:fa63330e14196071fafc0e369a8e9d3f847335f10d33ca152537fb47bf263440", size = 58044866, upload-time = "2026-01-28T20:36:31.13Z" },
-    { url = "https://files.pythonhosted.org/packages/d0/74/2202cc67e82a6eb64e42314e92ff2ee798e6dd5ee394967880b1370e878e/hf_xet-1.3.0b0-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:1f8a48df4e67ab695ae802f0d4d07c3d28fed64ea12decef13f8a8550783a42d", size = 53103717, upload-time = "2026-01-28T20:36:26.633Z" },
-    { url = "https://files.pythonhosted.org/packages/8d/eb/9cbf85387377adaef317918318d1921b456625fa2535f39e642ed77076e4/hf_xet-1.3.0b0-cp37-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:ae20bc5405c06538ba820e6a3f818df793fee554f83cf071caa641d0b36f08f8", size = 53485235, upload-time = "2026-01-28T20:37:05.554Z" },
-    { url = "https://files.pythonhosted.org/packages/0d/28/302fae85503e423e356042a3332e3b2b714b30ce27db2fe415260973bf0e/hf_xet-1.3.0b0-cp37-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:a566da3478ae73ccd6bca8cb8d1ef85bcd4c36e79912cbfafb5b33890a0f1301", size = 55093706, upload-time = "2026-01-28T20:37:09.561Z" },
+    { url = "https://files.pythonhosted.org/packages/df/9a/a24b26dc8a65f0ecc0fe5be981a19e61e7ca963b85e062c083f3a9100529/hf_xet-1.4.3-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:fc360b70c815bf340ed56c7b8c63aacf11762a4b099b2fe2c9bd6d6068668c08", size = 4212320, upload-time = "2026-03-31T22:39:42.922Z" },
+    { url = "https://files.pythonhosted.org/packages/53/60/46d493db155d2ee2801b71fb1b0fd67696359047fdd8caee2c914cc50c79/hf_xet-1.4.3-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:39f2d2e9654cd9b4319885733993807aab6de9dfbd34c42f0b78338d6617421f", size = 3991546, upload-time = "2026-03-31T22:39:41.335Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/f5/067363e1c96c6b17256910830d1b54099d06287e10f4ec6ec4e7e08371fc/hf_xet-1.4.3-cp37-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:49ad8a8cead2b56051aa84d7fce3e1335efe68df3cf6c058f22a65513885baac", size = 4193200, upload-time = "2026-03-31T22:40:01.936Z" },
+    { url = "https://files.pythonhosted.org/packages/42/4b/53951592882d9c23080c7644542fda34a3813104e9e11fa1a7d82d419cb8/hf_xet-1.4.3-cp37-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:7716d62015477a70ea272d2d68cd7cad140f61c52ee452e133e139abfe2c17ba", size = 4429392, upload-time = "2026-03-31T22:40:03.492Z" },
 ]
 
 [[package]]
@@ -1506,7 +1506,7 @@ dependencies = [
     { name = "verifiers", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://hub.primeintellect.ai/primeintellect/logic-env/@faee829c/logic_env-0.1.0-py3-none-any.whl", hash = "sha256:789523bfbd87af97d67422b1ba6f89c181d8d33e4b6aedce629c312b0ab4ed1f" },
+    { url = "https://hub.primeintellect.ai/primeintellect/logic-env/@7bded58d/logic_env-0.1.0-py3-none-any.whl", hash = "sha256:3ecc5f31feb13fb5bd8d9a091d1d7cf0e6a8687c758f9b2a04e5f1b3b0c235a8" },
 ]
 
 [[package]]
@@ -2629,7 +2629,7 @@ requires-dist = [
     { name = "torchtitan", git = "https://github.com/pytorch/torchtitan?rev=a1fdd7e" },
     { name = "transformers", git = "https://github.com/huggingface/transformers.git?rev=5c1c72b" },
     { name = "uvloop", specifier = ">=0.21.0" },
-    { name = "verifiers", git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=0db45e6" },
+    { name = "verifiers", git = "https://github.com/sbconlon/verifiers.git?branch=feature%2Farm-ppo" },
     { name = "vllm", specifier = ">=0.17.0" },
     { name = "vllm-router", marker = "platform_machine == 'x86_64' and extra == 'disagg'", url = "https://github.com/samsja/flash-attn-builds/releases/download/v0.3/vllm_router-0.1.11-cp38-abi3-linux_x86_64.whl" },
     { name = "wandb", specifier = ">=0.24.2" },
@@ -2649,7 +2649,7 @@ mamba-ssm = [{ name = "mamba-ssm", specifier = ">=2.3.0" }]
 
 [[package]]
 name = "prime-sandboxes"
-version = "0.2.16"
+version = "0.2.22"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -2659,23 +2659,23 @@ dependencies = [
     { name = "pydantic", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "tenacity", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/83/58/fdb9a63f1ea0c793da5e08b283c0eb2a3d986a25953126abd0b9bfa9535a/prime_sandboxes-0.2.16.tar.gz", hash = "sha256:c1a4504d7c094427fee436ad1561e12079c1d607003dd0345d4fead34ae873a8", size = 55606, upload-time = "2026-02-28T00:45:49.118Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/dc/a7/eb9cb01ce7fa812022ec7c2ffaeb379e1103e07f093a4b85e879b2d0143d/prime_sandboxes-0.2.22.tar.gz", hash = "sha256:7901adca4ff7fff1e7f08c06c4b76765cd90791965216655eb3a87d459588f5e", size = 64970, upload-time = "2026-04-22T18:32:12.973Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/33/7f/b717338c70a785feef5cb1bdaff46a1f942115a40fcd53df3127dea8c2f7/prime_sandboxes-0.2.16-py3-none-any.whl", hash = "sha256:18ef8b2bd073628bdc979b5a17acb640e5c30d19ab7ec356153b51c8fe3b12a2", size = 26639, upload-time = "2026-02-28T00:45:47.891Z" },
+    { url = "https://files.pythonhosted.org/packages/90/b8/46bf98c06826fc26d982c53e10d9d4f086a4c322993a6c51188e5bd6fd30/prime_sandboxes-0.2.22-py3-none-any.whl", hash = "sha256:0a75bb02049c16b55aae7475cc4082e8559ffa6d65181b238077771a95b57855", size = 33182, upload-time = "2026-04-22T18:32:11.739Z" },
 ]
 
 [[package]]
 name = "prime-tunnel"
-version = "0.1.4"
+version = "0.1.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "pydantic", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "tenacity", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/50/d4/be7356eab434edd623bc000b5c8d457e98b6feb3eed513b88e7865522178/prime_tunnel-0.1.4.tar.gz", hash = "sha256:caf092ae01be921a17824d14aca3b526f8b5b704f9996dbc6cdcefd40619ca8a", size = 11660, upload-time = "2026-02-27T01:32:15.261Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d1/e8/fec186cfbcc670deed94a7b5ace67688feed38b114b1c602d35a8f8d7564/prime_tunnel-0.1.6.tar.gz", hash = "sha256:5e371bc3557d8a5257a43ef1aeea1f8918da966a8565dacd33a647b6c82a0eaa", size = 13019, upload-time = "2026-04-13T15:13:17.24Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/42/c3/8def582c17f0f64f31efe11f7a0299139af3120c19fb2937a21c63de48d0/prime_tunnel-0.1.4-py3-none-any.whl", hash = "sha256:8e49715fdcdeed2e761c9b96fc7a94f07e6733ba9bf8e4022f8c46f496998a54", size = 13675, upload-time = "2026-02-27T01:32:13.816Z" },
+    { url = "https://files.pythonhosted.org/packages/52/35/adfac88e5880418f095758729b73e395c81be869d0be786fcd4b31938b2f/prime_tunnel-0.1.6-py3-none-any.whl", hash = "sha256:bc096bca509621379f671e2401253ab2ebe6c8c143d797b6ef85d8290c462e0d", size = 14914, upload-time = "2026-04-13T15:13:16.08Z" },
 ]
 
 [[package]]
@@ -3554,8 +3554,8 @@ dependencies = [
     { name = "typing-extensions", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6f09cdf2415516be028ae82e6b985bcfc3eac37bc52ab401142689f6224516ca" },
-    { url = "https://download.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:628e89bd5110ced7debee2a57c69959725b7fbc64eab81a39dd70e46c7e28ba5" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6f09cdf2415516be028ae82e6b985bcfc3eac37bc52ab401142689f6224516ca", upload-time = "2026-01-21T15:22:03Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu128/torch-2.10.0%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:628e89bd5110ced7debee2a57c69959725b7fbc64eab81a39dd70e46c7e28ba5", upload-time = "2026-01-21T15:22:11Z" },
 ]
 
 [[package]]
@@ -3829,8 +3829,8 @@ wheels = [
 
 [[package]]
 name = "verifiers"
-version = "0.1.12.dev1"
-source = { git = "https://github.com/PrimeIntellect-ai/verifiers.git?rev=0db45e6#0db45e6f4d8b20fb6ecfbb0e06138735ec4f3d99" }
+version = "0.1.12.dev3"
+source = { git = "https://github.com/sbconlon/verifiers.git?branch=feature%2Farm-ppo#019e7c983b652d949b9cdb3a0831c6057a911bc3" }
 dependencies = [
     { name = "aiolimiter", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "anthropic", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
@@ -3848,8 +3848,10 @@ dependencies = [
     { name = "prime-tunnel", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "pydantic", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "pyzmq", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "regex", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "requests", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "rich", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "setproctitle", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "tenacity", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "textual", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
     { name = "wget", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
