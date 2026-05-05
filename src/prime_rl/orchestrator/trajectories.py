@@ -11,6 +11,7 @@ import verifiers as vf
 from PIL import Image
 from transformers.tokenization_utils import PreTrainedTokenizer
 
+from prime_rl.orchestrator.top_k import substitute_sampled_into_top_k
 from prime_rl.transport import TrainingSample
 from prime_rl.utils.chat_template import (
     common_prefix_len,
@@ -306,11 +307,18 @@ def interleave_rollout(
         )
 
         # Phase 5: copy per-token top-K candidate IDs if present in the rollout
-        # output. None for GRPO; populated for ARM/PPO when the inference path
-        # produces it (Phase 5b wires the verifiers / vLLM extraction).
-        completion_top_k_token_ids = tokens.get("completion_top_k_token_ids")
-        if completion_top_k_token_ids is not None:
-            completion_top_k_token_ids = [list(row) for row in completion_top_k_token_ids]
+        # output, applying substitute_sampled_into_top_k so each row is
+        # guaranteed to contain the actually-sampled token (Phase 3 invariant).
+        # In a single-turn make_sample, all completion positions are mask=True,
+        # so the per-row `sampled_id` is `completion_ids[i]`. None for GRPO.
+        raw_top_k = tokens.get("completion_top_k_token_ids")
+        if raw_top_k is not None:
+            completion_top_k_token_ids = [
+                substitute_sampled_into_top_k(list(row), int(sampled_id))
+                for row, sampled_id in zip(raw_top_k, completion_ids)
+            ]
+        else:
+            completion_top_k_token_ids = None
 
         return TrainingSample(
             prompt_ids=list(tokens["prompt_ids"]),
@@ -349,17 +357,22 @@ def interleave_rollout(
             sample.completion_mask.extend(bool(i) for i in tokens["completion_mask"])
         sample.completion_logprobs.extend(tokens["completion_logprobs"])
         # Phase 5 (compact layout): append the new turn's top-K rows iff both
-        # the existing sample and the new turn carry top-K. Mismatched states
-        # (only one side has top-K) indicate the toggle changed mid-rollout,
-        # which shouldn't happen in normal use; we leave the field as-is and
-        # let downstream length checks surface the inconsistency.
+        # the existing sample and the new turn carry top-K. Apply
+        # substitute_sampled_into_top_k so each appended row is guaranteed to
+        # contain the actually-sampled token. Mismatched toggle states are left
+        # to surface as downstream length-check failures.
         new_top_k = tokens.get("completion_top_k_token_ids")
-        if sample.completion_top_k_token_ids is not None and new_top_k is not None:
-            sample.completion_top_k_token_ids.extend([list(row) for row in new_top_k])
-        elif sample.completion_top_k_token_ids is None and new_top_k is not None:
-            # First turn that introduces top-K -- start the field now. Compact
-            # form has no bridge entries, so no backfill is required.
-            sample.completion_top_k_token_ids = [list(row) for row in new_top_k]
+        if new_top_k is not None:
+            substituted = [
+                substitute_sampled_into_top_k(list(row), int(sampled_id))
+                for row, sampled_id in zip(new_top_k, tokens["completion_ids"])
+            ]
+            if sample.completion_top_k_token_ids is not None:
+                sample.completion_top_k_token_ids.extend(substituted)
+            else:
+                # First turn that introduces top-K -- start the field now.
+                # Compact form has no bridge entries, so no backfill is required.
+                sample.completion_top_k_token_ids = substituted
         sample.completion_temperatures.extend([temperature] * len(completion_ids))
 
         if tokens.get("routed_experts") is not None and sample.routed_experts is not None:
