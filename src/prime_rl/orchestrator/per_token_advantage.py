@@ -36,7 +36,7 @@ class PpoAdvantageInputs:
     before this function is called.
 
     Lengths:
-        Let `N_active = sum(sum(s.completion_mask) for s in samples)` —
+        Let `N_active = sum(sum(s.completion_mask) for s in samples)` --
         the total number of completion-mask=True positions across all
         samples. `v_all` and `v_target_all` are length-`N_active` 1D
         tensors carrying the V predictions at exactly those positions,
@@ -63,26 +63,43 @@ class ArmAdvantageInputs:
     view of one rollout's interleaved samples. All per-token tensors are
     pre-computed by the Advantage Server's compute layer (Phase 6.5)
     before this function is called -- including the K candidate Q+
-    evaluations at every completion-mask=True position.
+    evaluations at every completion-mask=True position AND the previous
+    iteration's V/Q+ at the sampled action (needed for the CFR+
+    accumulation term phi).
 
     Lengths:
         Let `N_active = sum(sum(s.completion_mask) for s in samples)`.
-        `v_all`, `v_target_all`, `q_plus_sampled_all` are length
-        `N_active`. `q_plus_candidates` is shape `[N_active, K]` where K
-        is fixed (32 per Phase 5's commitment) and each row's K values
-        match the order of `samples[i].completion_top_k_token_ids[k]`
-        (Phase 5). The function does not need the token IDs themselves
-        -- it indexes the Q+ values directly.
+        `v_all`, `v_target_all`, `v_prev_all`, `q_plus_sampled_all`, and
+        `q_plus_prev_sampled_all` are all length `N_active`.
+        `q_plus_candidates` is shape `[N_active, K]` where K is fixed
+        (32 per Phase 5's commitment) and each row's K values match the
+        order of `samples[i].completion_top_k_token_ids[k]` (Phase 5).
+
+    Iteration semantics:
+        `v_all` and `q_plus_*_all` (without `_prev`) are CURRENT iteration
+        network outputs (theta_t, omega_t).
+        `v_prev_all` and `q_plus_prev_sampled_all` are PREVIOUS iteration
+        network outputs (theta_{t-1}, omega_{t-1}). They participate only
+        in the phi (CFR+ accumulation) term of q_plus_target; advantages
+        and v_target use only the current iteration's tensors.
+        `v_target_all` is the slow-Polyak-copy of V (phi parameter), used
+        only for n-step return bootstrapping.
     """
 
     samples: list[TrainingSample]
     episodic_reward: float
     is_terminal: bool
-    v_all: Tensor
-    v_target_all: Tensor
-    q_plus_sampled_all: Tensor      # [N_active] -- Q+(o_k, sampled_action_k)
-    q_plus_candidates: Tensor       # [N_active, K] -- Q+ at all K candidates
+    # current iteration
+    v_all: Tensor                           # [N_active] -- V(o_k; theta_t)
+    q_plus_sampled_all: Tensor              # [N_active] -- Q+(o_k, a_k; omega_t)
+    q_plus_candidates: Tensor               # [N_active, K] -- Q+(o_k, a; omega_t) for K candidates
+    # slow target (Polyak-averaged)
+    v_target_all: Tensor                    # [N_active] -- V_target(o_k; phi)
+    # previous iteration (for CFR+ accumulation)
+    v_prev_all: Tensor                      # [N_active] -- V(o_k; theta_{t-1})
+    q_plus_prev_sampled_all: Tensor         # [N_active] -- Q+(o_k, a_k; omega_{t-1})
     gamma: float = 0.99
+    n_step: int = 5                         # n-step return horizon
 
 
 @dataclass
@@ -163,11 +180,6 @@ def ppo_gae_advantage_fn(inputs: PpoAdvantageInputs) -> PerTokenAdvantageOutputs
         - Truncated: not_done remains 1 at the final position, and we
           bootstrap using V_target at the final position itself
           (v_target_all[-1]) since no post-trajectory state is available.
-          This is a deliberate simplification documented in the phase doc
-          section 6 (`test_gae_truncation_no_terminal_reward`).
-
-    Output is per-completion-token (NOT per-mask=True): mask=False positions
-    receive 0.0 advantage / 0.0 v_target.
     """
     samples = inputs.samples
     if not samples:
@@ -233,39 +245,77 @@ def ppo_gae_advantage_fn(inputs: PpoAdvantageInputs) -> PerTokenAdvantageOutputs
 # ---------------------------------------------------------------------------
 
 
+def _n_step_return(
+    rewards: Tensor,
+    v_target_all: Tensor,
+    n_step: int,
+    gamma: float,
+    is_terminal: bool,
+) -> Tensor:
+    """Compute g_k = sum_{j=k}^{k+n-1} gamma^(j-k) * r_j + gamma^h * V_target(o_{k+h}).
+
+    `h = min(n_step, N - k)` is the effective horizon for position k. When
+    `k + n_step <= N - 1`, the bootstrap is `v_target_all[k+n_step]` (an
+    interior V_target estimate). When `k + n_step >= N`, the bootstrap is
+    the trajectory-boundary value: 0 for terminal rollouts, `v_target_all[-1]`
+    for truncated rollouts (no post-trajectory V_target estimate available).
+    """
+    n = rewards.shape[0]
+    dtype = rewards.dtype
+    boundary = (
+        torch.zeros((), dtype=dtype)
+        if is_terminal
+        else v_target_all[-1].to(dtype=dtype)
+    )
+    g = torch.zeros(n, dtype=dtype)
+    for k in range(n):
+        horizon = min(k + n_step, n)
+        # Discounted reward sum from index k to horizon - 1
+        for j in range(k, horizon):
+            g[k] = g[k] + (gamma ** (j - k)) * rewards[j]
+        # Bootstrap at index `horizon`
+        bootstrap = v_target_all[horizon] if horizon < n else boundary
+        g[k] = g[k] + (gamma ** (horizon - k)) * bootstrap
+    return g
+
+
 def arm_regret_matching_advantage_fn(inputs: ArmAdvantageInputs) -> PerTokenAdvantageOutputs:
-    """Token-level regret-matching advantage for ARM, run per rollout.
+    """Token-level CFR+-style regret-matching advantage for ARM.
 
-    For each completion-mask=True position k with K candidate actions S_k:
-        clipped_a    = max(0, Q+(o_k, sampled_action_k))
-        clipped_S    = max(0, Q+(o_k, a')) for a' in S_k
-        denom        = sum(clipped_S)
-        A(o_k, a_k)  = clipped_a / denom - 1/K     if denom > 0
-                       0                            otherwise (cold-start branch)
+    For each completion-mask=True position k, with current-iter networks
+    (theta_t, omega_t), previous-iter networks (theta_{t-1}, omega_{t-1}),
+    and Polyak-target network (phi):
 
-    The cold-start branch fires when every candidate's Q+ is non-positive
-    (the "all zero" or "all negative" cases), corresponding to a uniform
-    policy. Matches ARM's expected behavior during the first few iterations
-    when Q+ has not yet learned.
+        # 1. n-step return using V_target for stable bootstrapping
+        g_k = sum_{k'=k}^{k+n-1} gamma^(k'-k) * r_{k'}
+              + gamma^n * V_target(o_{k+n}; phi)
 
-    The CFR+ recurrence target for the next iteration's Q+ regression is:
-        q_plus_target_k = max(0, Q+(o_k, a_k) + A(o_k, a_k))
+        # 2. Previous iteration's clipped advantage (CFR+ accumulation)
+        phi_k = max(0, Q_plus(o_k, a_k; omega_{t-1}) - V(o_k; theta_{t-1}))
 
-    The clip-to-zero is what distinguishes CFR+ from vanilla CFR.
+        # 3. Regression targets for the Advantage Trainer (Phase 7)
+        q_plus_target_k = phi_k + g_k    # historical clip + fresh n-step return
+        v_target_k      = g_k
 
-    The v_target is the n-step (Monte-Carlo) discounted return bootstrapped
-    using V_target at the trajectory boundary. With V_target substituted
-    throughout PPO's GAE-derived v_target at lam=1, the formula collapses
-    to a simple backward recursion:
+        # 4. Current advantage for regret matching (raw, value-relative)
+        A_plus = Q_plus(o_k, a_k; omega_t) - V(o_k; theta_t)
 
-        running = 0 if is_terminal else v_target_all[-1]
-        for k from N-1 down to 0:
-            running = r_k + gamma * running
-            v_target[k] = running
+        # 5. Normalize over the K-candidate action set (centered policy advantage)
+        q_vals = [max(0, Q_plus(o_k, a; omega_t) - V(o_k; theta_t)) for a in S_k]
+        total  = sum(q_vals)
+        adv = max(0, A_plus) / total - 1/K       if total >= 1e-8
+        adv = 0.0                                 otherwise (cold-start)
 
-    This depends only on `v_target_all` (not `v_all`) -- ARM regresses Q+
-    against a self-referential target that includes Q+'s prior output,
-    requiring the slow-copy stabilization that V_target provides.
+    Why phi uses *previous* iteration's networks: that's what makes Q+
+    target a CFR+ recurrence (target = historical clipped advantage +
+    fresh return), which is what gives ARM its O(sqrt(T)) regret bound.
+    Without the phi term Q+ would just be regressing against the n-step
+    return and would have no memory of past iterations.
+
+    Why advantage uses *current* iteration's V baseline: A_plus is the
+    quantity the policy update consumes. It must be computed against the
+    networks the policy is being optimized against (current iter), not
+    against historical networks.
 
     Output is per-completion-token (NOT per-mask=True): mask=False positions
     receive 0.0 for all three outputs.
@@ -284,62 +334,60 @@ def arm_regret_matching_advantage_fn(inputs: ArmAdvantageInputs) -> PerTokenAdva
             q_plus_targets=[[0.0] * len(s.completion_ids) for s in samples],
         )
 
+    v_all = inputs.v_all
     v_target_all = inputs.v_target_all
+    v_prev_all = inputs.v_prev_all
     q_plus_sampled = inputs.q_plus_sampled_all
+    q_plus_prev_sampled = inputs.q_plus_prev_sampled_all
     q_plus_candidates = inputs.q_plus_candidates
 
-    if tuple(inputs.v_all.shape) != (n_active,):
-        raise ValueError(
-            f"v_all shape {tuple(inputs.v_all.shape)} != ({n_active},)"
-        )
-    if tuple(v_target_all.shape) != (n_active,):
-        raise ValueError(
-            f"v_target_all shape {tuple(v_target_all.shape)} != ({n_active},)"
-        )
-    if tuple(q_plus_sampled.shape) != (n_active,):
-        raise ValueError(
-            f"q_plus_sampled_all shape {tuple(q_plus_sampled.shape)} != ({n_active},)"
-        )
+    for name, t in [
+        ("v_all", v_all),
+        ("v_target_all", v_target_all),
+        ("v_prev_all", v_prev_all),
+        ("q_plus_sampled_all", q_plus_sampled),
+        ("q_plus_prev_sampled_all", q_plus_prev_sampled),
+    ]:
+        if tuple(t.shape) != (n_active,):
+            raise ValueError(f"{name} shape {tuple(t.shape)} != ({n_active},)")
     if q_plus_candidates.dim() != 2 or q_plus_candidates.shape[0] != n_active:
         raise ValueError(
             f"q_plus_candidates shape {tuple(q_plus_candidates.shape)} expected "
             f"({n_active}, K)"
         )
+    if inputs.n_step < 1:
+        raise ValueError(f"n_step must be >= 1, got {inputs.n_step}")
 
     K = q_plus_candidates.shape[1]
     gamma = float(inputs.gamma)
-    dtype = inputs.v_all.dtype
+    n_step = int(inputs.n_step)
+    dtype = v_all.dtype
 
-    # Regret-matching per active position. Tensorized; the cold-start branch
-    # is handled by leaving advantages at zero where denom == 0.
-    clipped_candidates = torch.clamp(q_plus_candidates, min=0.0)  # [N_active, K]
-    denom = clipped_candidates.sum(dim=1)                          # [N_active]
-    clipped_sampled = torch.clamp(q_plus_sampled, min=0.0)         # [N_active]
-
-    advantages_active = torch.zeros(n_active, dtype=dtype)
-    nondegenerate = denom > 0
-    if nondegenerate.any():
-        advantages_active[nondegenerate] = (
-            clipped_sampled[nondegenerate] / denom[nondegenerate] - 1.0 / K
-        )
-
-    # CFR+ recurrence target.
-    q_plus_targets_active = torch.clamp(q_plus_sampled + advantages_active, min=0.0)
-
-    # n-step return / Monte-Carlo v_target bootstrapped via V_target.
+    # ----- 1. n-step return g_k using V_target for bootstrap -----
     rewards = torch.zeros(n_active, dtype=dtype)
     if inputs.is_terminal:
         rewards[-1] = inputs.episodic_reward
+    g = _n_step_return(rewards, v_target_all, n_step, gamma, inputs.is_terminal)
 
-    v_targets_active = torch.zeros(n_active, dtype=dtype)
-    running = (
-        torch.zeros((), dtype=dtype)
-        if inputs.is_terminal
-        else v_target_all[-1].to(dtype=dtype)
-    )
-    for k in range(n_active - 1, -1, -1):
-        running = rewards[k] + gamma * running
-        v_targets_active[k] = running
+    # ----- 2. CFR+ accumulation term phi_k from previous iteration's networks -----
+    phi = torch.clamp(q_plus_prev_sampled - v_prev_all, min=0.0)
+
+    # ----- 3. Regression targets -----
+    q_plus_targets_active = phi + g
+    v_targets_active = g
+
+    # ----- 4 & 5. Regret matching using current-iter V baseline -----
+    a_plus = q_plus_sampled - v_all                                # [N_active]
+    q_vals = torch.clamp(q_plus_candidates - v_all.unsqueeze(1), min=0.0)  # [N_active, K]
+    total = q_vals.sum(dim=1)                                      # [N_active]
+
+    advantages_active = torch.zeros(n_active, dtype=dtype)
+    nondegenerate = total >= 1e-8
+    if nondegenerate.any():
+        advantages_active[nondegenerate] = (
+            torch.clamp(a_plus[nondegenerate], min=0.0) / total[nondegenerate]
+            - 1.0 / K
+        )
 
     return PerTokenAdvantageOutputs(
         advantages=_splay_active_to_completion(samples, active_idx_per_sample, advantages_active),
