@@ -11,7 +11,15 @@ def prepare_sample(training_example: TrainingSample, seq_len: int) -> MicroBatch
     input_ids = training_example.prompt_ids + training_example.completion_ids
     loss_mask = training_example.prompt_mask + training_example.completion_mask
     inference_logprobs = [0.0] * len(training_example.prompt_ids) + training_example.completion_logprobs
-    advantages = [training_example.advantage] * len(input_ids)
+    # Per-token advantages: zeros at prompt positions, the per-token list at completion positions.
+    # When `advantages is None` (sample not yet assigned an advantage) we substitute zeros
+    # so the packer doesn't crash; loss_mask=False at prompt positions and a zero advantage
+    # at completion positions both produce zero gradient, matching the prior "absent
+    # advantage → no signal" semantics without surfacing None into the tensor pipeline.
+    if training_example.advantages is None:
+        advantages = [0.0] * len(input_ids)
+    else:
+        advantages = [0.0] * len(training_example.prompt_ids) + training_example.advantages
     position_ids = list(range(len(input_ids)))
 
     # Per-token temperatures: prompt tokens use first completion temp (masked out anyway)

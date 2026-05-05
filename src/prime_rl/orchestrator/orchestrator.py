@@ -608,7 +608,11 @@ async def orchestrate(config: OrchestratorConfig):
             if samples is not None:
                 rollout_samples_per_rollout.append(len(samples))
                 for sample in samples:
-                    sample.advantage = advantage
+                    # GRPO: broadcast the per-rollout scalar advantage across every
+                    # completion token. PPO/ARM (Phase 2/3) will populate
+                    # `sample.advantages` directly with per-token values; that path
+                    # bypasses this loop's scalar broadcast.
+                    sample.advantages = [advantage] * len(sample.completion_ids)
                     sample.reward = rollout["reward"]
                     sample_decode_tokens = sum(sample.completion_mask)
                     sample_prefill_tokens = len(sample.prompt_ids) + len(sample.completion_mask) - sample_decode_tokens

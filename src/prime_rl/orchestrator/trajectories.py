@@ -313,7 +313,7 @@ def interleave_rollout(
             completion_logprobs=list(tokens["completion_logprobs"]),
             completion_temperatures=[temperature] * len(completion_ids),
             teacher_logprobs=None,
-            advantage=None,
+            advantages=None,
             routed_experts=routed_experts,
         )
 

@@ -15,7 +15,7 @@ def make_training_example():
             completion_logprobs=[-0.1, -0.2],
             completion_temperatures=[temperature, temperature],  # Per-token temperatures
             teacher_logprobs=[0.0, 0.0, 0.0, 0.0],
-            advantage=1.0,
+            advantages=[1.0, 1.0],
         )
 
     return _make_training_example
@@ -43,10 +43,12 @@ def test_prepare_batch_balances_micro_batches_across_workers(
     assert len(examples) <= len(flat_batches) < len(examples) + num_train_workers
     print(flat_batches)
 
-    # Verify real rollouts have expected non-zero advantages and loss mask
+    # Verify real rollouts have expected non-zero advantages and loss mask.
+    # Phase 1: per-token advantages are zero at prompt positions, non-zero only at
+    # completion positions. Non-zero count equals loss_mask True count (= 2 here).
     for batch in flat_batches[: len(examples)]:
         print(batch)
-        assert sum(1 for advantage in batch.advantages if advantage != 0.0) == 4
+        assert sum(1 for advantage in batch.advantages if advantage != 0.0) == 2
         assert sum(1 for loss_mask in batch.loss_mask if loss_mask) == 2
 
     # Verify padded batches have zero advantages and loss mask
@@ -90,7 +92,7 @@ def test_prepare_sample_with_routed_experts():
         completion_mask=[True, True],
         completion_logprobs=[-0.1, -0.2],
         completion_temperatures=[1.0, 1.0],
-        advantage=1.0,
+        advantages=[1.0, 1.0],
         routed_experts=routed_experts,
     )
 
@@ -110,7 +112,7 @@ def test_prepare_sample_truncates_routed_experts():
         completion_mask=[True, True],
         completion_logprobs=[-0.1, -0.2],
         completion_temperatures=[1.0, 1.0],
-        advantage=1.0,
+        advantages=[1.0, 1.0],
         routed_experts=routed_experts,
     )
 
@@ -129,7 +131,7 @@ def test_prepare_sample_none_routed_experts():
         completion_mask=[True, True],
         completion_logprobs=[-0.1, -0.2],
         completion_temperatures=[1.0, 1.0],
-        advantage=1.0,
+        advantages=[1.0, 1.0],
     )
 
     micro_batch = prepare_sample(sample, seq_len=8)

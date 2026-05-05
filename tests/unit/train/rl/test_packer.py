@@ -107,3 +107,28 @@ def test_packer_progress_updates_once_per_run(tmp_path: Path, monkeypatch: pytes
     sender = sender_holder["sender"]
     assert len(sender.sent) == 1
     assert len(sender.sent[0][0]) == 1
+
+
+
+def test_validate_sample_rejects_mismatched_advantages_length():
+    """Phase 1: advantages length must equal completion_ids length when non-None.
+
+    Uses MultiPacker.__new__ so we don't need the full constructor (transport
+    receivers, run manager, etc.) just to exercise the validation method.
+    _validate_sample only inspects the sample argument.
+    """
+    packer = MultiPacker.__new__(MultiPacker)
+
+    sample = TrainingSample(
+        prompt_ids=[1],
+        prompt_mask=[False],
+        completion_ids=[2, 3, 4],
+        completion_mask=[True, True, True],
+        completion_logprobs=[-0.1, -0.1, -0.1],
+        completion_temperatures=[1.0, 1.0, 1.0],
+        advantages=[0.5, -0.3],  # length 2, completion_ids length 3 — mismatch
+    )
+
+    valid, reason = packer._validate_sample(sample)
+    assert valid is False
+    assert reason is not None and "advantages" in reason
