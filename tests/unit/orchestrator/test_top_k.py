@@ -95,6 +95,28 @@ def test_get_sampling_args_default_omits_logprobs_int():
     assert "logprobs" not in extra
 
 
+def test_get_sampling_args_does_not_leak_internal_fields_to_top_level():
+    """Regression for Phase 5 hotfix: prime-rl-internal SamplingConfig fields
+    (return_top_k_token_ids, top_k_action_set_size) must NOT appear at the top
+    level of sampling_args, since the orchestrator forwards sampling_args as
+    kwargs to AsyncCompletions.create(...) which raises TypeError on unknown
+    arguments. Same goes for the toggle being on -- still no top-level leak.
+    """
+    for toggle in (False, True):
+        config = SamplingConfig(
+            max_tokens=128,
+            return_top_k_token_ids=toggle,
+            top_k_action_set_size=8,
+        )
+        args = get_sampling_args(config, temperature=1.0, is_vllm=True)
+        assert "return_top_k_token_ids" not in args, (
+            f"return_top_k_token_ids leaked into sampling_args (toggle={toggle})"
+        )
+        assert "top_k_action_set_size" not in args, (
+            f"top_k_action_set_size leaked into sampling_args (toggle={toggle})"
+        )
+
+
 def test_get_sampling_args_with_toggle_on_adds_extra_body_logprobs_K():
     """Toggle on -> extra_body['logprobs'] = K (vLLM-native top-K request)."""
     config = SamplingConfig(

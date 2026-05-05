@@ -59,13 +59,20 @@ def get_sampling_args(sampling_config: SamplingConfig, temperature: float, is_vl
         extra_body["min_p"] = 0.0
         extra_body["return_token_ids"] = True
 
-    # Phase 5: when ARM's top-K action set extraction is enabled, request top-K
-    # logprobs from vLLM via the OpenAI-compatible API's `extra_body.logprobs`
+    # Phase 5: pop the prime-rl-internal toggle fields BEFORE reading them so
+    # they don't get forwarded to the OpenAI client (which would raise
+    # TypeError on unknown kwargs). Same pattern as temp_scheduler / min_tokens
+    # / repetition_penalty above.
+    return_top_k_token_ids = sampling_args.pop("return_top_k_token_ids", False)
+    top_k_action_set_size = sampling_args.pop("top_k_action_set_size", 0)
+
+    # When ARM's top-K action set extraction is enabled, request top-K logprobs
+    # from vLLM via the OpenAI-compatible API's `extra_body.logprobs`
     # integer-valued path (vLLM-native; OpenAI standard caps top_logprobs at 20
     # via the bool `logprobs`/int `top_logprobs` split, which doesn't reach K=32).
-    # Phase 5b will extract the candidate token IDs from the response.
-    if sampling_config.return_top_k_token_ids:
-        extra_body["logprobs"] = sampling_config.top_k_action_set_size
+    # Phase 5b extracts the candidate token IDs from the response.
+    if return_top_k_token_ids:
+        extra_body["logprobs"] = top_k_action_set_size
 
     if extra_body:
         sampling_args["extra_body"] = extra_body
