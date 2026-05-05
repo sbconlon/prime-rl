@@ -28,12 +28,15 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
 
     routed_experts: list[list[list[int]]] | None = None  # [seq_len, layers, topk]
 
-    # Phase 5: per-completion-token top-K candidate token IDs for ARM regret
-    # matching. When non-None: outer length == len(completion_ids); inner
-    # length == top_k_action_set_size from the rollout config; the sampled
-    # token at position i is guaranteed present in completion_top_k_token_ids[i]
-    # (Phase 5's substitute_sampled_into_top_k upholds this invariant). None
-    # for GRPO and PPO.
+    # Phase 5: per-assistant-sampled-token top-K candidate token IDs for ARM
+    # regret matching. *Compact layout*: when non-None, outer length equals
+    # sum(completion_mask) (one row per mask=True position), NOT len(completion_ids).
+    # Bridge tokens that appear inside completion_ids in multi-turn fragmented
+    # rollouts (mask=False positions) are NOT represented here -- they were
+    # never sampled by the policy. Inner length is top_k_action_set_size, and
+    # the sampled token at the i-th mask=True position is guaranteed present
+    # in completion_top_k_token_ids[i] (substitute_sampled_into_top_k upholds
+    # this). None for GRPO and PPO.
     completion_top_k_token_ids: list[list[int]] | None = None
 
 

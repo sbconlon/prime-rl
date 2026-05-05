@@ -1,15 +1,12 @@
 """Phase 5 -- make_sample / extend_sample routing of completion_top_k_token_ids.
 
-These tests use FakeInferenceServer to produce shaped tokens dicts, then call
-the orchestrator's make_sample / extend_sample directly and assert the new
-field flows through.
+These tests exercise the *compact* layout (Option C): top-K rows correspond
+1:1 to assistant-sampled positions (mask=True). Bridge tokens (mask=False)
+introduced by extend_sample's multi-turn merge get no top-K row.
 
-Note: make_sample and extend_sample are nested closures inside
-`interleave_rollout` in trajectories.py. To test them in isolation we
-construct a minimal RolloutOutput-like state, drive interleave_rollout with
-mocked tokenization (or call the parts that don't require the full pipeline),
-and inspect the resulting TrainingSamples. To keep the surface manageable, the
-tests below directly call interleave_rollout with synthetic inputs.
+Tests use FakeInferenceServer to produce deterministic top-K data, then
+call the orchestrator's make_sample / extend_sample directly via mirrored
+logic and assert the new field flows through correctly.
 """
 
 from __future__ import annotations
@@ -21,34 +18,19 @@ from tests.unit.orchestrator._stubs import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Direct unit tests against the make_sample / extend_sample logic.
-#
-# `interleave_rollout` in trajectories.py defines make_sample and extend_sample
-# as inner closures that consume `tokens` dicts. We exercise the same code
-# paths by constructing a "tokens" dict and directly applying the equivalent
-# logic that lives inside make_sample / extend_sample. This is a unit test of
-# the data-copy logic only -- the higher-level interleave_rollout flow is not
-# under test in Phase 5 (it was already covered before; Phase 5 doesn't change
-# its semantics, just adds the new field copy).
-#
-# To verify make_sample / extend_sample themselves stay aligned with the
-# inline logic we replicate here, the integration sanity is
-# test_make_sample_uses_top_k_field_when_present below, which constructs a
-# TrainingSample by hand and asserts equality on the field shape.
-# ---------------------------------------------------------------------------
-
-
 def _build_sample_with_top_k(
     completion_ids: list[int],
-    completion_top_k_token_ids: list[list[int]] | None,
+    completion_mask: list[bool] | None = None,
+    completion_top_k_token_ids: list[list[int]] | None = None,
 ) -> TrainingSample:
-    """Mirror what make_sample does for the top-K field."""
+    """Mirror what make_sample produces."""
+    if completion_mask is None:
+        completion_mask = [True] * len(completion_ids)
     return TrainingSample(
         prompt_ids=[0],
         prompt_mask=[False],
         completion_ids=list(completion_ids),
-        completion_mask=[True] * len(completion_ids),
+        completion_mask=list(completion_mask),
         completion_logprobs=[0.0] * len(completion_ids),
         completion_temperatures=[1.0] * len(completion_ids),
         completion_top_k_token_ids=(
@@ -59,8 +41,13 @@ def _build_sample_with_top_k(
     )
 
 
+# ---------------------------------------------------------------------------
+# make_sample-side: top-K present / absent
+# ---------------------------------------------------------------------------
+
+
 def test_top_k_present_in_tokens_lands_in_sample():
-    """When `tokens['completion_top_k_token_ids']` is set, the sample carries it."""
+    """Single turn, all mask=True: top-K outer length equals completion_ids length."""
     server = FakeInferenceServer(top_k_action_set_size=4)
     completion_ids = [42, 100]
     tokens = server.make_tokens_dict(completion_ids=completion_ids, with_top_k=True)
@@ -74,8 +61,9 @@ def test_top_k_present_in_tokens_lands_in_sample():
         [42, 43, 44, 45],
         [100, 101, 102, 103],
     ]
-    # Length invariant
+    # Single-turn, no bridge: compact and rectangular happen to coincide.
     assert len(sample.completion_top_k_token_ids) == len(sample.completion_ids)
+    assert len(sample.completion_top_k_token_ids) == sum(sample.completion_mask)
 
 
 def test_top_k_absent_in_tokens_yields_none_field_on_sample():
@@ -89,34 +77,82 @@ def test_top_k_absent_in_tokens_yields_none_field_on_sample():
         completion_ids=tokens["completion_ids"],
         completion_top_k_token_ids=tokens.get("completion_top_k_token_ids"),
     )
-
     assert sample.completion_top_k_token_ids is None
 
 
-def test_extend_sample_concatenates_top_k_across_turns():
-    """Multi-turn rollout: extend_sample concatenates each turn's top-K."""
+# ---------------------------------------------------------------------------
+# extend_sample-side: multi-turn no-bridge / multi-turn with-bridge
+# ---------------------------------------------------------------------------
+
+
+def test_extend_sample_concatenates_top_k_no_bridge():
+    """Multi-turn with no bridge tokens (uncommon but minimal): rows concatenate."""
+    server = FakeInferenceServer(top_k_action_set_size=3)
+    turn_one = [10, 20]
+    turn_two = [30, 40, 50]
+
+    # Turn 1
+    sample = _build_sample_with_top_k(
+        completion_ids=turn_one,
+        completion_top_k_token_ids=server.synthesize_top_k_for_completion(turn_one),
+    )
+
+    # Turn 2 extension (mask=True only; no bridge)
+    new_top_k = server.synthesize_top_k_for_completion(turn_two)
+    sample.completion_ids.extend(turn_two)
+    sample.completion_mask.extend([True] * len(turn_two))
+    sample.completion_logprobs.extend([0.0] * len(turn_two))
+    sample.completion_temperatures.extend([1.0] * len(turn_two))
+    if sample.completion_top_k_token_ids is not None and new_top_k is not None:
+        sample.completion_top_k_token_ids.extend([list(row) for row in new_top_k])
+
+    assert sample.completion_top_k_token_ids == [
+        [10, 11, 12], [20, 21, 22],
+        [30, 31, 32], [40, 41, 42], [50, 51, 52],
+    ]
+    # No bridge: compact length == completion_ids length == sum(mask).
+    assert len(sample.completion_top_k_token_ids) == 5
+    assert sum(sample.completion_mask) == 5
+    assert len(sample.completion_ids) == 5
+
+
+def test_extend_sample_skips_bridge_tokens_under_compact_layout():
+    """Multi-turn with bridge tokens: top-K outer length == sum(completion_mask),
+    NOT len(completion_ids). Bridge positions get no row.
+    """
     server = FakeInferenceServer(top_k_action_set_size=3)
     turn_one_completion = [10, 20]
+    bridge_prompt_ids = [97, 98, 99]  # the next user/tool turn, inlined
     turn_two_completion = [30, 40, 50]
 
-    # Build the initial sample for turn 1.
+    # Turn 1
     sample = _build_sample_with_top_k(
         completion_ids=turn_one_completion,
         completion_top_k_token_ids=server.synthesize_top_k_for_completion(turn_one_completion),
     )
 
-    # Mirror what extend_sample does for the new turn's top-K append.
+    # Bridge extension: mask=False, no top-K row appended (Option C).
+    sample.completion_ids.extend(bridge_prompt_ids)
+    sample.completion_mask.extend([False] * len(bridge_prompt_ids))
+    sample.completion_logprobs.extend([0.0] * len(bridge_prompt_ids))
+    sample.completion_temperatures.extend([1.0] * len(bridge_prompt_ids))
+    # NO top-K extension here (Option C: bridge positions get no row).
+
+    # Turn 2 completion extension: mask=True, append top-K rows.
     new_top_k = server.synthesize_top_k_for_completion(turn_two_completion)
     sample.completion_ids.extend(turn_two_completion)
     sample.completion_mask.extend([True] * len(turn_two_completion))
     sample.completion_logprobs.extend([0.0] * len(turn_two_completion))
     sample.completion_temperatures.extend([1.0] * len(turn_two_completion))
-    if sample.completion_top_k_token_ids is not None:
+    if sample.completion_top_k_token_ids is not None and new_top_k is not None:
         sample.completion_top_k_token_ids.extend([list(row) for row in new_top_k])
 
-    # Concatenated structure: turn 1 then turn 2.
+    # Compact invariants:
+    assert len(sample.completion_ids) == 8        # 2 + 3 bridge + 3
+    assert sum(sample.completion_mask) == 5       # 2 + 3 (bridge excluded)
+    assert len(sample.completion_top_k_token_ids) == sum(sample.completion_mask)
+    # Top-K rows correspond ONLY to the assistant-sampled (mask=True) positions:
     assert sample.completion_top_k_token_ids == [
-        [10, 11, 12], [20, 21, 22],
-        [30, 31, 32], [40, 41, 42], [50, 51, 52],
+        [10, 11, 12], [20, 21, 22],          # turn 1 completion
+        [30, 31, 32], [40, 41, 42], [50, 51, 52],  # turn 2 completion (bridge skipped)
     ]
-    assert len(sample.completion_top_k_token_ids) == len(sample.completion_ids)

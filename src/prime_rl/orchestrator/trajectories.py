@@ -335,10 +335,10 @@ def interleave_rollout(
         sample.completion_mask.extend([False] * len(new_prompt_ids))
         sample.completion_logprobs.extend([0.0] * len(new_prompt_ids))
         sample.completion_temperatures.extend([temperature] * len(new_prompt_ids))
-        # Phase 5: extend top-K with empty rows for the bridge prompt tokens; the
-        # new turn's completion top-K is appended below alongside completion_ids.
-        if sample.completion_top_k_token_ids is not None:
-            sample.completion_top_k_token_ids.extend([[] for _ in new_prompt_ids])
+        # Phase 5: top-K uses the *compact* layout -- only assistant-sampled
+        # positions (completion_mask=True) get rows. Bridge tokens (mask=False)
+        # get no row, so we do not pad here. The new turn's completion top-K is
+        # appended below alongside its completion_ids.
 
         # Extend with new completion tokens
         completion_ids = tokens["completion_ids"]
@@ -348,24 +348,18 @@ def interleave_rollout(
         else:
             sample.completion_mask.extend(bool(i) for i in tokens["completion_mask"])
         sample.completion_logprobs.extend(tokens["completion_logprobs"])
-        # Phase 5: append the new turn's per-completion-token top-K, if both the
-        # existing sample and the new turn carry it. If only the existing sample
-        # has it, pad the new turn's slot with [] rows. If only the new turn has
-        # it, lift the field by retroactively filling earlier turns with [] (rare
-        # path -- only happens if extend_sample is called on a sample whose first
-        # turn pre-dated top-K extraction, which shouldn't occur in practice).
+        # Phase 5 (compact layout): append the new turn's top-K rows iff both
+        # the existing sample and the new turn carry top-K. Mismatched states
+        # (only one side has top-K) indicate the toggle changed mid-rollout,
+        # which shouldn't happen in normal use; we leave the field as-is and
+        # let downstream length checks surface the inconsistency.
         new_top_k = tokens.get("completion_top_k_token_ids")
-        new_completion_len = len(tokens["completion_ids"])
-        if sample.completion_top_k_token_ids is not None:
-            if new_top_k is not None:
-                sample.completion_top_k_token_ids.extend(list(row) for row in new_top_k)
-            else:
-                sample.completion_top_k_token_ids.extend([[] for _ in range(new_completion_len)])
-        elif new_top_k is not None:
-            existing_len = len(sample.completion_ids) - new_completion_len
-            sample.completion_top_k_token_ids = (
-                [[] for _ in range(existing_len)] + [list(row) for row in new_top_k]
-            )
+        if sample.completion_top_k_token_ids is not None and new_top_k is not None:
+            sample.completion_top_k_token_ids.extend([list(row) for row in new_top_k])
+        elif sample.completion_top_k_token_ids is None and new_top_k is not None:
+            # First turn that introduces top-K -- start the field now. Compact
+            # form has no bridge entries, so no backfill is required.
+            sample.completion_top_k_token_ids = [list(row) for row in new_top_k]
         sample.completion_temperatures.extend([temperature] * len(completion_ids))
 
         if tokens.get("routed_experts") is not None and sample.routed_experts is not None:
