@@ -18,7 +18,9 @@ from prime_rl.orchestrator.trajectories import (
     offload_images_to_disk,
     pretokenize_rollout_trajectory,
 )
+from prime_rl.orchestrator.advantage_server_client import AdvantageServerClient
 from prime_rl.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
+from prime_rl.transport.types import AdvantageTrainingSample
 from prime_rl.utils.pathing import get_log_dir
 
 # This monkey patch is necessary to avoid Pydantic validating fields using typing.Iterable (e.g. in multimodal or tool call messages) lazily which leads to tokenization errors, for more info see https://github.com/PrimeIntellect-ai/prime-rl/pull/1249
@@ -360,6 +362,22 @@ async def orchestrate(config: OrchestratorConfig):
         await teacher_inference_pool.wait_for_ready(config.teacher_model.model.name)
         logger.success("Teacher inference pool ready")
 
+    # Phase 6: setup the Advantage Server HTTP client for ppo/arm algorithms.
+    # The launcher (entrypoints/rl.py) spawns the Advantage Server subprocess
+    # in parallel with vLLM; we poll its /health endpoint here.
+    advantage_server_client = None
+    if config.algorithm in ("ppo", "arm"):
+        if config.advantage_server is None:
+            raise ValueError(
+                f"orchestrator.algorithm='{config.algorithm}' requires "
+                "orchestrator.advantage_server to be set."
+            )
+        logger.info(f"Initializing Advantage Server client (base_url={config.advantage_server.base_url})")
+        advantage_server_client = AdvantageServerClient(config.advantage_server)
+        logger.info("Waiting for Advantage Server to be ready")
+        await advantage_server_client.wait_for_ready()
+        logger.success("Advantage Server ready")
+
     # Set up weight broadcast backend
     if enable_policy_updates:
         logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
@@ -597,6 +615,9 @@ async def orchestrate(config: OrchestratorConfig):
 
         # Collect results and assign advantages
         train_examples: list[TrainingSample] = []
+        # Phase 6: collected for ppo/arm but currently unused. Phase 7 wires the
+        # Advantage Trainer transport to consume these.
+        advantage_examples: list[AdvantageTrainingSample] = []
         rollout_prefill_lens: list[int] = []
         rollout_decode_lens: list[int] = []
         rollout_samples_per_rollout: list[int] = []
@@ -606,13 +627,30 @@ async def orchestrate(config: OrchestratorConfig):
             rollout_prefill_tokens = 0
             rollout_decode_tokens = 0
             if samples is not None:
+                # Phase 6: for ppo/arm, replace samples with Advantage Server outputs
+                # (one HTTP call per rollout, all of its samples sent jointly so the
+                # GAE / regret-matching recursion can span fragment boundaries).
+                # Server returns paired (TrainingSample-with-advantages-populated,
+                # AdvantageTrainingSample) outputs.
+                if config.algorithm in ("ppo", "arm") and advantage_server_client is not None:
+                    episodic_reward = float(rollout["reward"])
+                    is_terminal = not bool(rollout.get("is_truncated", False))
+                    paired = await advantage_server_client.compute_advantages_and_targets(
+                        samples=samples,
+                        episodic_reward=episodic_reward,
+                        is_terminal=is_terminal,
+                        algorithm=config.algorithm,
+                    )
+                    samples = [pair[0] for pair in paired]
+                    advantage_examples.extend(pair[1] for pair in paired)
+
                 rollout_samples_per_rollout.append(len(samples))
                 for sample in samples:
                     # GRPO: broadcast the per-rollout scalar advantage across every
-                    # completion token. PPO/ARM (Phase 2/3) will populate
-                    # `sample.advantages` directly with per-token values; that path
-                    # bypasses this loop's scalar broadcast.
-                    sample.advantages = [advantage] * len(sample.completion_ids)
+                    # completion token. PPO/ARM: advantages were populated by the
+                    # Advantage Server above; do not overwrite them.
+                    if config.algorithm == "grpo":
+                        sample.advantages = [advantage] * len(sample.completion_ids)
                     sample.reward = rollout["reward"]
                     sample_decode_tokens = sum(sample.completion_mask)
                     sample_prefill_tokens = len(sample.prompt_ids) + len(sample.completion_mask) - sample_decode_tokens
@@ -909,6 +947,10 @@ async def orchestrate(config: OrchestratorConfig):
 
     if teacher_inference_pool is not None:
         await teacher_inference_pool.stop()
+
+    # Phase 6: close the Advantage Server HTTP client.
+    if advantage_server_client is not None:
+        await advantage_server_client.aclose()
 
     # Cancel event loop lag monitor task
     event_loop_lag_monitor_task.cancel()

@@ -75,6 +75,9 @@ class AdvantageServerClientProtocol(Protocol):
     async def aclose(self) -> None:
         ...
 
+    async def wait_for_ready(self, timeout: float = 600.0, poll_interval: float = 1.0) -> None:
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Real HTTP client (httpx async)
@@ -126,3 +129,31 @@ class AdvantageServerClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def wait_for_ready(self, timeout: float = 600.0, poll_interval: float = 1.0) -> None:
+        """Poll the server's /health endpoint until it returns 200 OK.
+
+        Mirrors the orchestrator's existing inference-pool readiness pattern.
+        Connection-refused errors during the first few seconds (server hasn't
+        bound the socket yet) are caught and retried; the timeout ceiling
+        protects against a permanently-unreachable server. Raises
+        TimeoutError on timeout.
+        """
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        last_error: str | None = None
+        while loop.time() < deadline:
+            try:
+                response = await self._client.get("/health")
+                if response.status_code == 200:
+                    return
+                last_error = f"http {response.status_code}"
+            except Exception as e:  # noqa: BLE001 -- surface any transport error in the timeout message
+                last_error = type(e).__name__ + ": " + str(e)
+            await asyncio.sleep(poll_interval)
+        raise TimeoutError(
+            f"Advantage Server at {self._config.base_url} did not become ready "
+            f"within {timeout}s. Last error: {last_error}"
+        )

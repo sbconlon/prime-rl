@@ -1,0 +1,129 @@
+"""Advantage Server HTTP entrypoint.
+
+FastAPI app exposing two endpoints:
+  GET  /health
+       Returns 200 OK once the ValueNetworkBackbone has finished loading;
+       503 SERVICE UNAVAILABLE before that. The orchestrator polls this
+       endpoint at startup.
+  POST /compute_advantages_and_targets
+       Accepts a msgspec.msgpack-encoded ComputeAdvantagesRequest body,
+       dispatches to advantage_server.compute, returns a msgspec.msgpack-
+       encoded ComputeAdvantagesResponse body.
+
+The compute work is GPU-bound and synchronous; we wrap it in
+`asyncio.run_in_executor` so a slow request does not block the event loop.
+
+Phase 6 = naive forward path (slow). Phase 6.5 layers KV-cache /
+batched-K-candidate optimizations.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+import msgspec
+import uvicorn
+from fastapi import FastAPI, Request, Response
+from transformers import AutoModel
+
+from prime_rl.advantage_server.compute import compute_advantages_and_targets
+from prime_rl.configs.advantage_server import AdvantageServerConfig
+from prime_rl.orchestrator.advantage_server_client import (
+    ComputeAdvantagesRequest,
+    ComputeAdvantagesResponse,
+    PairedSample,
+)
+from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
+
+_LOGGER = logging.getLogger("prime_rl.advantage_server")
+
+
+def create_app(config: AdvantageServerConfig) -> FastAPI:
+    """Build a FastAPI app for the Advantage Server.
+
+    Loading the value-network backbone happens lazily on app startup via the
+    lifespan handler. The /health endpoint reports 503 until load is complete.
+    """
+    app = FastAPI(title="Advantage Server")
+    app.state.config = config
+    app.state.backbone = None
+    app.state.ready = False
+    app.state.gamma = config.gamma
+    app.state.lam = config.lam
+    app.state.n_step = config.n_step
+
+    @app.on_event("startup")
+    async def _load_backbone() -> None:
+        cfg: AdvantageServerConfig = app.state.config
+        _LOGGER.info("Loading base model %s for ValueNetworkBackbone", cfg.model_name)
+        base = AutoModel.from_pretrained(cfg.model_name)
+        backbone = ValueNetworkBackbone(
+            base, lora_config=cfg.lora, polyak_tau=cfg.polyak_tau
+        )
+        backbone.eval()
+        app.state.backbone = backbone
+        app.state.ready = True
+        _LOGGER.info("Advantage Server ready (host=%s, port=%d)", cfg.host, cfg.port)
+
+    @app.get("/health")
+    async def health() -> Response:
+        if app.state.ready:
+            return Response(status_code=200, content=b'{"status":"ok"}', media_type="application/json")
+        return Response(
+            status_code=503, content=b'{"status":"loading"}', media_type="application/json"
+        )
+
+    @app.post("/compute_advantages_and_targets")
+    async def compute_endpoint(request: Request) -> Response:
+        if not app.state.ready:
+            return Response(status_code=503, content=b'{"error":"not ready"}', media_type="application/json")
+
+        body = await request.body()
+        decoded = msgspec.msgpack.decode(body, type=ComputeAdvantagesRequest)
+
+        backbone: ValueNetworkBackbone = app.state.backbone
+        loop = asyncio.get_event_loop()
+
+        def _do_compute():
+            kwargs: dict[str, float | int] = {"gamma": app.state.gamma}
+            if decoded.algorithm == "ppo":
+                kwargs["lam"] = app.state.lam
+            else:
+                kwargs["n_step"] = app.state.n_step
+            return compute_advantages_and_targets(
+                samples=decoded.samples,
+                episodic_reward=decoded.episodic_reward,
+                is_terminal=decoded.is_terminal,
+                algorithm=decoded.algorithm,
+                backbone=backbone,
+                **kwargs,
+            )
+
+        paired = await loop.run_in_executor(None, _do_compute)
+        paired_samples = [
+            PairedSample(llm_sample=llm, advantage_sample=adv) for llm, adv in paired
+        ]
+        response = ComputeAdvantagesResponse(paired_samples=paired_samples)
+        encoded = msgspec.msgpack.encode(response)
+        return Response(content=encoded, media_type="application/x-msgpack")
+
+    return app
+
+
+def main() -> None:
+    """CLI entrypoint: parse AdvantageServerConfig from CLI args / TOML, start uvicorn."""
+    from prime_rl.utils.config import cli
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    config = cli(AdvantageServerConfig)
+    app = create_app(config)
+    # log_config=None: don't override our basicConfig with uvicorn's defaults.
+    uvicorn.run(app, host=config.host, port=config.port, log_config=None)
+
+
+if __name__ == "__main__":
+    main()

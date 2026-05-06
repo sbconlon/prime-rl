@@ -134,6 +134,12 @@ class FakeAdvantageServer:
     async def aclose(self) -> None:
         pass
 
+    async def wait_for_ready(
+        self, timeout: float = 600.0, poll_interval: float = 1.0
+    ) -> None:
+        """Always ready; no real server to poll."""
+        return None
+
 
 def _zero_paired_for_sample(
     sample: TrainingSample,

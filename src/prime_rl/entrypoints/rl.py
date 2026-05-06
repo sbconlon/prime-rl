@@ -28,6 +28,7 @@ TRAINER_TOML = "trainer.toml"
 ORCHESTRATOR_TOML = "orchestrator.toml"
 INFERENCE_TOML = "inference.toml"
 TEACHER_INFERENCE_TOML = "teacher_inference.toml"
+ADVANTAGE_SERVER_TOML = "advantage_server.toml"
 
 
 def get_physical_gpu_ids() -> list[int]:
@@ -67,6 +68,11 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
     if teacher_inference is not None:
         with open(output_dir / TEACHER_INFERENCE_TOML, "wb") as f:
             tomli_w.dump(teacher_inference.model_dump(exclude_none=True, mode="json"), f)
+
+    # Phase 6: render advantage_server.toml when launcher is configured to spawn it.
+    if config.advantage_server is not None:
+        with open(output_dir / ADVANTAGE_SERVER_TOML, "wb") as f:
+            tomli_w.dump(config.advantage_server.model_dump(exclude_none=True, mode="json"), f)
 
 
 def check_gpus_available(gpu_ids: list[int]) -> None:
@@ -254,6 +260,37 @@ def rl_local(config: RLConfig):
             monitor_thread = Thread(
                 target=monitor_process,
                 args=(teacher_inference_process, stop_event, error_queue, "teacher_inference"),
+                daemon=True,
+            )
+            monitor_thread.start()
+            monitor_threads.append(monitor_thread)
+
+        # Phase 6: optionally spawn Advantage Server subprocess (PPO/ARM only).
+        # The orchestrator's wait_for_ready polls the server's /health endpoint;
+        # no need to gate the orchestrator startup here.
+        if config.advantage_server is not None:
+            adv_server_cmd = [
+                "uv", "run", "advantage-server", "@",
+                (config_dir / ADVANTAGE_SERVER_TOML).as_posix(),
+            ]
+            logger.info(
+                f"Starting Advantage Server (host={config.advantage_server.host}, port={config.advantage_server.port})"
+            )
+            logger.debug(f"Advantage Server start command: {' '.join(adv_server_cmd)}")
+            with open(log_dir / "advantage_server.stdout", "w") as log_file:
+                advantage_server_process = Popen(
+                    adv_server_cmd,
+                    env={**os.environ},
+                    stdout=log_file,
+                    stderr=log_file,
+                )
+            processes.append(advantage_server_process)
+
+            stop_event = Event()
+            stop_events["advantage_server"] = stop_event
+            monitor_thread = Thread(
+                target=monitor_process,
+                args=(advantage_server_process, stop_event, error_queue, "advantage_server"),
                 daemon=True,
             )
             monitor_thread.start()

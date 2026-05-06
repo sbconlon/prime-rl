@@ -3,6 +3,7 @@ from typing import Annotated, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from prime_rl.configs.advantage_server import AdvantageServerConfig
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.inference import WeightBroadcastConfig as InferenceWeightBroadcastConfig
 from prime_rl.configs.orchestrator import (
@@ -221,7 +222,6 @@ class MultiNodeDeploymentConfig(BaseDeploymentConfig):
             raise ValueError("Teacher inference is not yet supported in multi node deployment.")
         return self
 
-
 DeploymentConfig: TypeAlias = Annotated[
     SingleNodeDeploymentConfig | MultiNodeDeploymentConfig, Field(discriminator="type")
 ]
@@ -243,6 +243,23 @@ class RLConfig(BaseConfig):
         InferenceConfig | None,
         Field(
             description="Teacher inference config. If None, will use the same config as inference or a default config. Only used when teacher GPUs or nodes are set."
+        ),
+    ] = None
+
+    # Phase 6: server-side configuration for the Advantage Server subprocess.
+    # Required when orchestrator.algorithm in {"ppo", "arm"}; the launcher
+    # spawns `uv run advantage-server @ advantage_server.toml` when this is set.
+    advantage_server: Annotated[
+        "AdvantageServerConfig | None",
+        Field(
+            description=(
+                "Advantage Server subprocess configuration (server-side). "
+                "When set together with orchestrator.algorithm in {'ppo','arm'}, "
+                "the launcher spawns the Advantage Server alongside the LLM "
+                "Inference Server and the Trainer. Independent of "
+                "orchestrator.advantage_server, which is the orchestrator-side "
+                "client config (base_url, request_timeout)."
+            ),
         ),
     ] = None
 
@@ -365,6 +382,37 @@ class RLConfig(BaseConfig):
             raise ValueError(
                 "Teacher inference is not supported in multi-node deployment. "
                 "The SLURM template only handles inference and training nodes."
+            )
+        return self
+
+
+
+    @model_validator(mode="after")
+    def _validate_advantage_server_consistency(self) -> "RLConfig":
+        """Phase 6: cross-validate orchestrator.algorithm against advantage_server presence.
+
+        Two failure modes to surface early:
+          - algorithm in {"ppo","arm"} but no launcher advantage_server config
+            AND no orchestrator-side client config -> the launcher cannot spawn
+            the server and the orchestrator cannot reach an external one.
+          - advantage_server is set in the launcher config but algorithm == "grpo"
+            -> wasted process, almost certainly a misconfig.
+        """
+        algorithm = getattr(getattr(self, "orchestrator", None), "algorithm", "grpo")
+        client_set = getattr(getattr(self, "orchestrator", None), "advantage_server", None) is not None
+        server_set = self.advantage_server is not None
+
+        if algorithm in ("ppo", "arm") and not (server_set or client_set):
+            raise ValueError(
+                f"orchestrator.algorithm='{algorithm}' requires either "
+                "advantage_server (launcher spawns the subprocess) or "
+                "orchestrator.advantage_server (client points at an external "
+                "Advantage Server) to be set."
+            )
+        if algorithm == "grpo" and server_set:
+            raise ValueError(
+                "advantage_server is configured but orchestrator.algorithm='grpo'. "
+                "Either set algorithm to 'ppo' or 'arm', or remove advantage_server."
             )
         return self
 
