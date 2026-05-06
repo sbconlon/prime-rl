@@ -3,6 +3,7 @@ from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
+from prime_rl.configs.advantage_server import AdvantageServerClientConfig
 from prime_rl.configs.shared import (
     BaseModelConfig,
     ClientConfig,
@@ -825,6 +826,31 @@ class OrchestratorConfig(BaseConfig):
     # The advantage configuration
     advantage: AdvantageConfig | None = DefaultAdvantageConfig()
 
+    # Phase 6: top-level algorithm selector. "grpo" preserves the existing
+    # scalar-advantage path. "ppo" and "arm" route through the Advantage
+    # Server for per-token advantage computation; both require the
+    # `advantage_server` client config to be set.
+    algorithm: Annotated[
+        Literal["grpo", "ppo", "arm"],
+        Field(
+            description=(
+                "The training algorithm. 'grpo' is the existing baseline; 'ppo' "
+                "and 'arm' route through the Advantage Server for per-token "
+                "advantage computation."
+            ),
+        ),
+    ] = "grpo"
+
+    advantage_server: Annotated[
+        AdvantageServerClientConfig | None,
+        Field(
+            description=(
+                "Configuration for the Advantage Server HTTP client. Required "
+                "when algorithm in {'ppo', 'arm'}; ignored otherwise."
+            ),
+        ),
+    ] = None
+
     # Rollout filters (monitor by default, enforce optionally)
     filters: list[FilterConfig] = [GibberishFilterConfig(), RepetitionFilterConfig()]
 
@@ -1069,6 +1095,14 @@ class OrchestratorConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_length_shaping_requires_online_difficulty_filtering(self):
+        # Phase 6: ppo/arm algorithms require an advantage_server config.
+        if self.algorithm in ("ppo", "arm") and self.advantage_server is None:
+            raise ValueError(
+                f"orchestrator.algorithm='{self.algorithm}' requires "
+                "orchestrator.advantage_server to be set (the HTTP client config "
+                "for reaching the Advantage Server)."
+            )
+
         if isinstance(self.advantage, DefaultAdvantageConfig) and self.advantage.length_shaping_alpha is not None:
             if not self.buffer.online_difficulty_filtering:
                 raise ValueError("Group Relative Reward (GR³) scaling requires online difficulty filtering")

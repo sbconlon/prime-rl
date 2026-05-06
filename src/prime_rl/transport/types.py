@@ -48,6 +48,38 @@ class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tru
     run_idx: int | None = None
 
 
+# Phase 6: Advantage Server -> Orchestrator -> Advantage Trainer.
+class AdvantageTrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
+    """A single advantage training example, paired 1-1 with a TrainingSample.
+
+    Mirrors TrainingSample's prompt/completion structure exactly so the
+    Advantage Trainer (Phase 7) can reuse the same packer / loss-function
+    infrastructure as the LLM Trainer, just with different per-token
+    regression targets.
+
+    The per-token target lists (`v_targets`, `q_plus_targets`) follow Phase 1's
+    `advantages` length convention: when non-None, len matches len(completion_ids),
+    with zeros at mask=False positions (the splay applied by the advantage
+    functions in `prime_rl.orchestrator.per_token_advantage`). `q_plus_targets`
+    is non-None only for ARM; PPO leaves it None.
+    """
+
+    prompt_ids: list[int]
+    prompt_mask: list[bool]
+    completion_ids: list[int]
+    completion_mask: list[bool]
+    v_targets: list[float] | None = None
+    q_plus_targets: list[float] | None = None
+
+
+class AdvantageTrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
+    """A batch of advantage training examples for transport to the Advantage Trainer."""
+
+    examples: list[AdvantageTrainingSample]
+    step: int
+    run_idx: int | None = None
+
+
 # Packer -> Trainer
 class MicroBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A micro batch of data for training."""
