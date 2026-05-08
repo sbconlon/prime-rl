@@ -163,8 +163,27 @@ def rl_local(config: RLConfig):
     gpu_offset += config.deployment.num_train_gpus
     num_teacher_gpus = config.deployment.num_teacher_gpus or 0
     teacher_local_gpu_ids = list(range(gpu_offset, gpu_offset + num_teacher_gpus)) if num_teacher_gpus > 0 else []
+    gpu_offset += num_teacher_gpus
 
-    total_requested_gpus = num_infer_gpus + config.deployment.num_train_gpus + num_teacher_gpus
+    # Phase 10: reserve a dedicated GPU slice for each Advantage subprocess
+    # when configured. Closes the Phase 7c gap where these two Popens
+    # inherited os.environ unfiltered and defaulted to GPU 0.
+    advantage_server_local_gpu_ids = (
+        list(range(gpu_offset, gpu_offset + 1)) if config.advantage_server is not None else []
+    )
+    gpu_offset += len(advantage_server_local_gpu_ids)
+    advantage_trainer_local_gpu_ids = (
+        list(range(gpu_offset, gpu_offset + 1)) if config.advantage_trainer is not None else []
+    )
+    gpu_offset += len(advantage_trainer_local_gpu_ids)
+
+    total_requested_gpus = (
+        num_infer_gpus
+        + config.deployment.num_train_gpus
+        + num_teacher_gpus
+        + len(advantage_server_local_gpu_ids)
+        + len(advantage_trainer_local_gpu_ids)
+    )
     physical_gpu_ids = get_physical_gpu_ids()
     if total_requested_gpus > len(physical_gpu_ids):
         raise ValueError(
@@ -177,6 +196,12 @@ def rl_local(config: RLConfig):
     infer_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in infer_local_gpu_ids]
     trainer_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in trainer_local_gpu_ids]
     teacher_gpu_ids = [physical_gpu_mapping[local_gpu_id] for local_gpu_id in teacher_local_gpu_ids]
+    advantage_server_gpu_ids = [
+        physical_gpu_mapping[local_gpu_id] for local_gpu_id in advantage_server_local_gpu_ids
+    ]
+    advantage_trainer_gpu_ids = [
+        physical_gpu_mapping[local_gpu_id] for local_gpu_id in advantage_trainer_local_gpu_ids
+    ]
 
     start_command = sys.argv
     logger.info("Starting RL run")
@@ -189,7 +214,15 @@ def rl_local(config: RLConfig):
         wandb_shared_env["WANDB_SHARED_RUN_ID"] = uuid.uuid4().hex
 
     # Check for existing processes on GPUs
-    all_gpu_ids = list(set(infer_gpu_ids + trainer_gpu_ids + teacher_gpu_ids))
+    all_gpu_ids = list(
+        set(
+            infer_gpu_ids
+            + trainer_gpu_ids
+            + teacher_gpu_ids
+            + advantage_server_gpu_ids
+            + advantage_trainer_gpu_ids
+        )
+    )
     check_gpus_available(all_gpu_ids)
 
     # Validate client port matches inference server port
@@ -303,10 +336,16 @@ def rl_local(config: RLConfig):
                 f"Starting Advantage Server (host={config.advantage_server.host}, port={config.advantage_server.port})"
             )
             logger.debug(f"Advantage Server start command: {' '.join(adv_server_cmd)}")
+            logger.info(
+                f"Advantage Server pinned to GPU(s) {' '.join(map(str, advantage_server_gpu_ids))}"
+            )
             with open(log_dir / "advantage_server.stdout", "w") as log_file:
                 advantage_server_process = Popen(
                     adv_server_cmd,
-                    env={**os.environ},
+                    env={
+                        **os.environ,
+                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, advantage_server_gpu_ids)),
+                    },
                     stdout=log_file,
                     stderr=log_file,
                 )
@@ -344,10 +383,16 @@ def rl_local(config: RLConfig):
                 f"max_steps={config.advantage_trainer.max_steps})"
             )
             logger.debug(f"Advantage Trainer start command: {' '.join(adv_trainer_cmd)}")
+            logger.info(
+                f"Advantage Trainer pinned to GPU(s) {' '.join(map(str, advantage_trainer_gpu_ids))}"
+            )
             with open(log_dir / "advantage_trainer.stdout", "w") as log_file:
                 advantage_trainer_process = Popen(
                     adv_trainer_cmd,
-                    env={**os.environ},
+                    env={
+                        **os.environ,
+                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, advantage_trainer_gpu_ids)),
+                    },
                     stdout=log_file,
                     stderr=log_file,
                 )
