@@ -115,6 +115,24 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
     data, and so policy updates are not well-predicted by the advantage sign.
     This shift is similar to the shift from GRPO -> CISPO, but with the trust
     region being approximated by the probability difference instead of ratio.
+
+    Phase 8 -- shared-loss design choice (GRPO / PPO / ARM):
+
+    This loss is shared across GRPO, PPO, and ARM algorithms. The
+    ``advantages`` field on ``LossInputs`` is per-token (Phase 1 contract);
+    the algorithm that produced those advantages is opaque to this function.
+    Sharing the loss across algorithms is an intentional experimental-design
+    choice -- the thesis positions ARM and PPO as alternatives to GRPO at
+    the *advantage computation* level, not the loss level. Holding the loss
+    constant isolates "advantage computation" as the only manipulated
+    variable in the empirical comparison.
+
+    The codepath ``pg_loss = keep_mask * advantages * importance_ratio``
+    broadcasts elementwise over the per-token advantages tensor, so it is
+    correct for both uniform (GRPO scalar broadcast) and varying
+    (PPO GAE / ARM regret matching) advantage shapes without any algorithm
+    branching. See ``plan/phases/phase-08-llm-loss-verification.md`` for the
+    full rationale and alternatives considered.
     """
     trainer_logprobs = inputs.trainer_logprobs
     inference_logprobs = inputs.inference_logprobs
