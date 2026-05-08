@@ -85,10 +85,12 @@ def test_substitute_empty_input_raises():
 
 
 def test_get_sampling_args_default_omits_top_logprobs():
-    """Default SamplingConfig: extra_body must NOT carry top_logprobs.
+    """Default SamplingConfig: extra_body must NOT carry top_logprobs
+    or return_tokens_as_token_ids.
 
     Top-level `logprobs: True` (chosen-token logprob) stays as is. The
-    Phase 5 toggle adds `extra_body["top_logprobs"] = K` only when on.
+    Phase 5 toggle adds `extra_body["top_logprobs"] = K` and
+    `extra_body["return_tokens_as_token_ids"] = True` only when on.
     """
     config = SamplingConfig(max_tokens=128)
     args = get_sampling_args(config, temperature=1.0, is_vllm=True)
@@ -96,6 +98,7 @@ def test_get_sampling_args_default_omits_top_logprobs():
     extra = args.get("extra_body", {})
     assert "logprobs" not in extra
     assert "top_logprobs" not in extra
+    assert "return_tokens_as_token_ids" not in extra
 
 
 def test_get_sampling_args_does_not_leak_internal_fields_to_top_level():
@@ -121,7 +124,11 @@ def test_get_sampling_args_does_not_leak_internal_fields_to_top_level():
 
 
 def test_get_sampling_args_with_toggle_on_adds_extra_body_top_logprobs_K():
-    """Toggle on -> OpenAI-standard `logprobs=True` + `top_logprobs=K`.
+    """Toggle on -> OpenAI-standard `logprobs=True` + `top_logprobs=K`,
+    plus vLLM\'s `return_tokens_as_token_ids=True` so each candidate\'s
+    `token` field is encoded as "token_id:N" (the verifiers fork\'s
+    extractor parses this; vLLM 0.17 dropped the legacy `.token_id`
+    extension on top_logprobs items).
 
     vLLM 0.17 enforces the OpenAI schema strictly (rejects integer
     `logprobs`); the bool/int split is the supported path. vLLM accepts
@@ -135,6 +142,7 @@ def test_get_sampling_args_with_toggle_on_adds_extra_body_top_logprobs_K():
     args = get_sampling_args(config, temperature=1.0, is_vllm=True)
     assert args["extra_body"]["logprobs"] is True
     assert args["extra_body"]["top_logprobs"] == 32
+    assert args["extra_body"]["return_tokens_as_token_ids"] is True
 
 
 def test_get_sampling_args_toggle_respects_custom_K():

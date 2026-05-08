@@ -71,10 +71,17 @@ def get_sampling_args(sampling_config: SamplingConfig, temperature: float, is_vl
     # split. vLLM 0.17 enforces the OpenAI schema strictly (rejects an integer
     # `logprobs` with a 400 bool_parsing error) but lifts the OpenAI-standard
     # cap of 20 on `top_logprobs`, so K=32 (and larger ablations) remain viable.
-    # Phase 5b extracts the candidate token IDs from the response.
+    #
+    # `return_tokens_as_token_ids=True` asks vLLM to encode integer token
+    # IDs into each candidate\'s `token` field as "token_id:N", since vLLM
+    # 0.17\'s ChatCompletionLogProb dropped the legacy `.token_id` extension
+    # field (only {token, logprob, bytes} remain). The verifiers fork\'s
+    # Phase 5b extractor parses both forms (legacy `.token_id` and
+    # "token_id:N"-encoded `token`).
     if return_top_k_token_ids:
         extra_body["logprobs"] = True
         extra_body["top_logprobs"] = top_k_action_set_size
+        extra_body["return_tokens_as_token_ids"] = True
 
     if extra_body:
         sampling_args["extra_body"] = extra_body
