@@ -32,9 +32,15 @@ class TrainingBatchSender(ABC):
 class TrainingBatchReceiver(ABC):
     """Base class for receiving training examples from orchestrator."""
 
+    # Subclasses can override _batch_type to decode a different msgspec.Struct.
+    # Phase 7b uses this for AdvantageTrainingBatch -- see
+    # `transport/advantage_batch.py`. Default preserves the existing
+    # TrainingBatch (LLM-side) behavior.
+    _batch_type: type = TrainingBatch
+
     def __init__(self) -> None:
         self.logger = get_logger()
-        self.decoder = msgspec.msgpack.Decoder(type=TrainingBatch)
+        self.decoder = msgspec.msgpack.Decoder(type=self._batch_type)
 
     @abstractmethod
     def can_receive(self) -> bool:

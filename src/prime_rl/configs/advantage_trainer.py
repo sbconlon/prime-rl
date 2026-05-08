@@ -17,10 +17,12 @@ value_forward, Polyak update, single-step training tests) needs. The full
 process plumbing (transport, weight broadcast, train.py entrypoint) is Phase 7b.
 """
 
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import Field
 
+from prime_rl.configs.shared import FileSystemTransportConfig, LogConfig, TransportConfig
 from prime_rl.orchestrator.value_networks import ValueNetworkConfig
 from prime_rl.utils.config import BaseConfig
 
@@ -75,3 +77,26 @@ class AdvantageTrainerConfig(BaseConfig):
         float,
         Field(gt=0.0, description="Learning rate for the value-network LoRA adapters and value heads."),
     ] = 1e-3
+
+    # Where to write logs / checkpoints. Mirrors trainer.output_dir.
+    output_dir: Annotated[
+        Path,
+        Field(description="Directory to write outputs to (logs, checkpoints, broadcast staging)."),
+    ] = Path("outputs/advantage_trainer")
+
+    # Orchestrator -> Advantage Trainer transport. Default to filesystem (debug
+    # / single-node); production typically uses ZMQ.
+    transport: Annotated[
+        TransportConfig,
+        Field(description="Transport for receiving AdvantageTrainingBatch from the orchestrator."),
+    ] = FileSystemTransportConfig()
+
+    # Log level + structured-log toggle.
+    log: Annotated[
+        LogConfig,
+        Field(description="Logging configuration."),
+    ] = LogConfig()
+
+    # Phase 7c will add: optim, scheduler, weight_broadcast, ckpt, wandb,
+    # heartbeat, metrics_server. For 7b, the algorithmic-core-via-train.py
+    # uses AdamW with `learning_rate` directly and stubs broadcast/ckpt.

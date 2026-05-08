@@ -104,6 +104,13 @@ def _ensure_lora_globals(scaling: float) -> None:
         or _lora_base.LORA_NUM_TOKENS.shape != (N_ADAPTERS,)
     )
     if needs_reset:
+        # Nullify both globals first. Otherwise, the consistency check inside
+        # set_lora_num_tokens / set_multilora_scaling rejects the shape
+        # transition (e.g., from [1] to [N_ADAPTERS]) because the OTHER
+        # global is still at the old shape. Both setters skip the cross-
+        # shape check when the other global is None.
+        _lora_base.LORA_NUM_TOKENS = None
+        _lora_base.SCALING_FACTORS = None
         set_lora_num_tokens(
             torch.zeros(N_ADAPTERS, dtype=torch.long), reset_reference=True
         )
