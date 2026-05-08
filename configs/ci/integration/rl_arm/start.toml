@@ -51,6 +51,13 @@ id = "reverse-text"
 
 [inference]
 
+# Phase 10: vLLM\'s max_logprobs default is 20; the ARM canary requests
+# top_k_action_set_size=32 from vLLM\'s top_logprobs param. Lift the cap
+# via the vllm_extra passthrough (setattr\'d onto vLLM\'s engine args
+# namespace; see src/prime_rl/inference/vllm/server.py:368).
+[inference.vllm_extra]
+max_logprobs = 32
+
 # Advantage Server subprocess (launcher spawns; Phase 6/6.5).
 [advantage_server]
 model_name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
