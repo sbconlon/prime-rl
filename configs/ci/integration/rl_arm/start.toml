@@ -1,0 +1,79 @@
+# Phase 10 -- ARM end-to-end canary CI config.
+#
+# Mirrors configs/ci/integration/rl/start.toml (the GRPO canary) with the
+# four ARM-specific deltas:
+#   - orchestrator.algorithm = "arm"
+#   - orchestrator.sampling.return_top_k_token_ids = true
+#   - orchestrator.sampling.top_k_action_set_size  = 32
+#   - [advantage_server], [orchestrator.advantage_server], [advantage_trainer]
+#     subprocess + client config blocks (the launcher spawns the two extra
+#     processes when these are present; see entrypoints/rl.py).
+#
+# Note: the Phase 10 doc names the top-K toggles as inference.return_top_k_token_ids
+# / inference.top_k_action_set_size; the actual fields live on
+# orchestrator.sampling (see src/prime_rl/configs/orchestrator.py:163 / :176).
+# Used the correct path here.
+#
+# Standalone advantage_server.toml + advantage_trainer.toml in this directory
+# mirror the inline subprocess sections below so the per-subprocess configs
+# are also discoverable as standalone artifacts (the launcher itself only
+# ingests start.toml and renders the subconfigs to <output_dir>/configs/ at
+# runtime via Phase 7c's write_subconfigs).
+
+max_steps = 20
+seq_len = 2048
+
+[ckpt]
+
+[model]
+name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
+
+[trainer.optim]
+lr = 3e-6
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+algorithm = "arm"
+
+[orchestrator.sampling]
+max_tokens = 128
+return_top_k_token_ids = true
+top_k_action_set_size = 32
+
+# Orchestrator-side client config: how the orchestrator reaches the
+# Advantage Server. Must match the [advantage_server] host/port below.
+[orchestrator.advantage_server]
+base_url = "http://127.0.0.1:8200"
+
+[[orchestrator.env]]
+id = "reverse-text"
+
+[inference]
+
+# Advantage Server subprocess (launcher spawns; Phase 6/6.5).
+[advantage_server]
+model_name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
+host = "127.0.0.1"
+port = 8200
+
+[advantage_server.lora]
+rank = 16
+alpha = 32.0
+dropout = 0.0
+
+# Advantage Trainer subprocess (launcher spawns; Phase 7).
+# algorithm = "arm" enables the Q+ loss term in addition to V regression.
+[advantage_trainer]
+algorithm = "arm"
+max_steps = 20
+learning_rate = 1e-3
+
+[advantage_trainer.model]
+base_model_name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
+polyak_tau = 0.005
+
+[advantage_trainer.model.lora]
+rank = 16
+alpha = 32.0
+dropout = 0.0

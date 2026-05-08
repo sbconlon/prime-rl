@@ -6,6 +6,8 @@ import tomli_w
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_config import ConfigFileError
 
+from prime_rl.configs.advantage_server import AdvantageServerConfig
+from prime_rl.configs.advantage_trainer import AdvantageTrainerConfig
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.configs.rl import RLConfig
@@ -14,13 +16,19 @@ from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
 from prime_rl.utils.config import BaseConfig, cli
 
-# All config config classes
+# All config config classes. The two Advantage* entries (Phase 6/7) cover
+# the standalone subprocess TOMLs the launcher itself doesn\'t consume
+# directly (it consumes start.toml and renders subconfigs at runtime via
+# write_subconfigs); they ship alongside start.toml so subprocess configs
+# are discoverable as standalone artifacts (per the phase docs).
 CONFIG_CLASSES = [
     RLConfig,
     TrainerConfig,
     SFTConfig,
     OrchestratorConfig,
     InferenceConfig,
+    AdvantageServerConfig,
+    AdvantageTrainerConfig,
 ]
 
 

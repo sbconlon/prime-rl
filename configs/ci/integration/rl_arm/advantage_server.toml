@@ -1,0 +1,16 @@
+# Phase 10 -- standalone Advantage Server config (Phase 6/6.5).
+#
+# This file mirrors the [advantage_server] section of start.toml. The launcher
+# itself only consumes start.toml and renders the per-subprocess configs to
+# <output_dir>/configs/ at runtime (see Phase 7c's write_subconfigs); this
+# standalone file exists per the Phase 10 doc so the subprocess configs are
+# also checked in as discoverable artifacts.
+
+model_name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
+host = "127.0.0.1"
+port = 8200
+
+[lora]
+rank = 16
+alpha = 32.0
+dropout = 0.0
