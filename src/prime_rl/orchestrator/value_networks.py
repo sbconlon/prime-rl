@@ -28,12 +28,17 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from typing import TYPE_CHECKING
+
 from prime_rl.configs.trainer import LoRAConfig
 from prime_rl.trainer.lora import (
     _find_target_modules,
     _get_module_by_name,
     _set_module_by_name,
 )
+
+if TYPE_CHECKING:
+    from transformers import DynamicCache
 from prime_rl.trainer.models.layers.lora.base import (
     LORA_NUM_TOKENS,
     SCALING_FACTORS,
@@ -260,6 +265,144 @@ class ValueNetworkBackbone(nn.Module):
         """
         hidden = self._forward_base(input_ids, V_TARGET_SLOT)
         return self.v_target_head(hidden[:, -1, :])
+
+    # -------------------------------------------------------------------
+    # Phase 6.5: optimized forwards
+    # -------------------------------------------------------------------
+    #
+    # The naive `forward_v` / `forward_q_plus` / `forward_v_target` above
+    # produce one scalar per call by reading the value head at a single
+    # position. They are correct but unusably slow at production rollout
+    # length (~5000-9000 tokens) since each call is a full LLM forward.
+    #
+    # The optimized methods below produce one scalar per token from a
+    # SINGLE forward pass through the joint trajectory:
+    #   * forward_v_all_positions / forward_v_target_all_positions /
+    #     forward_q_plus_sampled_all_positions: one forward, all-positions
+    #     value-head reads, plus the populated `past_key_values` cache.
+    #   * forward_q_plus_candidates_at_position: batched K-candidate
+    #     evaluation using a (cloned + cropped + tiled) cache from a prior
+    #     Q+ forward.
+    #
+    # Per the Phase 6.5 spike (§12 of the phase doc), the cache stores
+    # LoRA-contributed K/V (because MultiLoRALinear's forward returns
+    # base + lora), so each per-adapter forward produces an
+    # adapter-specific cache. `set_lora_num_tokens` between forwards
+    # selects the adapter slot for THAT call's cache contributions.
+    # The naive forward methods are retained as the correctness oracle
+    # against which these optimized methods are tested.
+
+    def forward_v_all_positions(
+        self, input_ids: Tensor
+    ) -> tuple[Tensor, "DynamicCache"]:
+        """Forward through V slot, return per-token V values + populated cache.
+
+        input_ids: [batch, seq_len]
+        Returns:
+            v_values: [batch, seq_len] -- v_head applied at every position
+            past_key_values: DynamicCache populated with V slot's K/V
+        """
+        return self._forward_all_positions(input_ids, V_SLOT, self.v_head)
+
+    def forward_v_target_all_positions(
+        self, input_ids: Tensor
+    ) -> tuple[Tensor, "DynamicCache"]:
+        """Same as forward_v_all_positions but routed through V_target slot."""
+        return self._forward_all_positions(input_ids, V_TARGET_SLOT, self.v_target_head)
+
+    def forward_q_plus_sampled_all_positions(
+        self, input_ids: Tensor
+    ) -> tuple[Tensor, "DynamicCache"]:
+        """Forward through Q+ slot; return per-token Q+ values for the
+        SAMPLED action at each position, plus populated cache.
+
+        At position k, the model has just processed token completion_ids[k]
+        (the sampled action a_k) and the hidden state at that position
+        represents the post-action state. q_plus_head(hidden[k]) is
+        Q+(o_k, a_k) for the sampled action, where o_k is the prefix BEFORE
+        token k. (NB: this differs from `forward_q_plus(obs, a)` which
+        appends `a` to `obs`; the all-positions read here exploits the fact
+        that completion_ids already contains the sampled action.)
+        """
+        return self._forward_all_positions(input_ids, Q_PLUS_SLOT, self.q_plus_head)
+
+    def _forward_all_positions(
+        self, input_ids: Tensor, slot: int, head: nn.Module
+    ) -> tuple[Tensor, "DynamicCache"]:
+        """Shared implementation for the three all-positions forwards."""
+        batch, seq = input_ids.shape
+        with _adapter_routing(slot, batch * seq):
+            output = self.base_model(input_ids, use_cache=True)
+        return head(output.last_hidden_state), output.past_key_values
+
+    def forward_q_plus_candidates_at_position(
+        self,
+        prefix_past_key_values: "DynamicCache",
+        candidate_token_ids: Tensor,
+        prefix_length: int,
+    ) -> Tensor:
+        """Batched Q+ evaluation for K candidate actions at a single position.
+
+        prefix_past_key_values:
+            DynamicCache from a prior Q+ forward over a length-`prefix_length`
+            prefix. The cache must NOT be the original full-trajectory cache
+            (which would be longer); the caller is responsible for cropping
+            via `_clone_and_crop_cache` before passing it here.
+
+        candidate_token_ids: [K] candidate token IDs to evaluate at the next position.
+
+        prefix_length: integer length of the prefix the cache covers; tells
+            HF where to write the new K/V via cache_position.
+
+        Returns: q_plus_values [K]
+        """
+        K = candidate_token_ids.numel()
+        # The cache might be batch=1 (just-cropped) or already batch=K.
+        # Detect and tile if needed.
+        first_layer_keys = prefix_past_key_values.layers[0].keys
+        if first_layer_keys.shape[0] == 1 and K > 1:
+            # In-place tile to batch dim K.
+            prefix_past_key_values.batch_repeat_interleave(K)
+        elif first_layer_keys.shape[0] != K:
+            raise ValueError(
+                f"Cache batch dim ({first_layer_keys.shape[0]}) doesn't match K ({K}); "
+                "caller should pass a cache cloned from a batch=1 forward."
+            )
+
+        device = first_layer_keys.device
+        candidates_input = candidate_token_ids.to(device=device, dtype=torch.long).view(K, 1)
+        cache_position = torch.tensor([prefix_length], dtype=torch.long, device=device)
+
+        with _adapter_routing(Q_PLUS_SLOT, K):
+            output = self.base_model(
+                candidates_input,
+                past_key_values=prefix_past_key_values,
+                use_cache=True,
+                cache_position=cache_position,
+            )
+        # output.last_hidden_state: [K, 1, hidden]
+        return self.q_plus_head(output.last_hidden_state[:, 0, :])
+
+    @staticmethod
+    def clone_and_crop_cache(
+        cache: "DynamicCache", crop_length: int
+    ) -> "DynamicCache":
+        """Make a fresh DynamicCache from `cache`, cropped to first `crop_length`
+        positions. Tensors are detached + cloned (forward-output tensors are
+        not graph leaves and aren't deepcopy-able directly).
+
+        Used by the compute layer to evaluate K candidates at multiple positions
+        from a single full-trajectory Q+ cache: clone+crop per position, tile
+        to K, forward batched.
+        """
+        from transformers import DynamicCache
+
+        new_cache = DynamicCache()
+        for layer_idx, layer in enumerate(cache.layers):
+            keys = layer.keys[:, :, :crop_length, :].detach().clone()
+            values = layer.values[:, :, :crop_length, :].detach().clone()
+            new_cache.update(keys, values, layer_idx)
+        return new_cache
 
     # -------------------------------------------------------------------
     # Polyak update

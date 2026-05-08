@@ -420,3 +420,214 @@ def test_forward_q_plus_deterministic(tiny_backbone: ValueNetworkBackbone):
     out_a = tiny_backbone.forward_q_plus(obs, action_id=5)
     out_b = tiny_backbone.forward_q_plus(obs, action_id=5)
     assert torch.equal(out_a, out_b)
+
+
+# ===========================================================================
+# Phase 6.5 -- optimized-vs-naive correctness oracle tests
+# ===========================================================================
+# The naive forward methods (Phase 4) serve as the correctness oracle for the
+# optimized methods (Phase 6.5). For each optimized method, the test asserts
+# the optimized output matches the per-position naive output within float
+# tolerance.
+# ---------------------------------------------------------------------------
+
+
+def _backbone_with_distinct_adapters_and_heads() -> ValueNetworkBackbone:
+    """Build a tiny ValueNetworkBackbone with non-zero LoRA + non-zero value
+    heads. Production zero-init makes iteration-0 outputs trivially zero;
+    these tests exercise the non-trivial path.
+    """
+    import torch
+    from transformers import Qwen2Config, Qwen2Model
+
+    from prime_rl.configs.trainer import LoRAConfig
+    from prime_rl.orchestrator.value_networks import (
+        Q_PLUS_SLOT,
+        V_SLOT,
+        V_TARGET_SLOT,
+        ValueNetworkBackbone,
+    )
+    from prime_rl.trainer.models.layers.lora.multi_linear import MultiLoRALinear
+
+    torch.manual_seed(0)
+    config = Qwen2Config(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=128,
+    )
+    backbone = ValueNetworkBackbone(
+        Qwen2Model(config),
+        lora_config=LoRAConfig(rank=8, alpha=16.0, dropout=0.0),
+        polyak_tau=0.005,
+    )
+    backbone.eval()
+    # Set distinct LoRA values per slot.
+    with torch.no_grad():
+        for module in backbone.base_model.modules():
+            if isinstance(module, MultiLoRALinear):
+                module.lora_A[V_SLOT].fill_(0.4)
+                module.lora_B[V_SLOT].fill_(0.4)
+                module.lora_A[Q_PLUS_SLOT].fill_(0.6)
+                module.lora_B[Q_PLUS_SLOT].fill_(0.6)
+                module.lora_A[V_TARGET_SLOT].fill_(0.5)
+                module.lora_B[V_TARGET_SLOT].fill_(0.5)
+        # Break head zero-init so non-trivial dynamics flow through.
+        for head in (backbone.v_head, backbone.q_plus_head, backbone.v_target_head):
+            torch.nn.init.normal_(head.linear.weight, mean=0.0, std=0.02)
+    return backbone
+
+
+def test_forward_v_all_positions_matches_per_position_naive():
+    """Single all-positions forward gives the same V values as N naive
+    forwards over progressive prefixes."""
+    import torch
+
+    backbone = _backbone_with_distinct_adapters_and_heads()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    seq_len = input_ids.shape[1]
+
+    naive = [backbone.forward_v(input_ids[:, : k + 1]).item() for k in range(seq_len)]
+    optimized, _ = backbone.forward_v_all_positions(input_ids)
+    optimized_list = optimized[0].tolist()
+
+    for k, (a, b) in enumerate(zip(naive, optimized_list)):
+        assert abs(a - b) < 1e-4, f"position {k}: naive={a}, optimized={b}"
+
+
+def test_forward_v_target_all_positions_matches_naive():
+    """Same correctness oracle for V_target slot."""
+    import torch
+
+    backbone = _backbone_with_distinct_adapters_and_heads()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    seq_len = input_ids.shape[1]
+
+    naive = [backbone.forward_v_target(input_ids[:, : k + 1]).item() for k in range(seq_len)]
+    optimized, _ = backbone.forward_v_target_all_positions(input_ids)
+    optimized_list = optimized[0].tolist()
+
+    for k, (a, b) in enumerate(zip(naive, optimized_list)):
+        assert abs(a - b) < 1e-4, f"position {k}: naive={a}, optimized={b}"
+
+
+def test_forward_q_plus_sampled_all_positions_matches_naive():
+    """For each position k, optimized Q+ at the sampled action equals naive
+    forward_q_plus over the prefix-before-k with the sampled action appended.
+
+    Specifically, the optimized method reads q_plus_head at position k of
+    a forward over [prompt + completion]. That's equivalent to:
+        prefix = prompt + completion[:k]
+        sampled = completion[k]
+        forward_q_plus(prefix, sampled)
+    """
+    import torch
+
+    backbone = _backbone_with_distinct_adapters_and_heads()
+    # Use a short input so naive iteration is fast.
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    seq_len = input_ids.shape[1]
+
+    optimized, _ = backbone.forward_q_plus_sampled_all_positions(input_ids)
+    optimized_list = optimized[0].tolist()
+
+    # Naive: for each position k, append completion[k] to the prefix-before-k.
+    # The prefix-before-k is input_ids[:, :k]; the sampled action at k is
+    # input_ids[0, k].
+    for k in range(seq_len):
+        if k == 0:
+            # Skip k=0: forward_q_plus needs a non-empty prefix.
+            continue
+        prefix = input_ids[:, :k]
+        sampled = int(input_ids[0, k].item())
+        naive_qpk = backbone.forward_q_plus(prefix, action_id=sampled).item()
+        assert abs(naive_qpk - optimized_list[k]) < 1e-4, (
+            f"position {k}: naive={naive_qpk}, optimized={optimized_list[k]}"
+        )
+
+
+def test_forward_q_plus_candidates_at_position_batched_matches_naive():
+    """Batched K-candidate forward with cloned+cropped+tiled cache matches
+    K naive forward_q_plus calls, each with a single candidate."""
+    import torch
+
+    from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
+
+    backbone = _backbone_with_distinct_adapters_and_heads()
+    full_input = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])  # [1, 8]
+    prefix_length = 5  # evaluate candidates at position 5 (after 5 tokens)
+    candidates = [10, 20, 30, 40]
+    K = len(candidates)
+
+    # Naive: for each candidate, full forward_q_plus(prefix=full_input[:, :prefix_length], action_id=candidate).
+    prefix = full_input[:, :prefix_length]
+    naive = [backbone.forward_q_plus(prefix, action_id=c).item() for c in candidates]
+
+    # Optimized: forward Q+ over full_input to get the cache, clone+crop to
+    # `prefix_length`, tile to K, batched forward.
+    _, q_cache = backbone.forward_q_plus_sampled_all_positions(full_input)
+    cropped = ValueNetworkBackbone.clone_and_crop_cache(q_cache, prefix_length)
+    candidates_tensor = torch.tensor(candidates, dtype=torch.long)
+    optimized = backbone.forward_q_plus_candidates_at_position(
+        cropped, candidates_tensor, prefix_length
+    ).tolist()
+
+    for i, (a, b) in enumerate(zip(naive, optimized)):
+        assert abs(a - b) < 1e-3, f"candidate {i} ({candidates[i]}): naive={a}, optimized={b}"
+
+
+def test_clone_and_crop_cache_preserves_original():
+    """Clone + crop the cache; verify the original cache is unchanged
+    (so callers can use the same cache at multiple positions)."""
+    import torch
+
+    from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
+
+    backbone = _backbone_with_distinct_adapters_and_heads()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    _, cache = backbone.forward_q_plus_sampled_all_positions(input_ids)
+
+    original_keys_shape = tuple(cache.layers[0].keys.shape)
+    cropped = ValueNetworkBackbone.clone_and_crop_cache(cache, 3)
+
+    # Mutate the clone -- batch_repeat_interleave is in-place.
+    cropped.batch_repeat_interleave(2)
+    assert tuple(cropped.layers[0].keys.shape) == (2, 4, 3, 16)
+
+    # Original is unchanged.
+    assert tuple(cache.layers[0].keys.shape) == original_keys_shape
+
+
+def test_optimized_q_plus_at_zero_init_matches_zero():
+    """Sanity: at iteration-0 (zero-init adapters and heads),
+    forward_q_plus_sampled_all_positions returns all zeros, matching the
+    iteration-0 invariant for ARM's cold-start branch."""
+    import torch
+    from transformers import Qwen2Config, Qwen2Model
+
+    from prime_rl.configs.trainer import LoRAConfig
+    from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
+
+    torch.manual_seed(0)
+    config = Qwen2Config(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=128,
+    )
+    backbone = ValueNetworkBackbone(
+        Qwen2Model(config),
+        lora_config=LoRAConfig(rank=8, alpha=16.0, dropout=0.0),
+        polyak_tau=0.005,
+    )
+    backbone.eval()
+
+    input_ids = torch.tensor([[1, 2, 3, 4]])
+    q_all, _ = backbone.forward_q_plus_sampled_all_positions(input_ids)
+    assert q_all.abs().max().item() < 1e-7

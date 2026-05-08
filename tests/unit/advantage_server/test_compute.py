@@ -289,3 +289,285 @@ def test_dispatch_unknown_algorithm_raises(tiny_backbone: ValueNetworkBackbone):
             algorithm="grpo",  # type: ignore[arg-type]
             backbone=tiny_backbone,
         )
+
+
+# ===========================================================================
+# Phase 6.5 -- compute-level optimized-vs-naive correctness oracle
+# ===========================================================================
+# Strongest possible test: on the same input, the Phase 6.5 optimized compute
+# (which uses ValueNetworkBackbone's all-positions + batched-candidate methods)
+# matches a NAIVE compute that uses the per-position forward methods. The
+# naive compute is implemented inline in this test file as the oracle (it
+# mirrors the Phase 6 implementation exactly, kept here to detect any future
+# drift between the optimized and naive paths).
+# ---------------------------------------------------------------------------
+
+
+def _naive_compute_advantages_and_targets_ppo(
+    samples,
+    episodic_reward,
+    is_terminal,
+    backbone,
+    *,
+    gamma=0.99,
+    lam=0.95,
+):
+    """Naive (Phase 6) PPO compute -- per-position forward_v / forward_v_target
+    calls. Used as the correctness oracle for the Phase 6.5 optimized path.
+    """
+    import msgspec.structs
+    import torch
+
+    from prime_rl.orchestrator.per_token_advantage import (
+        PpoAdvantageInputs,
+        ppo_gae_advantage_fn,
+    )
+    from prime_rl.transport.types import AdvantageTrainingSample
+
+    backbone.eval()
+    device = next(backbone.parameters()).device
+    v_list, v_target_list = [], []
+
+    with torch.no_grad():
+        for sample in samples:
+            for j, mask_bit in enumerate(sample.completion_mask):
+                if not mask_bit:
+                    continue
+                prefix_ids = list(sample.prompt_ids) + list(sample.completion_ids[:j])
+                input_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
+                v_list.append(float(backbone.forward_v(input_ids).item()))
+                v_target_list.append(float(backbone.forward_v_target(input_ids).item()))
+
+    v_all = torch.tensor(v_list, dtype=torch.float32)
+    v_target_all = torch.tensor(v_target_list, dtype=torch.float32)
+    out = ppo_gae_advantage_fn(
+        PpoAdvantageInputs(
+            samples=samples,
+            episodic_reward=episodic_reward,
+            is_terminal=is_terminal,
+            v_all=v_all,
+            v_target_all=v_target_all,
+            gamma=gamma,
+            lam=lam,
+        )
+    )
+
+    paired = []
+    for i, sample in enumerate(samples):
+        new_llm = msgspec.structs.replace(sample, advantages=out.advantages[i])
+        adv = AdvantageTrainingSample(
+            prompt_ids=list(sample.prompt_ids),
+            prompt_mask=list(sample.prompt_mask),
+            completion_ids=list(sample.completion_ids),
+            completion_mask=list(sample.completion_mask),
+            v_targets=out.v_targets[i],
+            q_plus_targets=None,
+        )
+        paired.append((new_llm, adv))
+    return paired
+
+
+def _naive_compute_advantages_and_targets_arm(
+    samples,
+    episodic_reward,
+    is_terminal,
+    backbone,
+    *,
+    gamma=0.99,
+    n_step=5,
+):
+    """Naive (Phase 6) ARM compute. Per-position V / V_target / Q+_sampled +
+    K naive forward_q_plus calls per position for candidate evaluation.
+    """
+    import msgspec.structs
+    import torch
+
+    from prime_rl.orchestrator.per_token_advantage import (
+        ArmAdvantageInputs,
+        arm_regret_matching_advantage_fn,
+    )
+    from prime_rl.transport.types import AdvantageTrainingSample
+
+    backbone.eval()
+    device = next(backbone.parameters()).device
+    v_list, v_target_list, qp_sampled_list = [], [], []
+    qp_candidates_list = []
+
+    with torch.no_grad():
+        for sample in samples:
+            local_active = 0
+            for j, mask_bit in enumerate(sample.completion_mask):
+                if not mask_bit:
+                    continue
+                prefix_ids = list(sample.prompt_ids) + list(sample.completion_ids[:j])
+                input_ids = torch.tensor([prefix_ids], dtype=torch.long, device=device)
+                v_list.append(float(backbone.forward_v(input_ids).item()))
+                v_target_list.append(float(backbone.forward_v_target(input_ids).item()))
+                sampled_token = int(sample.completion_ids[j])
+                qp_sampled_list.append(
+                    float(backbone.forward_q_plus(input_ids, sampled_token).item())
+                )
+                cands = sample.completion_top_k_token_ids[local_active]
+                qp_candidates_list.append(
+                    [
+                        float(backbone.forward_q_plus(input_ids, int(c)).item())
+                        for c in cands
+                    ]
+                )
+                local_active += 1
+
+    v_all = torch.tensor(v_list, dtype=torch.float32)
+    v_target_all = torch.tensor(v_target_list, dtype=torch.float32)
+    qp_sampled_all = torch.tensor(qp_sampled_list, dtype=torch.float32)
+    qp_candidates = torch.tensor(qp_candidates_list, dtype=torch.float32)
+
+    out = arm_regret_matching_advantage_fn(
+        ArmAdvantageInputs(
+            samples=samples,
+            episodic_reward=episodic_reward,
+            is_terminal=is_terminal,
+            v_all=v_all,
+            v_target_all=v_target_all,
+            q_plus_sampled_all=qp_sampled_all,
+            q_plus_candidates=qp_candidates,
+            gamma=gamma,
+            n_step=n_step,
+        )
+    )
+
+    paired = []
+    for i, sample in enumerate(samples):
+        new_llm = msgspec.structs.replace(sample, advantages=out.advantages[i])
+        adv = AdvantageTrainingSample(
+            prompt_ids=list(sample.prompt_ids),
+            prompt_mask=list(sample.prompt_mask),
+            completion_ids=list(sample.completion_ids),
+            completion_mask=list(sample.completion_mask),
+            v_targets=out.v_targets[i],
+            q_plus_targets=out.q_plus_targets[i] if out.q_plus_targets else None,
+        )
+        paired.append((new_llm, adv))
+    return paired
+
+
+def _backbone_with_distinct_adapters_and_heads():
+    """Tiny backbone with non-zero LoRA + non-zero heads (so optimized vs naive
+    distinguishes meaningfully). Mirrors the helper in test_value_networks.py
+    (Phase 6.5)."""
+    import torch
+    from transformers import Qwen2Config, Qwen2Model
+
+    from prime_rl.configs.trainer import LoRAConfig
+    from prime_rl.orchestrator.value_networks import (
+        Q_PLUS_SLOT,
+        V_SLOT,
+        V_TARGET_SLOT,
+        ValueNetworkBackbone,
+    )
+    from prime_rl.trainer.models.layers.lora.multi_linear import MultiLoRALinear
+
+    torch.manual_seed(0)
+    config = Qwen2Config(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=128,
+    )
+    backbone = ValueNetworkBackbone(
+        Qwen2Model(config),
+        lora_config=LoRAConfig(rank=8, alpha=16.0, dropout=0.0),
+        polyak_tau=0.005,
+    )
+    backbone.eval()
+    with torch.no_grad():
+        for module in backbone.base_model.modules():
+            if isinstance(module, MultiLoRALinear):
+                module.lora_A[V_SLOT].fill_(0.4)
+                module.lora_B[V_SLOT].fill_(0.4)
+                module.lora_A[Q_PLUS_SLOT].fill_(0.6)
+                module.lora_B[Q_PLUS_SLOT].fill_(0.6)
+                module.lora_A[V_TARGET_SLOT].fill_(0.5)
+                module.lora_B[V_TARGET_SLOT].fill_(0.5)
+        for head in (backbone.v_head, backbone.q_plus_head, backbone.v_target_head):
+            torch.nn.init.normal_(head.linear.weight, mean=0.0, std=0.02)
+    return backbone
+
+
+def test_optimized_compute_ppo_matches_naive_compute_ppo():
+    """Optimized PPO compute matches naive PPO compute on a non-trivial
+    backbone (correctness oracle test, Phase 6.5)."""
+    backbone = _backbone_with_distinct_adapters_and_heads()
+    sample = _make_sample(completion_len=4)
+
+    optimized = compute_advantages_and_targets_ppo(
+        samples=[sample], episodic_reward=1.0, is_terminal=True, backbone=backbone
+    )
+    naive = _naive_compute_advantages_and_targets_ppo(
+        samples=[sample], episodic_reward=1.0, is_terminal=True, backbone=backbone
+    )
+
+    assert len(optimized) == len(naive) == 1
+    opt_llm, opt_adv = optimized[0]
+    naive_llm, naive_adv = naive[0]
+    for i, (a, b) in enumerate(zip(opt_llm.advantages, naive_llm.advantages)):
+        assert abs(a - b) < 1e-3, f"advantage[{i}]: opt={a}, naive={b}"
+    for i, (a, b) in enumerate(zip(opt_adv.v_targets, naive_adv.v_targets)):
+        assert abs(a - b) < 1e-3, f"v_target[{i}]: opt={a}, naive={b}"
+    assert opt_adv.q_plus_targets is None and naive_adv.q_plus_targets is None
+
+
+def test_optimized_compute_arm_matches_naive_compute_arm():
+    """Optimized ARM compute matches naive ARM compute on a non-trivial
+    backbone (correctness oracle test, Phase 6.5)."""
+    K = 4
+    completion_len = 3
+    backbone = _backbone_with_distinct_adapters_and_heads()
+    sample = _make_sample(
+        completion_len=completion_len,
+        completion_top_k_token_ids=[
+            [10 + j for j in range(K)] for j in range(completion_len)
+        ],
+    )
+
+    optimized = compute_advantages_and_targets_arm(
+        samples=[sample], episodic_reward=1.0, is_terminal=True, backbone=backbone
+    )
+    naive = _naive_compute_advantages_and_targets_arm(
+        samples=[sample], episodic_reward=1.0, is_terminal=True, backbone=backbone
+    )
+
+    opt_llm, opt_adv = optimized[0]
+    naive_llm, naive_adv = naive[0]
+    for i, (a, b) in enumerate(zip(opt_llm.advantages, naive_llm.advantages)):
+        assert abs(a - b) < 1e-3, f"advantage[{i}]: opt={a}, naive={b}"
+    for i, (a, b) in enumerate(zip(opt_adv.v_targets, naive_adv.v_targets)):
+        assert abs(a - b) < 1e-3, f"v_target[{i}]: opt={a}, naive={b}"
+    assert opt_adv.q_plus_targets is not None and naive_adv.q_plus_targets is not None
+    for i, (a, b) in enumerate(zip(opt_adv.q_plus_targets, naive_adv.q_plus_targets)):
+        assert abs(a - b) < 1e-3, f"q_plus_target[{i}]: opt={a}, naive={b}"
+
+
+def test_optimized_compute_handles_fragmented_rollout():
+    """Two-sample fragmented rollout: optimized matches naive across the
+    boundary (joint recursion preserved)."""
+    backbone = _backbone_with_distinct_adapters_and_heads()
+    s0 = _make_sample(completion_len=2)
+    s1 = _make_sample(completion_len=3, prompt_ids=[3, 4])
+
+    optimized = compute_advantages_and_targets_ppo(
+        samples=[s0, s1], episodic_reward=1.0, is_terminal=True, backbone=backbone
+    )
+    naive = _naive_compute_advantages_and_targets_ppo(
+        samples=[s0, s1], episodic_reward=1.0, is_terminal=True, backbone=backbone
+    )
+
+    for sample_idx in range(2):
+        opt_llm, opt_adv = optimized[sample_idx]
+        naive_llm, naive_adv = naive[sample_idx]
+        for i, (a, b) in enumerate(zip(opt_llm.advantages, naive_llm.advantages)):
+            assert abs(a - b) < 1e-3, (
+                f"sample {sample_idx} advantage[{i}]: opt={a}, naive={b}"
+            )
