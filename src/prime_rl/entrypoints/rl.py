@@ -29,6 +29,7 @@ ORCHESTRATOR_TOML = "orchestrator.toml"
 INFERENCE_TOML = "inference.toml"
 TEACHER_INFERENCE_TOML = "teacher_inference.toml"
 ADVANTAGE_SERVER_TOML = "advantage_server.toml"
+ADVANTAGE_TRAINER_TOML = "advantage_trainer.toml"
 
 
 def get_physical_gpu_ids() -> list[int]:
@@ -73,6 +74,31 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
     if config.advantage_server is not None:
         with open(output_dir / ADVANTAGE_SERVER_TOML, "wb") as f:
             tomli_w.dump(config.advantage_server.model_dump(exclude_none=True, mode="json"), f)
+
+    # Phase 7c: render advantage_trainer.toml when launcher is configured
+    # to spawn it. The launcher overrides two fields so the orchestrator,
+    # Advantage Server, and Advantage Trainer agree on wire connections:
+    #   - transport_input_dir: where the orchestrator writes
+    #     AdvantageTrainingBatch files. Must match the orchestrator's
+    #     hardcoded sender output_dir (config.orchestrator.output_dir /
+    #     "advantage_trainer_transport"; see orchestrator.py).
+    #   - advantage_server_url: where the trainer POSTs updated weights.
+    #     Built from the launcher-spawned server's host:port. None when
+    #     the launcher does not also spawn an Advantage Server (the
+    #     trainer will then train in isolation -- useful for debug).
+    if config.advantage_trainer is not None:
+        trainer_overrides = {
+            "transport_input_dir": (
+                config.orchestrator.output_dir / "advantage_trainer_transport"
+            ),
+        }
+        if config.advantage_server is not None:
+            trainer_overrides["advantage_server_url"] = (
+                f"http://{config.advantage_server.host}:{config.advantage_server.port}"
+            )
+        wired_trainer = config.advantage_trainer.model_copy(update=trainer_overrides)
+        with open(output_dir / ADVANTAGE_TRAINER_TOML, "wb") as f:
+            tomli_w.dump(wired_trainer.model_dump(exclude_none=True, mode="json"), f)
 
 
 def check_gpus_available(gpu_ids: list[int]) -> None:
@@ -302,6 +328,40 @@ def rl_local(config: RLConfig):
                 "No teacher_inference config specified, skipping starting teacher inference server. "
                 "Is your teacher inference server running? Make sure orchestrator.teacher_model is configured."
             )
+
+        # Phase 7c: optionally spawn Advantage Trainer subprocess (PPO/ARM
+        # only). The trainer reads AdvantageTrainingBatch from
+        # config.orchestrator.output_dir / "advantage_trainer_transport"
+        # and POSTs updated weights to the Advantage Server's
+        # /update_weights endpoint after each gradient step.
+        if config.advantage_trainer is not None:
+            adv_trainer_cmd = [
+                "uv", "run", "advantage-trainer", "@",
+                (config_dir / ADVANTAGE_TRAINER_TOML).as_posix(),
+            ]
+            logger.info(
+                f"Starting Advantage Trainer (algorithm={config.advantage_trainer.algorithm}, "
+                f"max_steps={config.advantage_trainer.max_steps})"
+            )
+            logger.debug(f"Advantage Trainer start command: {' '.join(adv_trainer_cmd)}")
+            with open(log_dir / "advantage_trainer.stdout", "w") as log_file:
+                advantage_trainer_process = Popen(
+                    adv_trainer_cmd,
+                    env={**os.environ},
+                    stdout=log_file,
+                    stderr=log_file,
+                )
+            processes.append(advantage_trainer_process)
+
+            stop_event = Event()
+            stop_events["advantage_trainer"] = stop_event
+            monitor_thread = Thread(
+                target=monitor_process,
+                args=(advantage_trainer_process, stop_event, error_queue, "advantage_trainer"),
+                daemon=True,
+            )
+            monitor_thread.start()
+            monitor_threads.append(monitor_thread)
 
         # Start orchestrator process
         orchestrator_cmd = [

@@ -91,12 +91,37 @@ class AdvantageTrainerConfig(BaseConfig):
         Field(description="Transport for receiving AdvantageTrainingBatch from the orchestrator."),
     ] = FileSystemTransportConfig()
 
+    # Phase 7c: directory the orchestrator writes AdvantageTrainingBatch
+    # files into (filesystem transport only). The launch script wires this
+    # to <orchestrator.output_dir>/advantage_trainer_transport so sender
+    # and receiver agree on layout. Required when transport.type ==
+    # "filesystem"; ignored when transport.type == "zmq".
+    transport_input_dir: Annotated[
+        Path | None,
+        Field(
+            description=(
+                "Directory to read AdvantageTrainingBatch files from "
+                "(filesystem transport only). Set by the launch script "
+                "to match the orchestrator's sender output_dir."
+            )
+        ),
+    ] = None
+
     # Log level + structured-log toggle.
     log: Annotated[
         LogConfig,
         Field(description="Logging configuration."),
     ] = LogConfig()
 
-    # Phase 7c will add: optim, scheduler, weight_broadcast, ckpt, wandb,
-    # heartbeat, metrics_server. For 7b, the algorithmic-core-via-train.py
-    # uses AdamW with `learning_rate` directly and stubs broadcast/ckpt.
+    # URL of the Advantage Server (Phase 7c). When set, the Trainer POSTs
+    # serialized LoRA + value-head weights to {url}/update_weights after each
+    # gradient step. When None, the Trainer trains in isolation (useful for
+    # standalone tests / smoke runs without a Server).
+    advantage_server_url: Annotated[
+        str | None,
+        Field(description="Base URL of the Advantage Server (Phase 7c weight broadcast target). None to disable broadcast."),
+    ] = None
+
+    # Phase 7d / future: optim, scheduler, ckpt, wandb, heartbeat,
+    # metrics_server. For 7c, the algorithmic-core-via-train.py uses AdamW
+    # with `learning_rate` directly and stubs ckpt.

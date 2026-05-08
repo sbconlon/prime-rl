@@ -167,26 +167,23 @@ def test_advantage_training_batch_msgspec_round_trip():
 
 
 def test_advantage_training_batch_receiver_uses_correct_decoder_type(tmp_path: Path):
-    """Phase 7b's parallel receiver classes override _batch_type so the
-    msgspec decoder is configured for AdvantageTrainingBatch, not
-    TrainingBatch. Confirms the inheritance + class-attr override works."""
-    _setup_multi_run_manager(tmp_path)
-
-    receiver = FileSystemAdvantageTrainingBatchReceiver()
+    """Phase 7b/7c: the path-based receiver overrides _batch_type so the
+    msgspec decoder is configured for AdvantageTrainingBatch."""
+    receiver = FileSystemAdvantageTrainingBatchReceiver(tmp_path)
     assert receiver.decoder.type is AdvantageTrainingBatch
-    # Also via the setup helper.
-    receiver2 = setup_advantage_training_batch_receiver(FileSystemTransportConfig())
+    # Also via the setup helper (filesystem requires input_dir).
+    receiver2 = setup_advantage_training_batch_receiver(
+        FileSystemTransportConfig(), input_dir=tmp_path
+    )
     assert receiver2.decoder.type is AdvantageTrainingBatch
 
 
 def test_setup_helpers_dispatch_to_filesystem(tmp_path: Path):
     """setup_advantage_training_batch_{sender,receiver} return filesystem
     classes for FileSystemTransportConfig."""
-    _setup_multi_run_manager(tmp_path)
-
     transport = FileSystemTransportConfig()
     sender = setup_advantage_training_batch_sender(tmp_path, transport)
-    receiver = setup_advantage_training_batch_receiver(transport)
+    receiver = setup_advantage_training_batch_receiver(transport, input_dir=tmp_path)
     assert isinstance(sender, FileSystemAdvantageTrainingBatchSender)
     assert isinstance(receiver, FileSystemAdvantageTrainingBatchReceiver)
 

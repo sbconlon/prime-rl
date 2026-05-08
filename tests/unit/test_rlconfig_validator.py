@@ -104,3 +104,59 @@ def test_arm_with_both_launcher_server_and_orchestrator_client_passes():
     )
     assert cfg.advantage_server is not None
     assert cfg.orchestrator.advantage_server is not None
+
+
+# ---------------------------------------------------------------------------
+# Phase 7c: advantage_trainer cross-validation
+# ---------------------------------------------------------------------------
+
+
+def _make_advantage_trainer_config():
+    """Minimal AdvantageTrainerConfig for validator tests."""
+    from prime_rl.configs.advantage_trainer import AdvantageTrainerConfig
+    from prime_rl.orchestrator.value_networks import ValueNetworkConfig
+
+    return AdvantageTrainerConfig(
+        model=ValueNetworkConfig(
+            base_model_name="test",
+            lora=LoRAConfig(rank=8, alpha=16.0, dropout=0.0),
+            polyak_tau=0.005,
+        ),
+        algorithm="arm",
+    )
+
+
+def test_grpo_with_advantage_trainer_raises():
+    """GRPO with a launcher advantage_trainer is a misconfig (Phase 7c)."""
+    with pytest.raises(ValueError, match="advantage_trainer"):
+        RLConfig(
+            trainer=_make_trainer(),
+            orchestrator=_make_orchestrator("grpo", with_client=False),
+            advantage_trainer=_make_advantage_trainer_config(),
+        )
+
+
+def test_arm_with_launcher_advantage_trainer_passes():
+    """ARM with launcher advantage_trainer + advantage_server passes the
+    cross-validators. This is the standard ARM launcher config."""
+    cfg = RLConfig(
+        trainer=_make_trainer(),
+        orchestrator=_make_orchestrator("arm", with_client=True),
+        advantage_server=_make_advantage_server_config(),
+        advantage_trainer=_make_advantage_trainer_config(),
+    )
+    assert cfg.advantage_trainer is not None
+    assert cfg.advantage_server is not None
+
+
+def test_ppo_with_launcher_advantage_trainer_passes():
+    """PPO with launcher advantage_trainer is also valid -- the trainer
+    only updates V (q_plus_targets are None on incoming batches)."""
+    cfg = RLConfig(
+        trainer=_make_trainer(),
+        orchestrator=_make_orchestrator("ppo", with_client=True),
+        advantage_server=_make_advantage_server_config(),
+        advantage_trainer=_make_advantage_trainer_config(),
+    )
+    assert cfg.advantage_trainer is not None
+

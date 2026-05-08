@@ -4,6 +4,7 @@ from typing import Annotated, Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from prime_rl.configs.advantage_server import AdvantageServerConfig
+from prime_rl.configs.advantage_trainer import AdvantageTrainerConfig
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.inference import WeightBroadcastConfig as InferenceWeightBroadcastConfig
 from prime_rl.configs.orchestrator import (
@@ -263,6 +264,23 @@ class RLConfig(BaseConfig):
         ),
     ] = None
 
+    # Phase 7c: server-side configuration for the Advantage Trainer subprocess.
+    # When set together with orchestrator.algorithm in {"ppo","arm"}, the
+    # launcher spawns `uv run advantage-trainer @ advantage_trainer.toml`
+    # alongside the other processes.
+    advantage_trainer: Annotated[
+        "AdvantageTrainerConfig | None",
+        Field(
+            description=(
+                "Advantage Trainer subprocess configuration (Phase 7c). "
+                "When set together with orchestrator.algorithm in {'ppo','arm'}, "
+                "the launcher spawns the Advantage Trainer, which consumes "
+                "AdvantageTrainingBatch records from the orchestrator transport "
+                "and broadcasts updated weights back to the Advantage Server."
+            ),
+        ),
+    ] = None
+
     output_dir: Annotated[
         Path,
         Field(
@@ -413,6 +431,14 @@ class RLConfig(BaseConfig):
             raise ValueError(
                 "advantage_server is configured but orchestrator.algorithm='grpo'. "
                 "Either set algorithm to 'ppo' or 'arm', or remove advantage_server."
+            )
+
+        # Phase 7c: same consistency check for advantage_trainer.
+        trainer_set = self.advantage_trainer is not None
+        if algorithm == "grpo" and trainer_set:
+            raise ValueError(
+                "advantage_trainer is configured but orchestrator.algorithm='grpo'. "
+                "Either set algorithm to 'ppo' or 'arm', or remove advantage_trainer."
             )
         return self
 

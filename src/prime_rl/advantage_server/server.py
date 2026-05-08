@@ -20,6 +20,9 @@ batched-K-candidate optimizations.
 from __future__ import annotations
 
 import asyncio
+import io
+
+import torch
 import logging
 
 import msgspec
@@ -107,6 +110,51 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
         response = ComputeAdvantagesResponse(paired_samples=paired_samples)
         encoded = msgspec.msgpack.encode(response)
         return Response(content=encoded, media_type="application/x-msgpack")
+
+    @app.post("/update_weights")
+    async def update_weights(request: Request) -> Response:
+        """Phase 7c: receive a torch.save'd state_dict from the Advantage Trainer.
+
+        Body: raw bytes (output of torch.save(state_dict, BytesIO)).
+        State dict contains LoRA adapters + value head weights only (not the
+        frozen base). load_state_dict(..., strict=False) tolerates the missing
+        base parameters.
+        """
+        if not app.state.ready:
+            return Response(status_code=503, content=b'{"error":"not ready"}', media_type="application/json")
+
+        body = await request.body()
+        backbone: ValueNetworkBackbone = app.state.backbone
+        loop = asyncio.get_event_loop()
+
+        def _do_load() -> tuple[int, int]:
+            state_dict = torch.load(
+                io.BytesIO(body), map_location="cpu", weights_only=True
+            )
+            # strict=False because the trainer only sends LoRA + heads, not the
+            # frozen base. Returns the LISTS of missing/unexpected keys; the
+            # missing list will be the (expected) frozen-base keys.
+            result = backbone.load_state_dict(state_dict, strict=False)
+            return len(result.missing_keys), len(result.unexpected_keys)
+
+        n_missing, n_unexpected = await loop.run_in_executor(None, _do_load)
+        if n_unexpected > 0:
+            _LOGGER.warning(
+                "update_weights: %d unexpected keys in state_dict (likely a "
+                "config mismatch between Trainer and Server)",
+                n_unexpected,
+            )
+        _LOGGER.debug(
+            "update_weights: applied state_dict (%d missing, %d unexpected)",
+            n_missing,
+            n_unexpected,
+        )
+        app.state.weight_step = getattr(app.state, "weight_step", 0) + 1
+        return Response(
+            status_code=200,
+            content=b'{"status":"ok"}',
+            media_type="application/json",
+        )
 
     return app
 

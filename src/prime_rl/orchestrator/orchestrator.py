@@ -20,6 +20,8 @@ from prime_rl.orchestrator.trajectories import (
 )
 from prime_rl.orchestrator.advantage_server_client import AdvantageServerClient
 from prime_rl.transport import TrainingBatch, TrainingSample, setup_training_batch_sender
+from prime_rl.transport.advantage_batch import setup_advantage_training_batch_sender
+from prime_rl.transport.types import AdvantageTrainingBatch
 from prime_rl.transport.types import AdvantageTrainingSample
 from prime_rl.utils.pathing import get_log_dir
 
@@ -397,6 +399,22 @@ async def orchestrate(config: OrchestratorConfig):
     logger.info(f"Initializing training batch sender ({config.rollout_transport})")
     training_batch_sender = setup_training_batch_sender(config.output_dir, config.rollout_transport)
 
+    # Phase 7c: when running PPO/ARM, also set up an outbound transport
+    # for AdvantageTrainingBatch (orchestrator -> Advantage Trainer).
+    # Output dir is a subdirectory of config.output_dir; the launch
+    # script must configure the Advantage Trainer's transport to read
+    # from the same path.
+    advantage_trainer_sender = None
+    if config.algorithm in ("ppo", "arm"):
+        advantage_trainer_output_dir = config.output_dir / "advantage_trainer_transport"
+        advantage_trainer_output_dir.mkdir(parents=True, exist_ok=True)
+        advantage_trainer_sender = setup_advantage_training_batch_sender(
+            advantage_trainer_output_dir, config.rollout_transport
+        )
+        logger.info(
+            f"Advantage Trainer transport sender ready (output_dir={advantage_trainer_output_dir})"
+        )
+
     # Track last online eval checkpoint step for this process
     last_eval_step = -1
     # Track previous ckpt_step to detect when ckpt_step jumps over eval interval boundaries
@@ -692,6 +710,20 @@ async def orchestrate(config: OrchestratorConfig):
 
         training_batch_sender.send(training_batch)
 
+        # Phase 7c: send the parallel AdvantageTrainingBatch to the Advantage
+        # Trainer. advantage_examples is populated by the per-rollout loop
+        # above when algorithm in {ppo, arm}; empty otherwise.
+        if advantage_trainer_sender is not None and advantage_examples:
+            advantage_batch = AdvantageTrainingBatch(
+                examples=advantage_examples,
+                step=progress.step,
+                run_idx=training_batch.run_idx,
+            )
+            advantage_trainer_sender.send(advantage_batch)
+            logger.debug(
+                f"Sent AdvantageTrainingBatch with {len(advantage_examples)} samples (step={progress.step})"
+            )
+
         # Await and process val results
         await val_task
         val_outputs = val_task.result()
@@ -935,6 +967,8 @@ async def orchestrate(config: OrchestratorConfig):
 
     # Close training batch sender
     training_batch_sender.close()
+    if advantage_trainer_sender is not None:
+        advantage_trainer_sender.close()
 
     # Shutdown rollout executor
     rollout_executor.shutdown(wait=False)

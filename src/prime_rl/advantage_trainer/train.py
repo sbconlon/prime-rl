@@ -27,9 +27,11 @@ exercises `train` end-to-end.
 
 from __future__ import annotations
 
+import io
 import time
 from typing import Literal
 
+import httpx
 import torch
 from torch import optim
 from transformers import AutoModel
@@ -49,6 +51,59 @@ from prime_rl.transport.advantage_batch import (
 from prime_rl.transport.types import AdvantageTrainingBatch
 from prime_rl.utils.config import cli
 from prime_rl.utils.logger import get_logger, setup_logger
+
+
+# ---------------------------------------------------------------------------
+# Weight broadcast (Trainer -> Advantage Server, HTTP POST per step)
+# ---------------------------------------------------------------------------
+
+
+def _serialize_trainable_state_dict(backbone: ValueNetworkBackbone) -> bytes:
+    """Serialize only the trainable parameters (LoRA + value heads) via torch.save.
+
+    Returns the raw bytes ready to POST to /update_weights. The Advantage
+    Server's load_state_dict(strict=False) tolerates the missing frozen-base
+    keys.
+    """
+    state_dict = {
+        name: param.detach().cpu()
+        for name, param in backbone.named_parameters()
+        if param.requires_grad
+    }
+    buffer = io.BytesIO()
+    torch.save(state_dict, buffer)
+    return buffer.getvalue()
+
+
+def _broadcast_weights(
+    backbone: ValueNetworkBackbone, server_url: str, *, timeout: float = 60.0
+) -> bool:
+    """Best-effort broadcast: serialize the trainable params and POST them
+    to the Advantage Server. Returns True on success, False on any error.
+
+    Errors are non-fatal -- the Trainer continues, the Server runs one
+    step with stale weights. Repeated failures suggest a real connectivity
+    problem and the operator should investigate.
+    """
+    try:
+        body = _serialize_trainable_state_dict(backbone)
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(
+                f"{server_url.rstrip('/')}/update_weights",
+                content=body,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+        if response.status_code != 200:
+            get_logger().warning(
+                "weight broadcast: server responded %d: %s",
+                response.status_code,
+                response.text[:200],
+            )
+            return False
+        return True
+    except Exception as exc:
+        get_logger().warning("weight broadcast failed: %s", exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +228,13 @@ def train(config: AdvantageTrainerConfig) -> None:
 
     optimizer = optim.AdamW(trainable_params, lr=config.learning_rate)
 
-    receiver = setup_advantage_training_batch_receiver(config.transport)
-    logger.info(f"Transport receiver ready ({config.transport.type})")
+    receiver = setup_advantage_training_batch_receiver(
+        config.transport, input_dir=config.transport_input_dir
+    )
+    logger.info(
+        f"Transport receiver ready ({config.transport.type}, "
+        f"input_dir={config.transport_input_dir})"
+    )
 
     step = 0
     while step < config.max_steps:
@@ -192,6 +252,16 @@ def train(config: AdvantageTrainerConfig) -> None:
                 algorithm=config.algorithm,
                 polyak_tau=config.polyak_tau,
             )
+
+            # Phase 7c: broadcast updated weights to the Advantage Server
+            # (best-effort; failures logged but non-fatal).
+            if config.advantage_server_url and metrics["n_samples"] > 0:
+                broadcast_ok = _broadcast_weights(
+                    backbone, config.advantage_server_url
+                )
+                if not broadcast_ok:
+                    logger.warning(f"step={step}: weight broadcast failed")
+
             logger.info(
                 f"step={step} mean_loss={metrics['mean_loss']:.4f} "
                 f"l_v={metrics['l_v']:.4f} l_q={metrics['l_q']:.4f} "
