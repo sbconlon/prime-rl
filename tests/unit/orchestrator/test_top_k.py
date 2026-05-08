@@ -84,15 +84,18 @@ def test_substitute_empty_input_raises():
 # ---------------------------------------------------------------------------
 
 
-def test_get_sampling_args_default_omits_logprobs_int():
-    """Default SamplingConfig: extra_body must NOT carry an integer logprobs."""
+def test_get_sampling_args_default_omits_top_logprobs():
+    """Default SamplingConfig: extra_body must NOT carry top_logprobs.
+
+    Top-level `logprobs: True` (chosen-token logprob) stays as is. The
+    Phase 5 toggle adds `extra_body["top_logprobs"] = K` only when on.
+    """
     config = SamplingConfig(max_tokens=128)
     args = get_sampling_args(config, temperature=1.0, is_vllm=True)
     assert args["logprobs"] is True  # OpenAI-bool form for chosen-token logprob (existing behavior)
     extra = args.get("extra_body", {})
-    # The integer-valued vLLM-native logprobs key is what Phase 5 introduces
-    # under the toggle; absent by default.
     assert "logprobs" not in extra
+    assert "top_logprobs" not in extra
 
 
 def test_get_sampling_args_does_not_leak_internal_fields_to_top_level():
@@ -117,26 +120,33 @@ def test_get_sampling_args_does_not_leak_internal_fields_to_top_level():
         )
 
 
-def test_get_sampling_args_with_toggle_on_adds_extra_body_logprobs_K():
-    """Toggle on -> extra_body['logprobs'] = K (vLLM-native top-K request)."""
+def test_get_sampling_args_with_toggle_on_adds_extra_body_top_logprobs_K():
+    """Toggle on -> OpenAI-standard `logprobs=True` + `top_logprobs=K`.
+
+    vLLM 0.17 enforces the OpenAI schema strictly (rejects integer
+    `logprobs`); the bool/int split is the supported path. vLLM accepts
+    `top_logprobs > 20`, so K=32 stays viable.
+    """
     config = SamplingConfig(
         max_tokens=128,
         return_top_k_token_ids=True,
         top_k_action_set_size=32,
     )
     args = get_sampling_args(config, temperature=1.0, is_vllm=True)
-    assert args["extra_body"]["logprobs"] == 32
+    assert args["extra_body"]["logprobs"] is True
+    assert args["extra_body"]["top_logprobs"] == 32
 
 
 def test_get_sampling_args_toggle_respects_custom_K():
-    """Custom K propagates."""
+    """Custom K propagates via top_logprobs."""
     config = SamplingConfig(
         max_tokens=128,
         return_top_k_token_ids=True,
         top_k_action_set_size=8,
     )
     args = get_sampling_args(config, temperature=1.0, is_vllm=True)
-    assert args["extra_body"]["logprobs"] == 8
+    assert args["extra_body"]["logprobs"] is True
+    assert args["extra_body"]["top_logprobs"] == 8
 
 
 # ---------------------------------------------------------------------------

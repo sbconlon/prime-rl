@@ -67,12 +67,14 @@ def get_sampling_args(sampling_config: SamplingConfig, temperature: float, is_vl
     top_k_action_set_size = sampling_args.pop("top_k_action_set_size", 0)
 
     # When ARM's top-K action set extraction is enabled, request top-K logprobs
-    # from vLLM via the OpenAI-compatible API's `extra_body.logprobs`
-    # integer-valued path (vLLM-native; OpenAI standard caps top_logprobs at 20
-    # via the bool `logprobs`/int `top_logprobs` split, which doesn't reach K=32).
+    # from vLLM via the OpenAI-standard `logprobs: bool` + `top_logprobs: int`
+    # split. vLLM 0.17 enforces the OpenAI schema strictly (rejects an integer
+    # `logprobs` with a 400 bool_parsing error) but lifts the OpenAI-standard
+    # cap of 20 on `top_logprobs`, so K=32 (and larger ablations) remain viable.
     # Phase 5b extracts the candidate token IDs from the response.
     if return_top_k_token_ids:
-        extra_body["logprobs"] = top_k_action_set_size
+        extra_body["logprobs"] = True
+        extra_body["top_logprobs"] = top_k_action_set_size
 
     if extra_body:
         sampling_args["extra_body"] = extra_body
