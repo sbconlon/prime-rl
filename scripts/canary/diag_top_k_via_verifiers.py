@@ -58,36 +58,15 @@ async def main() -> None:
     print()
     if has_rt is not True:
         print("--> ROOT CAUSE: orchestrator is NOT setting return_tokens_as_token_ids=True.")
-        print("    The Phase 5 vLLM-0.17 followup patch in src/prime_rl/orchestrator/utils.py")
-        print("    isn\'t taking effect at runtime even though the unit tests pass.")
         sys.exit(2)
 
-    # 2. Construct verifiers' chat client the way the orchestrator does.
-    # Look up how verifiers builds its OpenAI client at runtime so we hit the
-    # same code path. Simplest: use the helper the client class exposes.
+    # 2. Construct verifiers' chat client via its standard ctor (calls
+    # setup_client(config) internally to build the AsyncOpenAI). vLLM
+    # ignores api_key but openai-python requires SOME value to be set.
     print("=== constructing verifiers OpenAIChatCompletionsClient ===")
-    from prime_rl.configs.shared import ClientConfig as PRClientConfig
+    base = "http://localhost:8000/v1"
+    os.environ.setdefault("VLLM_API_KEY", "dummy")
 
-    pr_client_config = PRClientConfig(
-        timeout=600,
-        connect_timeout=30.0,
-        base_url=["http://localhost:8000/v1"],
-        api_key_var="VLLM_API_KEY",
-        headers={},
-    )
-    print(f"  base_url: {pr_client_config.base_url}")
-
-    # The verifiers client is constructed via setup_openai_client; mirror that here
-    # by directly building an AsyncOpenAI ourselves and wrapping with the verifiers
-    # client class. The key is exercising the verifiers method that wraps the
-    # request -- get_native_response -- with the orchestrator-shaped sampling_args.
-    from openai import AsyncOpenAI
-    base = pr_client_config.base_url[0] if isinstance(pr_client_config.base_url, list) else pr_client_config.base_url
-    raw_client = AsyncOpenAI(base_url=base, api_key="dummy")
-
-    # OpenAIChatCompletionsClient is normally constructed via verifiers\' Client[..]
-    # framework with a ClientConfig (from verifiers.types, not prime-rl). Build it
-    # directly:
     from verifiers.types import ClientConfig as VFClientConfig
     vf_config = VFClientConfig(
         base_url=base,
@@ -96,9 +75,8 @@ async def main() -> None:
         connect_timeout=30,
     )
     client = OpenAIChatCompletionsClient(vf_config)
-    # Verifiers\' setup_client returns an AsyncOpenAI; use that as the underlying
-    # transport but keep our own to avoid auth/header surprises.
-    client.client = raw_client
+    print(f"  client.client type: {type(client.client).__name__}")
+    print(f"  base: {base}")
 
     # 3. Fire the request via the verifiers client method -- same as the env does.
     print()
@@ -133,7 +111,6 @@ async def main() -> None:
         print(f"first content[0].top_logprobs[0]: token={tl0.token!r}, logprob={tl0.logprob}")
         print(f"top_logprobs[0] count: {len(first.top_logprobs)}")
 
-        # The diagnostic question:
         if isinstance(tl0.token, str) and tl0.token.startswith("token_id:"):
             print()
             print("--> return_tokens_as_token_ids REACHED vLLM (token_id:N encoding present).")
@@ -141,8 +118,6 @@ async def main() -> None:
             print()
             print("--> return_tokens_as_token_ids did NOT reach vLLM.")
             print("    Token field is plain text, not 'token_id:N'.")
-            print("    The verifiers OpenAIChatCompletionsClient is stripping or transforming")
-            print("    extra_body before forwarding to AsyncOpenAI.")
     else:
         print("first content[0].top_logprobs is empty")
 
@@ -158,6 +133,8 @@ async def main() -> None:
         if token_ids is not None and len(result) != len(token_ids):
             print(f"  LENGTH MISMATCH: top_k {len(result)} != token_ids {len(token_ids)} "
                   "(silently dropped at chat_completions_client.py:570-575)")
+        else:
+            print(f"  lengths match (top_k {len(result)} == token_ids {len(token_ids) if token_ids else '?'})")
 
 
 if __name__ == "__main__":
