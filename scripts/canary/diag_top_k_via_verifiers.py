@@ -69,7 +69,7 @@ async def main() -> None:
 
     from verifiers.types import ClientConfig as VFClientConfig
     vf_config = VFClientConfig(
-        base_url=base,
+        api_base_url=base,
         api_key_var="VLLM_API_KEY",
         timeout=600,
         connect_timeout=30,
