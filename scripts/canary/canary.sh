@@ -127,17 +127,29 @@ cmd_bootstrap() {
     uv sync --extra flash-attn
     ok "uv sync done"
 
-    step "pin protobuf<6 (wandb 0.24.2 ships pb2 stubs that need it)"
-    uv pip install --force-reinstall 'protobuf>=5,<6' >/dev/null
-    ok "protobuf pinned to v5"
-
-    step "install reverse-text env (PrimeIntellect index)"
-    uv pip install reverse-text --index-url "$PRIME_INDEX_URL" >/dev/null
+    # Install reverse-text BEFORE pinning protobuf<6 so the resolver
+    # can satisfy prime-sandboxes' transitive protobuf>=6.31.1 marker
+    # against the post-sync protobuf 6.x already in the venv. Use
+    # --extra-index-url (NOT --index-url, which is exclusive) so PyPI
+    # remains available for verifiers + prime-sandboxes lookups.
+    step "install reverse-text env (PrimeIntellect index + PyPI)"
+    uv pip install reverse-text \
+        --extra-index-url "$PRIME_INDEX_URL" \
+        --prerelease=allow >/dev/null
     ok "reverse-text installed"
 
     step "install verifiers fork (editable, on top of synced venv)"
     uv pip install -e "$VERIFIERS_DIR" --force-reinstall >/dev/null
     ok "verifiers editable from $VERIFIERS_DIR"
+
+    # Pin protobuf<6 LAST: single-package --force-reinstall doesn\'t
+    # trigger a transitive re-resolve, so prime-sandboxes' technical
+    # protobuf>=6.31.1 requirement is "violated" only on paper. The
+    # canary doesn\'t exercise the prime-sandboxes code path that
+    # would care, and wandb 0.24.2\'s pb2 stubs need protobuf 5.
+    step "pin protobuf<6 (wandb 0.24.2 needs it; LAST so no transitive resolve)"
+    uv pip install --force-reinstall 'protobuf>=5,<6' >/dev/null
+    ok "protobuf pinned to v5"
 
     step "pre-fetch HF model: $MODEL_REPO"
     SNAP=$(uv run python - <<EOF
