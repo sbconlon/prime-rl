@@ -281,6 +281,13 @@ def interleave_rollout(
                 "completion_mask": [bool(i) for i in tokens["completion_mask"]],
                 "completion_logprobs": list(tokens["completion_logprobs"]),
                 "routed_experts": tokens.get("routed_experts"),
+                # Phase 5: forward the per-completion-token top-K candidate IDs that
+                # the verifiers chat client extracts from vLLM's top_logprobs and
+                # threads through TrajectoryStepTokens. None for GRPO/PPO; populated
+                # for ARM. Without this line, make_sample sees no top-K and the
+                # Advantage Server rejects the request with
+                # "ARM compute requires sample.completion_top_k_token_ids".
+                "completion_top_k_token_ids": tokens.get("completion_top_k_token_ids"),
             }
 
         logger.warning(f"Missing rollout tokens for example {output['example_id']} step {step_idx}.")
