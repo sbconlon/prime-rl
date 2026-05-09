@@ -137,5 +137,67 @@ async def main() -> None:
             print(f"  lengths match (top_k {len(result)} == token_ids {len(token_ids) if token_ids else '?'})")
 
 
-if __name__ == "__main__":
+
+
+async def main_from_native() -> None:
+    """Extension: also test from_native_response (the verifiers method that
+    wraps a ChatCompletionResponse into a vf.Response with tokens populated).
+    This is what parse_response_tokens (used by MultiTurnEnv.add_model_response,
+    which SingleTurnEnv inherits) ultimately reads."""
+    snap = os.environ.get("SNAP")
+    if not snap:
+        return
+
+    from prime_rl.configs.orchestrator import SamplingConfig
+    from prime_rl.orchestrator.utils import get_sampling_args
+    from verifiers.clients.openai_chat_completions_client import OpenAIChatCompletionsClient
+    from verifiers.types import ClientConfig as VFClientConfig
+
+    sampling_args = get_sampling_args(
+        SamplingConfig(max_tokens=128, return_top_k_token_ids=True, top_k_action_set_size=32),
+        temperature=1.0, is_vllm=True,
+    )
+    os.environ.setdefault("VLLM_API_KEY", "dummy")
+    client = OpenAIChatCompletionsClient(VFClientConfig(
+        api_base_url="http://localhost:8000/v1", api_key_var="VLLM_API_KEY",
+        timeout=600, connect_timeout=30,
+    ))
+
+    raw = await client.get_native_response(
+        prompt=[{"role": "user", "content": "Reverse: hi"}],
+        model=snap, sampling_args=sampling_args,
+    )
+
+    print()
+    print("=== from_native_response wrapping ===")
+    has_pti = hasattr(raw, "prompt_token_ids")
+    print(f"raw response has prompt_token_ids attr: {has_pti}")
+    if has_pti:
+        pti = raw.prompt_token_ids
+        print(f"  prompt_token_ids type: {type(pti).__name__}, value None? {pti is None}, length: {len(pti) if pti else 'N/A'}")
+
+    vf_response = await client.from_native_response(raw)
+    msg = vf_response.message
+    print(f"vf_response.message.tokens is None: {msg.tokens is None}")
+    if msg.tokens is None:
+        print("--> ROOT CAUSE: parse_tokens returned None inside from_native_response.")
+        print("    Most likely: vLLM didn\'t set 'prompt_token_ids' on the response,")
+        print("    so parse_tokens (line 508 of chat client) bailed early.")
+    else:
+        ttk = msg.tokens.completion_top_k_token_ids
+        print(f"  completion_top_k_token_ids is None: {ttk is None}")
+        if ttk is not None:
+            print(f"  shape: {len(ttk)} positions x {len(ttk[0]) if ttk else 0}")
+            print("--> verifiers Response.message.tokens HAS top-K populated.")
+            print("    The bug is downstream of from_native_response.")
+        else:
+            print("--> top-K extraction inside parse_tokens failed.")
+            print("    Likely: extractor returned non-None but length-mismatch fired,")
+            print("    OR extractor returned None (extractor saw token_id-less top_logprobs).")
+
+
+if __name__ == "__main__" and "--ext" in sys.argv:
+    asyncio.run(main_from_native())
+elif __name__ == "__main__":
     asyncio.run(main())
+    asyncio.run(main_from_native())
