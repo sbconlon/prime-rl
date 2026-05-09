@@ -142,14 +142,16 @@ cmd_bootstrap() {
     uv pip install -e "$VERIFIERS_DIR" --force-reinstall >/dev/null
     ok "verifiers editable from $VERIFIERS_DIR"
 
-    # Pin protobuf<6 LAST: single-package --force-reinstall doesn\'t
-    # trigger a transitive re-resolve, so prime-sandboxes' technical
-    # protobuf>=6.31.1 requirement is "violated" only on paper. The
-    # canary doesn\'t exercise the prime-sandboxes code path that
-    # would care, and wandb 0.24.2\'s pb2 stubs need protobuf 5.
-    step "pin protobuf<6 (wandb 0.24.2 needs it; LAST so no transitive resolve)"
-    uv pip install --force-reinstall 'protobuf>=5,<6' >/dev/null
-    ok "protobuf pinned to v5"
+    # Pin protobuf to >=6.31.1,<7 LAST. The verifiers editable install
+    # bumps protobuf to 7.x, which breaks wandb 0.24.2\'s pb2 stubs
+    # ("Imports" missing from wandb_telemetry_pb2 at runtime). The
+    # floor 6.31.1 is what prime-sandboxes 0.2.23 was gencoded against
+    # (per the protobuf cross-version guarantee, runtime must be >=
+    # gencode). Pinning into the 6.x range keeps both wandb and
+    # prime-sandboxes happy.
+    step "pin protobuf>=6.31.1,<7 (wandb pb2 + prime-sandboxes gencode floor)"
+    uv pip install --force-reinstall 'protobuf>=6.31.1,<7' >/dev/null
+    ok "protobuf pinned to 6.x"
 
     # Lock the venv NOW: every `uv run python` from this point on must
     # NOT trigger an implicit sync (which would wipe the editable
@@ -170,7 +172,7 @@ EOF
 import sys
 import google.protobuf
 proto_v = google.protobuf.__version__
-assert proto_v.startswith("5."), f"protobuf must be 5.x, got {proto_v}"
+assert proto_v.startswith("6."), f"protobuf must be 6.x, got {proto_v}"
 
 import wandb
 import wandb.proto.wandb_telemetry_pb2 as t
@@ -263,8 +265,8 @@ cmd_run() {
     step "venv sanity (UV_NO_SYNC=1 should keep this fast and side-effect-free)"
     uv run python - <<'EOF'
 import google.protobuf
-assert google.protobuf.__version__.startswith("5."), \
-    f"protobuf {google.protobuf.__version__} -- bootstrap pinned <6, did UV_NO_SYNC slip?"
+assert google.protobuf.__version__.startswith("6."), \
+    f"protobuf {google.protobuf.__version__} -- bootstrap pinned to 6.x, did UV_NO_SYNC slip?"
 import wandb.proto.wandb_telemetry_pb2 as t
 assert hasattr(t, "Imports"), "wandb proto broken; rerun bootstrap"
 import verifiers.clients.openai_chat_completions_client as m
