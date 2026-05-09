@@ -38,7 +38,7 @@ async def main() -> None:
 
     # 1. Build sampling_args via the orchestrator's actual function.
     sampling_config = SamplingConfig(
-        max_tokens=20,
+        max_tokens=128,
         return_top_k_token_ids=True,
         top_k_action_set_size=32,
     )
@@ -82,7 +82,7 @@ async def main() -> None:
     print()
     print("=== firing request via OpenAIChatCompletionsClient.get_native_response ===")
     response = await client.get_native_response(
-        prompt=[{"role": "user", "content": "Reverse this: hello world"}],
+        prompt=[{"role": "user", "content": "Reverse: hi"}],
         model=snap,
         sampling_args=sampling_args,
     )
