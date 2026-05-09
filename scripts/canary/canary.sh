@@ -153,9 +153,20 @@ cmd_bootstrap() {
     uv pip install --force-reinstall 'protobuf>=6.31.1,<7' >/dev/null
     ok "protobuf pinned to 6.x"
 
+    # Same pattern as the protobuf pin: the verifiers editable install
+    # bumped starlette 0.50 -> 1.0, but fastapi 0.124.4 (lockfile pin)
+    # still passes `on_startup` to starlette\'s Router which 1.0
+    # dropped, breaking the Advantage Server\'s FastAPI() init.
+    # Single-package --force-reinstall keeps fastapi at 0.124.4 and
+    # rolls starlette back into the working range.
+    step "pin starlette<1 (fastapi 0.124.4 needs starlette 0.x Router API)"
+    uv pip install --force-reinstall 'starlette<1' >/dev/null
+    ok "starlette pinned to 0.x"
+
     # Lock the venv NOW: every `uv run python` from this point on must
     # NOT trigger an implicit sync (which would wipe the editable
-    # verifiers, reverse-text, and the protobuf<6 pin we just set up).
+    # verifiers, reverse-text, and the protobuf+starlette pins we
+    # just set up).
     export UV_NO_SYNC=1
 
     step "pre-fetch HF model: $MODEL_REPO"
@@ -192,10 +203,17 @@ assert "token_id:" in src and "_resolve_token_id" in src, \
 import flash_attn
 import fastapi
 import starlette
+starlette_v = starlette.__version__
+assert starlette_v.startswith("0."), \
+    f"starlette must be 0.x (fastapi 0.124.4 incompat with starlette 1.0+), got {starlette_v}"
+# Smoke-build a FastAPI app to catch the on_startup Router mismatch
+# at bootstrap time, not in the live Advantage Server subprocess.
+from fastapi import FastAPI
+FastAPI(title="bootstrap-smoke")
 print(
     f"protobuf={proto_v} | wandb={wandb.__version__} | "
     f"flash_attn={flash_attn.__version__} | "
-    f"fastapi={fastapi.__version__} | starlette={starlette.__version__} | "
+    f"fastapi={fastapi.__version__} | starlette={starlette_v} | "
     f"verifiers={m.__file__}"
 )
 EOF
@@ -275,6 +293,11 @@ assert google.protobuf.__version__.startswith("6."), \
     f"protobuf {google.protobuf.__version__} -- bootstrap pinned to 6.x, did UV_NO_SYNC slip?"
 import wandb.proto.wandb_telemetry_pb2 as t
 assert hasattr(t, "Imports"), "wandb proto broken; rerun bootstrap"
+import starlette
+assert starlette.__version__.startswith("0."), \
+    f"starlette {starlette.__version__} -- bootstrap pinned to 0.x, did UV_NO_SYNC slip?"
+from fastapi import FastAPI
+FastAPI(title="run-smoke")  # catches the on_startup Router mismatch early
 import verifiers.clients.openai_chat_completions_client as m
 import inspect
 src = inspect.getsource(m._extract_top_k_token_ids_from_logprobs_content)
