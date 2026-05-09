@@ -151,6 +151,11 @@ cmd_bootstrap() {
     uv pip install --force-reinstall 'protobuf>=5,<6' >/dev/null
     ok "protobuf pinned to v5"
 
+    # Lock the venv NOW: every `uv run python` from this point on must
+    # NOT trigger an implicit sync (which would wipe the editable
+    # verifiers, reverse-text, and the protobuf<6 pin we just set up).
+    export UV_NO_SYNC=1
+
     step "pre-fetch HF model: $MODEL_REPO"
     SNAP=$(uv run python - <<EOF
 from huggingface_hub import snapshot_download
@@ -160,8 +165,7 @@ EOF
     [ -d "$SNAP" ] || fail "snapshot_download did not return a directory: $SNAP"
     ok "model snapshot at $SNAP"
 
-    step "verify venv coherence (lock UV_NO_SYNC=1; subsequent uv run must NOT re-sync)"
-    export UV_NO_SYNC=1
+    step "verify venv coherence (UV_NO_SYNC=1 already set; subsequent uv run must NOT re-sync)"
     uv run python - <<'EOF'
 import sys
 import google.protobuf
