@@ -228,6 +228,12 @@ export SNAP='$SNAP'
 : "\${WANDB_API_KEY:=}"
 : "\${WANDB_MODE:=offline}"
 export WANDB_API_KEY WANDB_MODE
+
+# Bocconi gnodes are MIG-partitioned -- adjacent slices are hardware-
+# isolated, so the launcher\'s "existing processes on GPUs" pre-flight
+# check (entrypoints/rl.py: check_gpus_available) does not apply. The
+# error message itself recommends this env var for MIG systems.
+export PRIME_RL_SKIP_GPU_CHECK=1
 EOF
     ok "wrote $ENV_FILE"
 
