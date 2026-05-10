@@ -31,6 +31,11 @@ from fastapi import FastAPI, Request, Response
 from transformers import AutoModel
 
 from prime_rl.advantage_server.compute import compute_advantages_and_targets
+from prime_rl.advantage_server._prof import (
+    new_request_id,
+    prof,
+    set_request_id,
+)
 from prime_rl.configs.advantage_server import AdvantageServerConfig
 from prime_rl.orchestrator.advantage_server_client import (
     ComputeAdvantagesRequest,
@@ -82,34 +87,49 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
         if not app.state.ready:
             return Response(status_code=503, content=b'{"error":"not ready"}', media_type="application/json")
 
-        body = await request.body()
-        decoded = msgspec.msgpack.decode(body, type=ComputeAdvantagesRequest)
+        # Phase 10 perf instrumentation: tag every PROF line emitted during
+        # this request with a short request id so the analyzer can group them.
+        # No-op when PRIME_RL_ADV_PROF env var is unset.
+        rid = new_request_id()
+        set_request_id(rid)
 
-        backbone: ValueNetworkBackbone = app.state.backbone
-        loop = asyncio.get_event_loop()
+        with prof("endpoint.TOTAL"):
+            with prof("endpoint.body_read"):
+                body = await request.body()
+            with prof("endpoint.decode_request", body_bytes=len(body)):
+                decoded = msgspec.msgpack.decode(body, type=ComputeAdvantagesRequest)
 
-        def _do_compute():
-            kwargs: dict[str, float | int] = {"gamma": app.state.gamma}
-            if decoded.algorithm == "ppo":
-                kwargs["lam"] = app.state.lam
-            else:
-                kwargs["n_step"] = app.state.n_step
-            return compute_advantages_and_targets(
-                samples=decoded.samples,
-                episodic_reward=decoded.episodic_reward,
-                is_terminal=decoded.is_terminal,
-                algorithm=decoded.algorithm,
-                backbone=backbone,
-                **kwargs,
-            )
+            backbone: ValueNetworkBackbone = app.state.backbone
+            loop = asyncio.get_event_loop()
 
-        paired = await loop.run_in_executor(None, _do_compute)
-        paired_samples = [
-            PairedSample(llm_sample=llm, advantage_sample=adv) for llm, adv in paired
-        ]
-        response = ComputeAdvantagesResponse(paired_samples=paired_samples)
-        encoded = msgspec.msgpack.encode(response)
-        return Response(content=encoded, media_type="application/x-msgpack")
+            def _do_compute():
+                # Re-set the request id inside the executor thread; ContextVar
+                # is not propagated across threads automatically.
+                set_request_id(rid)
+                kwargs: dict[str, float | int] = {"gamma": app.state.gamma}
+                if decoded.algorithm == "ppo":
+                    kwargs["lam"] = app.state.lam
+                else:
+                    kwargs["n_step"] = app.state.n_step
+                return compute_advantages_and_targets(
+                    samples=decoded.samples,
+                    episodic_reward=decoded.episodic_reward,
+                    is_terminal=decoded.is_terminal,
+                    algorithm=decoded.algorithm,
+                    backbone=backbone,
+                    **kwargs,
+                )
+
+            with prof("endpoint.run_in_executor", sync_cuda=True):
+                paired = await loop.run_in_executor(None, _do_compute)
+            with prof("endpoint.build_response"):
+                paired_samples = [
+                    PairedSample(llm_sample=llm, advantage_sample=adv) for llm, adv in paired
+                ]
+                response = ComputeAdvantagesResponse(paired_samples=paired_samples)
+            with prof("endpoint.encode_response"):
+                encoded = msgspec.msgpack.encode(response)
+            return Response(content=encoded, media_type="application/x-msgpack")
 
     @app.post("/update_weights")
     async def update_weights(request: Request) -> Response:

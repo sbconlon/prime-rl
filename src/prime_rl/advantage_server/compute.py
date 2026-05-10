@@ -35,6 +35,7 @@ from prime_rl.orchestrator.per_token_advantage import (
     ppo_gae_advantage_fn,
 )
 from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
+from prime_rl.advantage_server._prof import prof
 from prime_rl.transport.types import AdvantageTrainingSample, TrainingSample
 
 
@@ -87,23 +88,35 @@ def compute_advantages_and_targets_arm(
     K-candidate evaluation against a cloned-cropped-tiled Q+ cache. The
     Phase 3 advantage function consumes the resulting tensors.
     """
-    v_all, v_target_all, q_plus_sampled_all, q_plus_candidates = _build_per_token_value_tensors(
-        samples=samples, backbone=backbone, need_q_plus=True
-    )
-    assert q_plus_sampled_all is not None and q_plus_candidates is not None
-    inputs = ArmAdvantageInputs(
-        samples=samples,
-        episodic_reward=episodic_reward,
-        is_terminal=is_terminal,
-        v_all=v_all,
-        v_target_all=v_target_all,
-        q_plus_sampled_all=q_plus_sampled_all,
-        q_plus_candidates=q_plus_candidates,
-        gamma=gamma,
-        n_step=n_step,
-    )
-    out = arm_regret_matching_advantage_fn(inputs)
-    return _build_paired_outputs(samples, out)
+    n_samples = len(samples)
+    total_completion = sum(len(s.completion_ids) for s in samples)
+    total_active = sum(sum(s.completion_mask) for s in samples)
+    with prof(
+        "compute.arm.TOTAL",
+        n_samples=n_samples,
+        total_completion=total_completion,
+        total_active=total_active,
+    ):
+        with prof("compute.arm.build_value_tensors", sync_cuda=True):
+            v_all, v_target_all, q_plus_sampled_all, q_plus_candidates = _build_per_token_value_tensors(
+                samples=samples, backbone=backbone, need_q_plus=True
+            )
+        assert q_plus_sampled_all is not None and q_plus_candidates is not None
+        inputs = ArmAdvantageInputs(
+            samples=samples,
+            episodic_reward=episodic_reward,
+            is_terminal=is_terminal,
+            v_all=v_all,
+            v_target_all=v_target_all,
+            q_plus_sampled_all=q_plus_sampled_all,
+            q_plus_candidates=q_plus_candidates,
+            gamma=gamma,
+            n_step=n_step,
+        )
+        with prof("compute.arm.regret_matching"):
+            out = arm_regret_matching_advantage_fn(inputs)
+        with prof("compute.arm.build_paired_outputs"):
+            return _build_paired_outputs(samples, out)
 
 
 def compute_advantages_and_targets(
@@ -188,7 +201,13 @@ def _build_per_token_value_tensors(
             )
 
             # ----- V all-positions -----
-            v_all_seq, _v_cache = backbone.forward_v_all_positions(full_input_ids)
+            with prof(
+                "build_value_tensors.forward_v_all",
+                sync_cuda=True,
+                prompt_len=prompt_len,
+                completion_len=completion_len,
+            ):
+                v_all_seq, _v_cache = backbone.forward_v_all_positions(full_input_ids)
             # v_all_seq[0, k] is V at observation o_k = first k tokens of input.
             # We need V(o_k) for k = (prompt_len-1, ..., prompt_len + completion_len - 2)
             # because position 0 of completion is "before completion[0] is sampled,
@@ -200,16 +219,28 @@ def _build_per_token_value_tensors(
             v_per_completion = v_all_seq[0, prompt_len - 1 : prompt_len - 1 + completion_len]
 
             # ----- V_target all-positions -----
-            v_target_all_seq, _vt_cache = backbone.forward_v_target_all_positions(full_input_ids)
+            with prof(
+                "build_value_tensors.forward_v_target_all",
+                sync_cuda=True,
+                prompt_len=prompt_len,
+                completion_len=completion_len,
+            ):
+                v_target_all_seq, _vt_cache = backbone.forward_v_target_all_positions(full_input_ids)
             v_target_per_completion = v_target_all_seq[
                 0, prompt_len - 1 : prompt_len - 1 + completion_len
             ]
 
             if need_q_plus:
                 # ----- Q+ all-positions (sampled) + K-candidate per active position -----
-                q_plus_all_seq, q_plus_cache = backbone.forward_q_plus_sampled_all_positions(
-                    full_input_ids
-                )
+                with prof(
+                    "build_value_tensors.forward_q_plus_sampled_all",
+                    sync_cuda=True,
+                    prompt_len=prompt_len,
+                    completion_len=completion_len,
+                ):
+                    q_plus_all_seq, q_plus_cache = backbone.forward_q_plus_sampled_all_positions(
+                        full_input_ids
+                    )
                 # Q+ at the sampled action a_k = completion_ids[k] is read at the
                 # full-input position right AFTER token a_k, i.e. position
                 # `prompt_len + k`. (One position later than V, because Q+
@@ -239,25 +270,39 @@ def _build_per_token_value_tensors(
                 local_active = 0
                 per_position_candidates: list[torch.Tensor] = []
                 per_position_sampled: list[torch.Tensor] = []
-                for j, mask_bit in enumerate(sample.completion_mask):
-                    if not mask_bit:
-                        continue
-                    candidates_for_j = sample.completion_top_k_token_ids[local_active]
-                    cand_tensor = torch.tensor(
-                        candidates_for_j, dtype=torch.long, device=device
-                    )
-                    crop_length = prompt_len + j
-                    cropped_cache = ValueNetworkBackbone.clone_and_crop_cache(
-                        q_plus_cache, crop_length
-                    )
-                    q_for_K = backbone.forward_q_plus_candidates_at_position(
-                        prefix_past_key_values=cropped_cache,
-                        candidate_token_ids=cand_tensor,
-                        prefix_length=crop_length,
-                    )
-                    per_position_candidates.append(q_for_K)
-                    per_position_sampled.append(q_plus_sampled_per_completion[j])
-                    local_active += 1
+                n_active_positions = sum(sample.completion_mask)
+                with prof(
+                    "build_value_tensors.candidates_loop",
+                    sync_cuda=True,
+                    n_active=n_active_positions,
+                    K=K,
+                ):
+                    for j, mask_bit in enumerate(sample.completion_mask):
+                        if not mask_bit:
+                            continue
+                        candidates_for_j = sample.completion_top_k_token_ids[local_active]
+                        cand_tensor = torch.tensor(
+                            candidates_for_j, dtype=torch.long, device=device
+                        )
+                        crop_length = prompt_len + j
+                        with prof("build_value_tensors.candidates.clone_crop_cache", sync_cuda=False):
+                            cropped_cache = ValueNetworkBackbone.clone_and_crop_cache(
+                                q_plus_cache, crop_length
+                            )
+                        with prof(
+                            "build_value_tensors.candidates.forward_K",
+                            sync_cuda=True,
+                            crop_length=crop_length,
+                            K=K,
+                        ):
+                            q_for_K = backbone.forward_q_plus_candidates_at_position(
+                                prefix_past_key_values=cropped_cache,
+                                candidate_token_ids=cand_tensor,
+                                prefix_length=crop_length,
+                            )
+                        per_position_candidates.append(q_for_K)
+                        per_position_sampled.append(q_plus_sampled_per_completion[j])
+                        local_active += 1
 
                 if per_position_candidates:
                     q_plus_sampled_chunks.append(torch.stack(per_position_sampled))
