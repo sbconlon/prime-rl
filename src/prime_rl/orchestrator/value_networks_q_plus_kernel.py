@@ -82,6 +82,13 @@ def _apply_rotary_to_q_only(q: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
+# flash_attn_with_kvcache launches a CUDA grid whose batch dim is capped at
+# 65535 (cudaGridDim.y/z). At ALFWorld scale (N_active=8000, K=32) the flat
+# batch B = 256k blows past that. Chunk B internally; the layer chain stays
+# unchunked because projections/MLP on B=256k are fine memory-wise on A100s.
+_FLASH_MAX_BATCH = 32768
+
+
 def _attention_flash(
     q_fa: Tensor,           # [B, 1, n_q, head_dim] (FA layout)
     k_cache_fa: Tensor,     # [1, S_cache, n_kv, head_dim]
@@ -89,18 +96,40 @@ def _attention_flash(
     cache_seqlens: Tensor,  # [B] int32
     cache_batch_idx: Tensor,  # [B] int32 (all zeros for shared cache)
 ) -> Tensor:
-    """flash_attn_with_kvcache call. Returns [B, 1, n_q, head_dim]."""
+    """flash_attn_with_kvcache call. Returns [B, 1, n_q, head_dim].
+
+    Chunks along B when B > _FLASH_MAX_BATCH to keep flash_attn's grid
+    dimension under the CUDA 65535 cap.
+    """
     assert _flash_attn_with_kvcache is not None, "flash_attn not available"
-    return _flash_attn_with_kvcache(
-        q=q_fa,
-        k_cache=k_cache_fa,
-        v_cache=v_cache_fa,
-        k=None,
-        v=None,
-        cache_seqlens=cache_seqlens,
-        cache_batch_idx=cache_batch_idx,
-        causal=True,
-    )
+    B = q_fa.shape[0]
+    if B <= _FLASH_MAX_BATCH:
+        return _flash_attn_with_kvcache(
+            q=q_fa,
+            k_cache=k_cache_fa,
+            v_cache=v_cache_fa,
+            k=None,
+            v=None,
+            cache_seqlens=cache_seqlens,
+            cache_batch_idx=cache_batch_idx,
+            causal=True,
+        )
+    outs: list[Tensor] = []
+    for start in range(0, B, _FLASH_MAX_BATCH):
+        end = min(start + _FLASH_MAX_BATCH, B)
+        outs.append(
+            _flash_attn_with_kvcache(
+                q=q_fa[start:end],
+                k_cache=k_cache_fa,
+                v_cache=v_cache_fa,
+                k=None,
+                v=None,
+                cache_seqlens=cache_seqlens[start:end],
+                cache_batch_idx=cache_batch_idx[start:end],
+                causal=True,
+            )
+        )
+    return torch.cat(outs, dim=0)
 
 
 def _attention_python(
