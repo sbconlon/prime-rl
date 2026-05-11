@@ -472,7 +472,10 @@ def forward_q_plus_sampled_all_positions_flex_kernel(
             # Cache contract: store K/V pre-GQA-expansion in HF's
             # [B, n_kv, S, d] layout so the K-candidate kernel
             # (forward_q_plus_candidates_batched) can read them unchanged.
-            cache.update(K, V, layer_idx)
+            # Make K/V contiguous before cache store -- the K-candidate kernel calls
+            # .contiguous() on cache reads; if our stored tensors are strided views
+            # (from the transpose above) that contiguous() must materialize.
+            cache.update(K.contiguous(), V.contiguous(), layer_idx)
 
             # GQA expansion for the attention computation.
             n_rep = n_q // n_kv
