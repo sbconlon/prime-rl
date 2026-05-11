@@ -329,7 +329,10 @@ class ValueNetworkBackbone(nn.Module):
         return self._forward_all_positions(input_ids, V_TARGET_SLOT, self.v_target_head)
 
     def forward_q_plus_sampled_all_positions(
-        self, input_ids: Tensor
+        self,
+        input_ids: Tensor,
+        *,
+        use_flex_attn: bool | None = None,
     ) -> tuple[Tensor, "DynamicCache"]:
         """Forward through Q+ slot; return per-token Q+ values for the
         SAMPLED action at each position, plus populated cache.
@@ -341,7 +344,28 @@ class ValueNetworkBackbone(nn.Module):
         token k. (NB: this differs from `forward_q_plus(obs, a)` which
         appends `a` to `obs`; the all-positions read here exploits the fact
         that completion_ids already contains the sampled action.)
+
+        Phase 10 AdvTrainer perf path: when use_flex_attn is True (or None
+        and we are on CUDA with FlexAttention available), routes through
+        forward_q_plus_sampled_all_positions_flex_kernel which uses
+        FlexAttention's strict-causal mask_mod -- ~40x faster than the
+        SDPA Math backend that the 4D additive mask forces. Same cache
+        layout, so the AdvSrv K-candidate kernel keeps working unchanged.
+        Falls back to the SDPA Math path otherwise (CPU, no flex, or
+        explicit use_flex_attn=False).
         """
+        from prime_rl.orchestrator.value_networks_q_plus_kernel import (
+            _HAS_FLEX_ATTN,
+            forward_q_plus_sampled_all_positions_flex_kernel,
+        )
+        if use_flex_attn is None:
+            use_flex_attn = _HAS_FLEX_ATTN and input_ids.device.type == "cuda"
+        if use_flex_attn:
+            if not _HAS_FLEX_ATTN:
+                raise RuntimeError(
+                    "use_flex_attn=True but torch.nn.attention.flex_attention is not available"
+                )
+            return forward_q_plus_sampled_all_positions_flex_kernel(self, input_ids)
         return self._forward_all_positions(input_ids, Q_PLUS_SLOT, self.q_plus_head)
 
     def _forward_all_positions(

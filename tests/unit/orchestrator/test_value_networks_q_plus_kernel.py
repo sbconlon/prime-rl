@@ -233,3 +233,178 @@ def test_kernel_different_positions_yield_different_outputs(
         f"({out[0,0].item()} vs {out[1,0].item()}, diff={diff:.3e}). "
         "RoPE or cache_seqlens isn\'t per-row."
     )
+# ---------------------------------------------------------------------------
+# FlexAttention all-positions Q+ kernel tests (lever 1).
+# ---------------------------------------------------------------------------
+#
+# These three tests exercise forward_q_plus_sampled_all_positions_flex_kernel
+# directly (bypassing the auto-detect dispatch since local CI is CPU-only).
+# The kernel itself requires CUDA + PyTorch >= 2.5 (FlexAttention), so the
+# tests are skipped when those aren't available.
+#
+# The dispatch path (use_flex_attn parameter on
+# forward_q_plus_sampled_all_positions) is covered by the existing
+# value_networks tests, which exercise the SDPA Math fallback on CPU.
+
+
+@pytest.fixture
+def cuda_tiny_qwen3_backbone() -> ValueNetworkBackbone:
+    """CUDA + BF16 backbone, mirrors AdvSrv/AdvTrainer production config."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for FlexAttention tests")
+    try:
+        from torch.nn.attention.flex_attention import flex_attention  # noqa: F401
+    except ImportError:
+        pytest.skip("FlexAttention not available (needs PyTorch >= 2.5)")
+
+    torch.manual_seed(0)
+    base = Qwen3Model(_tiny_qwen3_config()).to(device="cuda", dtype=torch.bfloat16)
+    lora = LoRAConfig(rank=8, alpha=16.0, dropout=0.0)
+    backbone = ValueNetworkBackbone(base, lora_config=lora, polyak_tau=0.005)
+    backbone = backbone.to(device="cuda", dtype=torch.bfloat16)
+    # Break zero-init.
+    torch.manual_seed(1)
+    with torch.no_grad():
+        for name, p in backbone.named_parameters():
+            if ("lora_A" in name) or ("lora_B" in name):
+                p.copy_(torch.randn_like(p) * 0.1)
+        for head in (backbone.v_head, backbone.q_plus_head, backbone.v_target_head):
+            torch.nn.init.normal_(head.linear.weight, std=0.05)
+    backbone.eval()
+    return backbone
+
+
+def test_flex_forward_parity_vs_sdpa_math(
+    cuda_tiny_qwen3_backbone: ValueNetworkBackbone,
+):
+    """Flex kernel's Q+ output matches the SDPA Math path within BF16 noise.
+
+    Per spike 6.2 the FP32 parity is essentially zero (atol < 1e-8); in BF16
+    we allow atol=3e-2 for accumulation noise. This is the canonical
+    correctness gate: if it ever regresses we have a real math bug.
+    """
+    torch.manual_seed(2)
+    input_ids = torch.randint(
+        1, 256, (1, 32), dtype=torch.long, device="cuda"
+    )
+
+    flex_q, _ = cuda_tiny_qwen3_backbone.forward_q_plus_sampled_all_positions(
+        input_ids, use_flex_attn=True,
+    )
+    sdpa_q, _ = cuda_tiny_qwen3_backbone.forward_q_plus_sampled_all_positions(
+        input_ids, use_flex_attn=False,
+    )
+
+    abs_diff = (flex_q.float() - sdpa_q.float()).abs()
+    max_abs = abs_diff.max().item()
+    assert torch.isfinite(flex_q).all(), "flex Q+ produced non-finite values"
+    assert max_abs < 3e-2, (
+        f"flex vs SDPA Math Q+ output diverged: max_abs={max_abs:.3e} "
+        f"(BF16 noise budget = 3e-2)"
+    )
+
+
+def test_flex_backward_parity_vs_sdpa_math(
+    cuda_tiny_qwen3_backbone: ValueNetworkBackbone,
+):
+    """Gradients w.r.t. Q+ LoRA params match between flex and SDPA Math paths.
+
+    Confirms that FlexAttention's backward is correct end-to-end through
+    the full Qwen3 layer chain + LoRA routing + q_plus_head, not just the
+    raw attention call covered by spike 6.1.
+    """
+    torch.manual_seed(3)
+    input_ids = torch.randint(
+        1, 256, (1, 32), dtype=torch.long, device="cuda"
+    )
+    target = torch.randn(1, 32, dtype=torch.bfloat16, device="cuda")
+
+    # Q+ LoRA slot (1) params: collect references for grad inspection.
+    def q_plus_lora_params(backbone):
+        return [
+            (name, p) for name, p in backbone.named_parameters()
+            if (("lora_A" in name) or ("lora_B" in name))
+            and name.endswith(f".{Q_PLUS_SLOT}")
+        ]
+
+    # Flex path backward.
+    backbone = cuda_tiny_qwen3_backbone
+    for _, p in q_plus_lora_params(backbone):
+        p.grad = None
+    backbone.train()
+    flex_q, _ = backbone.forward_q_plus_sampled_all_positions(
+        input_ids, use_flex_attn=True,
+    )
+    ((flex_q - target) ** 2).mean().backward()
+    flex_grads = {name: p.grad.detach().clone() for name, p in q_plus_lora_params(backbone)}
+
+    # SDPA Math path backward.
+    for _, p in q_plus_lora_params(backbone):
+        p.grad = None
+    sdpa_q, _ = backbone.forward_q_plus_sampled_all_positions(
+        input_ids, use_flex_attn=False,
+    )
+    ((sdpa_q - target) ** 2).mean().backward()
+    sdpa_grads = {name: p.grad.detach().clone() for name, p in q_plus_lora_params(backbone)}
+
+    backbone.eval()
+
+    assert flex_grads.keys() == sdpa_grads.keys() and len(flex_grads) > 0
+    grad_tol = 5e-2  # BF16 backward accumulates more aggressively than forward
+    for name in flex_grads:
+        gf = flex_grads[name]
+        gs = sdpa_grads[name]
+        assert torch.isfinite(gf).all(), f"non-finite flex grad: {name}"
+        mab = (gf - gs).float().abs().max().item()
+        assert mab < grad_tol, (
+            f"grad diverged for {name}: max_abs={mab:.3e} (tol {grad_tol})"
+        )
+
+
+def test_flex_cache_contract_matches_sdpa_math(
+    cuda_tiny_qwen3_backbone: ValueNetworkBackbone,
+):
+    """Flex kernel populates DynamicCache identically (within BF16 noise) to
+    the SDPA Math path. The AdvSrv K-candidate kernel reads this cache, so
+    a layout/shape/dtype mismatch would silently break inference.
+
+    Compares per-layer K/V tensors. Cache layout must be [B, n_kv, S, d]
+    in BF16, matching what HF's standard forward produces.
+    """
+    torch.manual_seed(4)
+    input_ids = torch.randint(
+        1, 256, (1, 32), dtype=torch.long, device="cuda"
+    )
+
+    _, flex_cache = cuda_tiny_qwen3_backbone.forward_q_plus_sampled_all_positions(
+        input_ids, use_flex_attn=True,
+    )
+    _, sdpa_cache = cuda_tiny_qwen3_backbone.forward_q_plus_sampled_all_positions(
+        input_ids, use_flex_attn=False,
+    )
+
+    assert len(flex_cache.layers) == len(sdpa_cache.layers), (
+        f"layer count mismatch: flex={len(flex_cache.layers)} "
+        f"sdpa={len(sdpa_cache.layers)}"
+    )
+
+    cache_tol = 5e-2  # BF16 noise; cache K, V go through Q+ LoRA path
+    for i, (fl, sd) in enumerate(zip(flex_cache.layers, sdpa_cache.layers)):
+        assert fl.keys.shape == sd.keys.shape, (
+            f"layer {i} keys shape: flex={fl.keys.shape} sdpa={sd.keys.shape}"
+        )
+        assert fl.values.shape == sd.values.shape, (
+            f"layer {i} values shape: flex={fl.values.shape} sdpa={sd.values.shape}"
+        )
+        assert fl.keys.dtype == sd.keys.dtype, (
+            f"layer {i} keys dtype: flex={fl.keys.dtype} sdpa={sd.keys.dtype}"
+        )
+
+        k_diff = (fl.keys.float() - sd.keys.float()).abs().max().item()
+        v_diff = (fl.values.float() - sd.values.float()).abs().max().item()
+        assert k_diff < cache_tol, (
+            f"layer {i} K cache diverged: max_abs={k_diff:.3e} (tol {cache_tol})"
+        )
+        assert v_diff < cache_tol, (
+            f"layer {i} V cache diverged: max_abs={v_diff:.3e} (tol {cache_tol})"
+        )

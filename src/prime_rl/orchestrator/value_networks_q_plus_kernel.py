@@ -339,3 +339,158 @@ def forward_q_plus_candidates_batched_kernel(
     # Q+ head (returns scalar per row).
     q_plus = backbone.q_plus_head(h[:, 0, :])                # [B]
     return q_plus.view(N_active, K)
+# ---------------------------------------------------------------------------
+# FlexAttention all-positions Q+ kernel (lever 1 of the AdvTrainer perf pass).
+# ---------------------------------------------------------------------------
+#
+# Replaces the SDPA Math backend path used by `_forward_all_positions` when
+# slot == Q_PLUS_SLOT. The 4D additive strict-causal mask that path uses
+# kicks SDPA off Flash backend onto Math, which materializes the full S x S
+# attention probabilities at every layer and saves them for backward --
+# that's ~3.6 GB/sample at S=2048 in BF16 across 28 layers, which OOMs the
+# AdvTrainer at batch sizes typical of the canary.
+#
+# FlexAttention JIT-compiles a Triton kernel that respects strict-causal
+# via a mask_mod function without materializing the score matrix. The
+# strict-causal mask_mod is:
+#
+#     M[i, j] = 0       if j <  i  (attend)
+#     M[i, j] = -inf    if j >= i  (mask out)
+#     M[0, 0] = 0       (position-0 self-attend; avoids NaN softmax row)
+#
+# Spike 6.2 validated FP32 forward parity = 7.45e-9 (essentially zero)
+# against HF's stock self_attn with the equivalent 4D additive mask.
+
+try:
+    from torch.nn.attention.flex_attention import (
+        create_block_mask,
+        flex_attention,
+    )
+    _HAS_FLEX_ATTN = True
+    _flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+except ImportError:
+    create_block_mask = None  # type: ignore[assignment]
+    flex_attention = None  # type: ignore[assignment]
+    _HAS_FLEX_ATTN = False
+    _flex_attention_compiled = None  # type: ignore[assignment]
+
+
+# Cache strict-causal block masks by (seq_len, device_str). FlexAttention's
+# block_mask is a heavy object (precomputed sparsity pattern); reusing it
+# across calls is essential. AdvTrainer training batches all share the
+# same seq_len after packing, so the cache hit rate is ~100%.
+_BLOCK_MASK_CACHE: dict[tuple[int, str], object] = {}
+
+
+def _strict_causal_mask_mod(b, h, q_idx, kv_idx):
+    # Position-0 self-attend handled explicitly to avoid a fully-masked
+    # softmax row at q_idx=0 (would produce NaN).
+    return (kv_idx < q_idx) | ((q_idx == 0) & (kv_idx == 0))
+
+
+def _get_strict_causal_block_mask(seq_len: int, device: torch.device):
+    """Build or fetch a cached strict-causal FlexAttention block_mask."""
+    key = (seq_len, str(device))
+    cached = _BLOCK_MASK_CACHE.get(key)
+    if cached is None:
+        cached = create_block_mask(
+            _strict_causal_mask_mod,
+            B=None, H=None,
+            Q_LEN=seq_len, KV_LEN=seq_len,
+            device=device,
+        )
+        _BLOCK_MASK_CACHE[key] = cached
+    return cached
+
+
+def _apply_rotary_qk(q: Tensor, k: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor]:
+    """Apply RoPE to both Q and K. Mirrors HF's apply_rotary_pos_emb_qwen3.
+
+    q, k: [B, H, S, D]
+    cos, sin: [B, S, D]
+    """
+    cos = cos.unsqueeze(1)  # [B, 1, S, D]
+    sin = sin.unsqueeze(1)
+    q_rot = q * cos + rotate_half(q) * sin
+    k_rot = k * cos + rotate_half(k) * sin
+    return q_rot, k_rot
+
+
+def forward_q_plus_sampled_all_positions_flex_kernel(
+    backbone: "ValueNetworkBackbone",
+    input_ids: Tensor,
+) -> tuple[Tensor, "DynamicCache"]:
+    """All-positions Q+ forward via FlexAttention with strict-causal mask_mod.
+
+    Memory-efficient and ~40x faster than the SDPA Math fallback at S=2048
+    in BF16 (spike 6.1 measurement on A100 MIG slice).
+
+    Returns the same (q_plus_seq [B, S], cache) contract as the SDPA path
+    so the AdvSrv K-candidate kernel can consume the cache unchanged.
+    Cache layout: HF's [B, n_kv, S, head_dim] per layer.
+    """
+    from prime_rl.orchestrator.value_networks import Q_PLUS_SLOT, _adapter_routing
+    from transformers import DynamicCache
+
+    assert _HAS_FLEX_ATTN, "FlexAttention not available (needs PyTorch >= 2.5)"
+    assert input_ids.dim() == 2, f"input_ids must be [B, S], got {tuple(input_ids.shape)}"
+    B, S = input_ids.shape
+    device = input_ids.device
+
+    block_mask = _get_strict_causal_block_mask(S, device)
+
+    # Embed + RoPE coefficients (RoPE shared across layers).
+    h = backbone.base_model.embed_tokens(input_ids)  # [B, S, hidden]
+    position_ids = torch.arange(S, device=device, dtype=torch.long).unsqueeze(0).expand(B, -1)
+    cos, sin = backbone.base_model.rotary_emb(h, position_ids)
+
+    cache = DynamicCache()
+
+    # All layer forwards route through Q+ slot.
+    with _adapter_routing(Q_PLUS_SLOT, B * S):
+        for layer_idx, layer in enumerate(backbone.base_model.layers):
+            attn = layer.self_attn
+            d = attn.head_dim
+            n_q = attn.q_proj.out_features // d
+            n_kv = attn.k_proj.out_features // d
+
+            # ---- Attention block ----
+            residual = h
+            h_norm = layer.input_layernorm(h)
+
+            Q = attn.q_proj(h_norm).view(B, S, n_q, d).transpose(1, 2)     # [B, n_q,  S, d]
+            K = attn.k_proj(h_norm).view(B, S, n_kv, d).transpose(1, 2)    # [B, n_kv, S, d]
+            V = attn.v_proj(h_norm).view(B, S, n_kv, d).transpose(1, 2)    # [B, n_kv, S, d]
+
+            if hasattr(attn, "q_norm"):
+                Q = attn.q_norm(Q)
+            if hasattr(attn, "k_norm"):
+                K = attn.k_norm(K)
+
+            Q, K = _apply_rotary_qk(Q, K, cos, sin)
+
+            # Cache contract: store K/V pre-GQA-expansion in HF's
+            # [B, n_kv, S, d] layout so the K-candidate kernel
+            # (forward_q_plus_candidates_batched) can read them unchanged.
+            cache.update(K, V, layer_idx)
+
+            # GQA expansion for the attention computation.
+            n_rep = n_q // n_kv
+            K_full = K.repeat_interleave(n_rep, dim=1)                     # [B, n_q, S, d]
+            V_full = V.repeat_interleave(n_rep, dim=1)
+
+            attn_out = _flex_attention_compiled(Q, K_full, V_full, block_mask=block_mask)
+            # attn_out: [B, n_q, S, d] -> [B, S, n_q*d]
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, S, n_q * d)
+            attn_out = attn.o_proj(attn_out)
+
+            h = residual + attn_out
+
+            # ---- MLP block ----
+            residual2 = h
+            h = layer.post_attention_layernorm(h)
+            h = residual2 + layer.mlp(h)
+
+    h = backbone.base_model.norm(h)
+    q_plus_seq = backbone.q_plus_head(h)  # [B, S]
+    return q_plus_seq, cache
