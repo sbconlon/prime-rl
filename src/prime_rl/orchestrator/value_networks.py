@@ -452,6 +452,47 @@ class ValueNetworkBackbone(nn.Module):
         # output.last_hidden_state: [K, 1, hidden]
         return self.q_plus_head(output.last_hidden_state[:, 0, :])
 
+    def forward_q_plus_candidates_batched(
+        self,
+        prefix_cache: "DynamicCache",
+        candidate_token_ids: Tensor,
+        candidate_positions: Tensor,
+        *,
+        use_flash_attn: bool | None = None,
+    ) -> Tensor:
+        """Batched Q+ candidate forward over all (position, candidate) pairs.
+
+        Single forward over B = N_active * K rows, all sharing the same
+        physical Q+ prefix cache via cache_batch_idx=zeros(B) and
+        flash_attn_with_kvcache(k=None, v=None) for cross-attention. Replaces
+        the 128-iteration per-position loop in the Advantage Server compute
+        path. See plan/implement-q-plus-shared-cache-cross-attention.md
+        sections 4.2-4.4.
+
+        Args:
+          prefix_cache: produced by forward_q_plus_sampled_all_positions over
+            the full input (prompt + completion). Shared across all rows.
+          candidate_token_ids: [N_active, K] int64 candidate tokens
+            (Phase 5 compact layout).
+          candidate_positions: [N_active] integer positions in the full
+            trajectory (= prompt_len + j_local for each active j). Must
+            be >= 1.
+          use_flash_attn: force flash-attn path or FP32 Python fallback.
+            Default: auto (flash-attn if installed and inputs are CUDA).
+
+        Returns: [N_active, K] Q+ values (after q_plus_head).
+        """
+        from prime_rl.orchestrator.value_networks_q_plus_kernel import (
+            forward_q_plus_candidates_batched_kernel,
+        )
+        return forward_q_plus_candidates_batched_kernel(
+            self,
+            prefix_cache=prefix_cache,
+            candidate_token_ids=candidate_token_ids,
+            candidate_positions=candidate_positions,
+            use_flash_attn=use_flash_attn,
+        )
+
     @staticmethod
     def clone_and_crop_cache(
         cache: "DynamicCache", crop_length: int
