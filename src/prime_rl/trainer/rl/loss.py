@@ -167,6 +167,11 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
     kl_loss = loss_mask * log_importance_ratio**2
     loss = (-pg_loss + loss_config.kl_tau * kl_loss).sum()
 
+    # Phase 10 ARM diagnostic: surface advantage / pg_loss magnitudes per step
+    # so we can confirm the value-network signal actually reaches the policy
+    # gradient. Look for these in the trainer step log.
+    adv_abs = advantages.abs()
+    pg_abs = pg_loss.abs()
     metrics = {
         "mismatch_kl": _safe_mean(mismatch_kl, loss_mask),  # all trainable tokens
         "masked_mismatch_kl": _safe_mean(mismatch_kl, loss_mask & is_masked),  # all trainable, masked tokens
@@ -174,6 +179,11 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
         "is_masked": _safe_mean(is_masked, loss_mask),
         "is_masked_low": _safe_mean(is_masked_low, loss_mask),
         "is_masked_high": _safe_mean(is_masked_high, loss_mask),
+        # Diagnostic: what advantage magnitude reaches the loss, and how
+        # much pg_loss it contributes at trainable positions.
+        "adv_abs_mean": _safe_mean(adv_abs, loss_mask),
+        "adv_abs_max": adv_abs.max().detach(),
+        "pg_loss_abs_mean": _safe_mean(pg_abs, loss_mask),
     }
     if teacher_kl is not None:
         metrics["teacher_kl"] = _safe_mean(teacher_kl, loss_mask)

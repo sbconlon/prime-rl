@@ -23,9 +23,12 @@ a deferred edit pass.
 
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 import torch
+
+_LOGGER = logging.getLogger("prime_rl.advantage_server")
 
 from prime_rl.orchestrator.per_token_advantage import (
     ArmAdvantageInputs,
@@ -115,8 +118,36 @@ def compute_advantages_and_targets_arm(
         )
         with prof("compute.arm.regret_matching"):
             out = arm_regret_matching_advantage_fn(inputs)
+        # Phase 10 diagnostic: per-request advantage + target magnitudes.
+        # Catches the case where regret-matching produces ~0 (cold start,
+        # or normalization that eats signal) before that signal reaches the
+        # LLM trainer. Look for this line in advantage_server.log.
+        _log_advantage_magnitudes(out)
         with prof("compute.arm.build_paired_outputs"):
             return _build_paired_outputs(samples, out)
+
+
+def _log_advantage_magnitudes(out: PerTokenAdvantageOutputs) -> None:
+    """Emit per-request advantage / v_target / q_plus_target magnitudes."""
+    import math
+    adv_flat = [a for sample in out.advantages for a in sample]
+    v_flat = [v for sample in out.v_targets for v in sample]
+    if not adv_flat:
+        _LOGGER.info("ARM_DIAG advantages=empty")
+        return
+    adv_abs = [abs(a) for a in adv_flat]
+    v_abs = [abs(v) for v in v_flat]
+    msg = (
+        f"ARM_DIAG n_tokens={len(adv_flat)} "
+        f"adv_abs_mean={sum(adv_abs)/len(adv_abs):.4e} "
+        f"adv_abs_max={max(adv_abs):.4e} "
+        f"v_target_abs_mean={sum(v_abs)/len(v_abs):.4e}"
+    )
+    if out.q_plus_targets is not None:
+        q_flat = [q for sample in out.q_plus_targets for q in sample]
+        q_abs = [abs(q) for q in q_flat]
+        msg += f" q_plus_target_abs_mean={sum(q_abs)/len(q_abs):.4e}"
+    _LOGGER.info(msg)
 
 
 def compute_advantages_and_targets(

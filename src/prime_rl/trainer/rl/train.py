@@ -529,6 +529,14 @@ def train(config: TrainerConfig):
         step_message += f" | Grad. Norm: {grad_norm:.4f} | LR: {current_lr:.2e} | Throughput: {throughput:.0f} tokens/s | MFU: {mfu:.1f}% | Peak Mem.: {peak_memory:.1f} GiB"
         if "max_vio/mean" in tensor_stats:
             step_message += f" | Max Vio: {tensor_stats['max_vio/mean']:.4f}"
+        # Phase 10 ARM diagnostic: advantage / pg_loss magnitudes reaching
+        # the policy gradient. Pair with the AdvSrv\'s ARM_DIAG log lines.
+        if "adv_abs_mean/mean" in tensor_stats:
+            step_message += (
+                f" | Adv abs mean: {tensor_stats['adv_abs_mean/mean']:.3e}"
+                f" | Adv abs max: {tensor_stats['adv_abs_max/mean']:.3e}"
+                f" | PG loss abs mean: {tensor_stats['pg_loss_abs_mean/mean']:.3e}"
+            )
         logger.success(step_message)
 
         # Log performance metrics
