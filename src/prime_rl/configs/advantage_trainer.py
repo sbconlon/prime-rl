@@ -78,6 +78,24 @@ class AdvantageTrainerConfig(BaseConfig):
         Field(gt=0.0, description="Learning rate for the value-network LoRA adapters and value heads."),
     ] = 1e-3
 
+    # Phase 10 lever 2: how many samples per forward+backward chunk inside
+    # a training step. Larger = better GPU utilization (matmul efficiency),
+    # but more activation memory per chunk. Default 8 fits comfortably on
+    # a 40GB MIG slice at canary-shape sequences. Set to 1 to recover the
+    # pre-lever-2 per-sample backward behavior (useful for debugging or
+    # parity checks against earlier runs).
+    inner_batch_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Samples per forward+backward chunk inside a training step. "
+                "1 = per-sample backward (pre-lever-2); 8 = default; larger "
+                "amortizes Python overhead but grows activation memory."
+            ),
+        ),
+    ] = 8
+
     # Where to write logs / checkpoints. Mirrors trainer.output_dir.
     output_dir: Annotated[
         Path,
