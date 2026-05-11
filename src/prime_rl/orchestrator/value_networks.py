@@ -227,10 +227,21 @@ class ValueNetworkBackbone(nn.Module):
     # -------------------------------------------------------------------
 
     def _forward_base(self, input_ids: Tensor, slot: int) -> Tensor:
-        """Run base model with all tokens routed to `slot`. Returns last_hidden_state."""
+        """Run base model with all tokens routed to `slot`. Returns last_hidden_state.
+
+        Applies the slot-dependent strict-causal mask for Q+ (plan section 4.1
+        cross-attention semantic). V and V_target retain HF default causal.
+        Keeps `forward_q_plus` consistent with `forward_q_plus_sampled_all_positions`
+        so the Phase 6.5 parity test still acts as a real correctness oracle.
+        """
         batch, seq = input_ids.shape
+        extra_kwargs: dict[str, Tensor] = {}
+        if slot == Q_PLUS_SLOT:
+            extra_kwargs["attention_mask"] = self._build_strict_causal_mask(
+                seq, input_ids.device
+            )
         with _adapter_routing(slot, batch * seq):
-            output = self.base_model(input_ids)
+            output = self.base_model(input_ids, **extra_kwargs)
         # Both AutoModel.from_pretrained's BaseModelOutputWithPast and direct
         # Qwen2Model output expose `last_hidden_state`.
         return output.last_hidden_state  # [batch, seq, hidden]
@@ -336,11 +347,62 @@ class ValueNetworkBackbone(nn.Module):
     def _forward_all_positions(
         self, input_ids: Tensor, slot: int, head: nn.Module
     ) -> tuple[Tensor, "DynamicCache"]:
-        """Shared implementation for the three all-positions forwards."""
+        """Shared implementation for the three all-positions forwards.
+
+        For Q+ (slot == Q_PLUS_SLOT), injects a 4D strict-causal mask so
+        each position\'s hidden state is the attention output of Q_i
+        against K_{0..i-1}, V_{0..i-1} -- the candidate\'s own K/V do NOT
+        enter attention. This is the cross-attention semantic that ARM\'s
+        Q+(o, a) requires (a is not part of o); see the implement-q-plus-
+        shared-cache-cross-attention plan, section 4.1.
+
+        V and V_target slots retain HF\'s default self-inclusive causal
+        behavior (no mask passed; HF infers standard causal). State-only
+        value functions have no analogous "action at position t" to exclude.
+        """
         batch, seq = input_ids.shape
+        extra_kwargs: dict[str, Tensor] = {}
+        if slot == Q_PLUS_SLOT:
+            extra_kwargs["attention_mask"] = self._build_strict_causal_mask(
+                seq, input_ids.device
+            )
         with _adapter_routing(slot, batch * seq):
-            output = self.base_model(input_ids, use_cache=True)
+            output = self.base_model(input_ids, use_cache=True, **extra_kwargs)
         return head(output.last_hidden_state), output.past_key_values
+
+    def _build_strict_causal_mask(
+        self, seq_len: int, device: torch.device
+    ) -> Tensor:
+        """Build a [1, 1, seq_len, seq_len] strict-causal attention mask.
+
+            M[i, j] = 0       if j <  i  (attend)
+            M[i, j] = -inf    if j >= i  (mask out)
+            M[0, 0] = 0       (special case: position-0 self-attend)
+
+        Strict-causal at position 0 would attend to the empty set; an
+        all-masked softmax row produces NaN, which would propagate into
+        all downstream layers\' K and V at every position. Self-attending
+        at position 0 keeps the hidden state finite. The Q+ value at
+        position 0 is never read in training (prompt-mask is False there)
+        or inference (the K-candidate forward asserts candidate_positions
+        >= 1), so the degenerate self-attention output is harmless.
+
+        Dtype matches the model\'s parameter dtype (typically BF16); the
+        sentinel is `torch.finfo(dtype).min`, matching HF\'s own mask
+        construction convention.
+        """
+        attn_dtype = next(self.base_model.parameters()).dtype
+        i_idx = torch.arange(seq_len, device=device).unsqueeze(1)  # [seq, 1]
+        j_idx = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq]
+        keep = j_idx < i_idx                                        # bool [seq, seq]
+        keep[0, 0] = True                                           # position-0 self-attend
+        sentinel = torch.finfo(attn_dtype).min
+        mask = torch.where(
+            keep,
+            torch.zeros((), dtype=attn_dtype, device=device),
+            torch.full((), sentinel, dtype=attn_dtype, device=device),
+        )
+        return mask.unsqueeze(0).unsqueeze(0)                       # [1, 1, seq, seq]
 
     def forward_q_plus_candidates_at_position(
         self,
