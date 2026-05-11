@@ -154,7 +154,7 @@ class MultiLoRALinear(MultiLoRAModule):
             lora_out = _run_lora_for_loop(lora_x, combined_lora_A, combined_lora_B, offsets)
 
         # Apply per-token scaling
-        per_token_scaling = torch.repeat_interleave(self._scaling_factors, self._lora_num_tokens).unsqueeze(-1).to(x.device)
+        per_token_scaling = torch.repeat_interleave(self._scaling_factors, self._lora_num_tokens).unsqueeze(-1).to(device=x.device, dtype=x.dtype)
         return (base_out + per_token_scaling * lora_out).view(new_shape)
 
     def __repr__(self) -> str:
