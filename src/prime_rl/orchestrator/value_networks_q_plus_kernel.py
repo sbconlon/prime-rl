@@ -43,6 +43,8 @@ except ImportError:
     _flash_attn_with_kvcache = None  # type: ignore[assignment]
     _HAS_FLASH_ATTN = False
 
+_LOGGED_PATH = False  # set to True after first kernel call logs the chosen path
+
 
 from transformers.models.qwen3.modeling_qwen3 import rotate_half
 
@@ -213,6 +215,17 @@ def forward_q_plus_candidates_batched_kernel(
         use_flash_attn = _HAS_FLASH_ATTN and device.type == "cuda"
     if use_flash_attn and not _HAS_FLASH_ATTN:
         raise RuntimeError("use_flash_attn=True but flash_attn is not installed")
+
+    # One-shot log so we can confirm which attention path is being used at
+    # runtime. Set _LOGGED at module scope after first call.
+    global _LOGGED_PATH
+    if not _LOGGED_PATH:
+        import logging
+        logging.getLogger("prime_rl.advantage_server").warning(
+            f"forward_q_plus_candidates_batched: use_flash_attn={use_flash_attn}, "
+            f"_HAS_FLASH_ATTN={_HAS_FLASH_ATTN}, device={device}, N_active={N_active}, K={K}"
+        )
+        _LOGGED_PATH = True
 
     # Sanity: this kernel doesn\'t handle sliding-window attention. Qwen3-0.6B
     # has full attention on all layers; bail loudly if a future variant turns
