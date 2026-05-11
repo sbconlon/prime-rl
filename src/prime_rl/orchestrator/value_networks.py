@@ -410,7 +410,13 @@ class ValueNetworkBackbone(nn.Module):
         candidate_token_ids: Tensor,
         prefix_length: int,
     ) -> Tensor:
-        """Batched Q+ evaluation for K candidate actions at a single position.
+        """DEPRECATED (plan §4.6): replaced by forward_q_plus_candidates_batched.
+
+        Retained as a per-position correctness oracle for unit tests until a
+        cleanup commit removes it. No remaining production callers after the
+        §4.5 rewrite of advantage_server/compute.py.
+
+        Batched Q+ evaluation for K candidate actions at a single position.
 
         prefix_past_key_values:
             DynamicCache from a prior Q+ forward over a length-`prefix_length`
@@ -497,7 +503,13 @@ class ValueNetworkBackbone(nn.Module):
     def clone_and_crop_cache(
         cache: "DynamicCache", crop_length: int
     ) -> "DynamicCache":
-        """Make a fresh DynamicCache from `cache`, cropped to first `crop_length`
+        """DEPRECATED (plan §4.6): no remaining production callers after the §4.5
+        rewrite of advantage_server/compute.py. The batched K-candidate forward
+        does not write to the cache (k=None, v=None in flash_attn_with_kvcache),
+        so per-position cloning is unnecessary. Retained as a utility for unit
+        tests and the deprecated forward_q_plus_candidates_at_position oracle.
+
+        Make a fresh DynamicCache from `cache`, cropped to first `crop_length`
         positions. Tensors are detached + cloned (forward-output tensors are
         not graph leaves and aren't deepcopy-able directly).
 

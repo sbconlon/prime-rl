@@ -249,11 +249,12 @@ def _build_per_token_value_tensors(
                     0, prompt_len : prompt_len + completion_len
                 ]
 
-                # K candidates per active (mask=True) position. The cache is
-                # cloned + cropped per position, then tiled to batch K.
-                # The candidate evaluation at completion position j uses
-                # the prefix `prompt_ids + completion_ids[:j]`, so the cache
-                # crop length is `prompt_len + j`.
+                # K candidates per active (mask=True) position. Plan §4.5
+                # batched path: all (j, c) pairs run through a single
+                # forward_q_plus_candidates_batched call sharing the same
+                # physical q_plus_cache via cache_batch_idx=zeros(N_active * K).
+                # Replaces the per-position loop that previously dominated
+                # ~95% of request latency in the canary.
                 K = (
                     len(sample.completion_top_k_token_ids[0])
                     if sample.completion_top_k_token_ids
@@ -265,48 +266,50 @@ def _build_per_token_value_tensors(
                         "to be populated (Phase 5 toggle 'return_top_k_token_ids' on)."
                     )
 
-                # Stride through mask=True positions; index into completion_top_k_token_ids
-                # in compact layout (Phase 5 Option C).
-                local_active = 0
-                per_position_candidates: list[torch.Tensor] = []
-                per_position_sampled: list[torch.Tensor] = []
-                n_active_positions = sum(sample.completion_mask)
-                with prof(
-                    "build_value_tensors.candidates_loop",
-                    sync_cuda=True,
-                    n_active=n_active_positions,
-                    K=K,
-                ):
-                    for j, mask_bit in enumerate(sample.completion_mask):
-                        if not mask_bit:
-                            continue
-                        candidates_for_j = sample.completion_top_k_token_ids[local_active]
-                        cand_tensor = torch.tensor(
-                            candidates_for_j, dtype=torch.long, device=device
-                        )
-                        crop_length = prompt_len + j
-                        with prof("build_value_tensors.candidates.clone_crop_cache", sync_cuda=False):
-                            cropped_cache = ValueNetworkBackbone.clone_and_crop_cache(
-                                q_plus_cache, crop_length
-                            )
-                        with prof(
-                            "build_value_tensors.candidates.forward_K",
-                            sync_cuda=True,
-                            crop_length=crop_length,
-                            K=K,
-                        ):
-                            q_for_K = backbone.forward_q_plus_candidates_at_position(
-                                prefix_past_key_values=cropped_cache,
-                                candidate_token_ids=cand_tensor,
-                                prefix_length=crop_length,
-                            )
-                        per_position_candidates.append(q_for_K)
-                        per_position_sampled.append(q_plus_sampled_per_completion[j])
-                        local_active += 1
+                # Collect active positions in compact layout (Phase 5 Option C).
+                active_local_js = [
+                    j for j, m in enumerate(sample.completion_mask) if m
+                ]
+                n_active = len(active_local_js)
 
-                if per_position_candidates:
-                    q_plus_sampled_chunks.append(torch.stack(per_position_sampled))
-                    q_plus_candidates_chunks.append(torch.stack(per_position_candidates))
+                if n_active > 0:
+                    # Build candidate tensors. completion_top_k_token_ids is
+                    # in compact layout: index i corresponds to the i-th
+                    # mask=True position.
+                    candidate_token_ids = torch.tensor(
+                        [
+                            list(sample.completion_top_k_token_ids[i])
+                            for i in range(n_active)
+                        ],
+                        dtype=torch.long,
+                        device=device,
+                    )  # [N_active, K]
+                    candidate_positions = torch.tensor(
+                        [prompt_len + j for j in active_local_js],
+                        dtype=torch.int32,
+                        device=device,
+                    )  # [N_active]
+
+                    with prof(
+                        "build_value_tensors.candidates_batched",
+                        sync_cuda=True,
+                        n_active=n_active,
+                        K=K,
+                    ):
+                        q_for_all = backbone.forward_q_plus_candidates_batched(
+                            prefix_cache=q_plus_cache,
+                            candidate_token_ids=candidate_token_ids,
+                            candidate_positions=candidate_positions,
+                        )  # [N_active, K]
+
+                    # Q+ at the sampled action for each active position:
+                    # gather from the per-completion sampled tensor.
+                    active_js_tensor = torch.tensor(
+                        active_local_js, dtype=torch.long, device=device
+                    )
+                    per_position_sampled = q_plus_sampled_per_completion[active_js_tensor]
+                    q_plus_sampled_chunks.append(per_position_sampled)
+                    q_plus_candidates_chunks.append(q_for_all)
 
             # Splay V / V_target into mask=True positions only (compact form).
             for j, mask_bit in enumerate(sample.completion_mask):

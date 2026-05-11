@@ -254,9 +254,11 @@ def forward_q_plus_candidates_batched_kernel(
             _V = attn.v_proj(h_norm)                         # discarded
             del _K, _V
 
-            # Q-norm + RoPE.
+            # Q-norm + RoPE. q_norm is Qwen3-specific (applied per head_dim
+            # before RoPE); Qwen2/Qwen2.5 don't have it. Detect and skip.
             Q = Q.view(B, 1, n_q, head_dim)                  # [B, 1, n_q, d]
-            Q = attn.q_norm(Q)
+            if hasattr(attn, "q_norm"):
+                Q = attn.q_norm(Q)
             Q = Q.transpose(1, 2)                            # [B, n_q, 1, d]
             Q = _apply_rotary_to_q_only(Q, cos, sin)
 
