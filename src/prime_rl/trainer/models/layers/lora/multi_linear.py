@@ -140,7 +140,7 @@ class MultiLoRALinear(MultiLoRAModule):
         ori_shape = x.shape
         new_shape = ori_shape[:-1] + (self.out_features,)
         x = x.view(-1, x.shape[-1])
-        offsets = self._lora_num_tokens.cumsum(dim=0, dtype=torch.int32)
+        offsets = self._lora_num_tokens.cumsum(dim=0, dtype=torch.int32).to(x.device)
         assert offsets[-1] == x.shape[0], f"offsets: {offsets}, x.shape: {x.shape}"
 
         base_out = self.base_layer(x)
@@ -154,7 +154,7 @@ class MultiLoRALinear(MultiLoRAModule):
             lora_out = _run_lora_for_loop(lora_x, combined_lora_A, combined_lora_B, offsets)
 
         # Apply per-token scaling
-        per_token_scaling = torch.repeat_interleave(self._scaling_factors, self._lora_num_tokens).unsqueeze(-1)
+        per_token_scaling = torch.repeat_interleave(self._scaling_factors, self._lora_num_tokens).unsqueeze(-1).to(x.device)
         return (base_out + per_token_scaling * lora_out).view(new_shape)
 
     def __repr__(self) -> str:
