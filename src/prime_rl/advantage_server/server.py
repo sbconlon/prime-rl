@@ -64,11 +64,24 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
     @app.on_event("startup")
     async def _load_backbone() -> None:
         cfg: AdvantageServerConfig = app.state.config
-        _LOGGER.info("Loading base model %s for ValueNetworkBackbone", cfg.model_name)
-        base = AutoModel.from_pretrained(cfg.model_name)
+        # Phase 10 perf: serve on GPU in BF16 when available. Loading on CPU
+        # forces the Q+ K-candidate kernel onto the FP32 Python attention
+        # fallback (~31s/request); on CUDA+BF16 it uses flash_attn_with_kvcache.
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+            dtype = torch.bfloat16
+        else:
+            device = torch.device("cpu")
+            dtype = torch.float32
+        _LOGGER.info(
+            "Loading base model %s for ValueNetworkBackbone (device=%s, dtype=%s)",
+            cfg.model_name, device, dtype,
+        )
+        base = AutoModel.from_pretrained(cfg.model_name, dtype=dtype)
         backbone = ValueNetworkBackbone(
             base, lora_config=cfg.lora, polyak_tau=cfg.polyak_tau
         )
+        backbone = backbone.to(device=device, dtype=dtype)
         backbone.eval()
         app.state.backbone = backbone
         app.state.ready = True
