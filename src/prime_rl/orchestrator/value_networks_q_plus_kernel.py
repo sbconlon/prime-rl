@@ -367,7 +367,17 @@ try:
         flex_attention,
     )
     _HAS_FLEX_ATTN = True
-    _flex_attention_compiled = torch.compile(flex_attention, dynamic=False)
+    # dynamic=True is REQUIRED: the AdvTrainer per-sample backward feeds
+    # variable-length sequences, one sample at a time. With dynamic=False,
+    # torch.compile generates a new kernel per distinct seq_len; after 8
+    # recompiles dynamo hits its config.recompile_limit and silently falls
+    # back to the eager unfused flex_attention path -- which materializes
+    # the SxS score matrix at every layer, exactly the path we built this
+    # kernel to escape. Once that fallback is cached, the perf win is
+    # gone for the rest of the run. dynamic=True generates one kernel that
+    # handles all shapes; marginally slower per call than a shape-specialized
+    # kernel, but no recompilation cascade.
+    _flex_attention_compiled = torch.compile(flex_attention, dynamic=True)
 except ImportError:
     create_block_mask = None  # type: ignore[assignment]
     flex_attention = None  # type: ignore[assignment]
