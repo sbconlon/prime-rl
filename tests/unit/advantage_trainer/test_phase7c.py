@@ -231,7 +231,10 @@ def _build_tiny_server_app(monkeypatch: pytest.MonkeyPatch):
 
     class _TinyAutoModel:
         @staticmethod
-        def from_pretrained(name: str):
+        def from_pretrained(name: str, **kwargs):
+            # AdvSrv passes dtype=bfloat16 on CUDA, dtype=float32 on CPU
+            # (server.py); the tiny fake just ignores it -- the post-init
+            # backbone.to(device, dtype=...) call casts anyway.
             torch.manual_seed(0)
             return Qwen2Model(_tiny_qwen2_config())
 
@@ -278,7 +281,7 @@ def test_update_weights_endpoint_applies_state_dict(monkeypatch: pytest.MonkeyPa
         # Pre-state on server\'s backbone differs from new_backbone\'s.
         server_backbone: ValueNetworkBackbone = app.state.backbone
         before = dict(server_backbone.named_parameters())[sentinel_name].detach().clone()
-        assert not torch.allclose(before, new_value)
+        assert not torch.allclose(before.detach().cpu().float(), new_value.detach().cpu().float())
 
         response = client.post(
             "/update_weights",
@@ -289,7 +292,7 @@ def test_update_weights_endpoint_applies_state_dict(monkeypatch: pytest.MonkeyPa
         assert response.json() == {"status": "ok"}
 
         after = dict(server_backbone.named_parameters())[sentinel_name].detach().clone()
-        assert torch.allclose(after, new_value)
+        assert torch.allclose(after.detach().cpu().float(), new_value.detach().cpu().float(), atol=1e-2, rtol=1e-2)
         # weight_step counter incremented.
         assert getattr(app.state, "weight_step", 0) == 1
 

@@ -138,8 +138,16 @@ def _train_step(
     device = next(backbone.parameters()).device
     backbone.train()
 
-    # Sum loss across samples; one backward pass for the whole batch.
-    total_loss: torch.Tensor | None = None
+    # Per-sample backward (Phase 10 perf fix): accumulating per-sample losses
+    # into one autograd graph and backwarding at the end retains every
+    # sample's activations until the final backward, which OOMs at batch
+    # sizes typical of the canary (the strict-causal Q+ mask from §4.1
+    # kicks SDPA onto its math backend, making each sample's saved
+    # activations ~GB-scale). Backward per sample releases the graph
+    # immediately; gradients accumulate in-place on the parameters, then we
+    # scale by 1/n_samples to recover mean-of-losses semantics.
+    optimizer.zero_grad()
+    total_loss_scalar = 0.0
     total_l_v = 0.0
     total_l_q = 0.0
     n_samples = 0
@@ -161,30 +169,29 @@ def _train_step(
         )
         out: ValueLossOutputs = value_regression_loss_fn(loss_inputs)
 
-        # Accumulate. Cloning isn't needed since each sample's loss is a
-        # fresh tensor with its own graph -- summation chains the graphs.
-        if total_loss is None:
-            total_loss = out.loss
-        else:
-            total_loss = total_loss + out.loss
+        out.loss.backward()  # graph freed after each sample
+        total_loss_scalar += out.loss.detach().item()
         total_l_v += out.metrics["l_v"].item()
         total_l_q += out.metrics["l_q"].item()
         n_samples += 1
 
-    if total_loss is None or n_samples == 0:
+    if n_samples == 0:
         # Empty batch -- nothing to do.
         return {"loss": 0.0, "mean_loss": 0.0, "l_v": 0.0, "l_q": 0.0, "n_samples": 0}
 
-    mean_loss = total_loss / n_samples
+    # Scale accumulated gradients to match the mean-of-losses semantics of
+    # the previous (loss-accumulation + single backward) implementation.
+    for p_ in backbone.parameters():
+        if p_.grad is not None:
+            p_.grad.div_(n_samples)
 
-    optimizer.zero_grad()
-    mean_loss.backward()
     optimizer.step()
     backbone.polyak_update_v_target(tau=polyak_tau)
 
+    mean_loss_scalar = total_loss_scalar / n_samples
     return {
-        "loss": float(total_loss.detach().item()),
-        "mean_loss": float(mean_loss.detach().item()),
+        "loss": float(total_loss_scalar),
+        "mean_loss": float(mean_loss_scalar),
         "l_v": total_l_v / n_samples,
         "l_q": total_l_q / n_samples,
         "n_samples": n_samples,
@@ -212,14 +219,23 @@ def train(config: AdvantageTrainerConfig) -> None:
     logger.info(f"Starting Advantage Trainer (algorithm={config.algorithm})")
     logger.info(f"Loading value backbone from {config.model.base_model_name}")
 
-    base_model = AutoModel.from_pretrained(config.model.base_model_name)
+    # Match the AdvSrv's CUDA + BF16 placement (server.py). FP32 on a
+    # 0.6B model with the Phase 10 batch shape was the second contributor
+    # to the OOM (the first being the per-sample backward fix above).
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        dtype = torch.bfloat16
+    else:
+        device = torch.device("cpu")
+        dtype = torch.float32
+    logger.info(f"Loading value backbone (device={device}, dtype={dtype})")
+    base_model = AutoModel.from_pretrained(config.model.base_model_name, dtype=dtype)
     backbone = ValueNetworkBackbone(
         base_model,
         lora_config=config.model.lora,
         polyak_tau=config.polyak_tau,
     )
-    if torch.cuda.is_available():
-        backbone = backbone.to("cuda")
+    backbone = backbone.to(device=device, dtype=dtype)
     logger.success("Value backbone loaded")
 
     trainable_params = [p for p in backbone.parameters() if p.requires_grad]
