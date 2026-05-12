@@ -116,6 +116,11 @@ def compute_advantages_and_targets_arm(
             gamma=gamma,
             n_step=n_step,
         )
+        # Job B canary (postmortem 2026-05-12): Q+ discrimination metrics
+        # over the top-K candidates, computed before advantage normalization
+        # so we see raw network discrimination + the resulting regret
+        # distribution's concentration. Look for ARM_DISCRIM_DIAG lines.
+        _log_q_plus_distribution(q_plus_candidates, v_all)
         with prof("compute.arm.regret_matching"):
             out = arm_regret_matching_advantage_fn(inputs)
         # Phase 10 diagnostic: per-request advantage + target magnitudes.
@@ -125,6 +130,78 @@ def compute_advantages_and_targets_arm(
         _log_advantage_magnitudes(out)
         with prof("compute.arm.build_paired_outputs"):
             return _build_paired_outputs(samples, out)
+
+
+def _log_q_plus_distribution(
+    q_plus_candidates: "torch.Tensor",
+    v_all: "torch.Tensor",
+) -> None:
+    """Emit per-request Q+ discrimination metrics across the K-candidate set.
+
+    The Job B canary per the 2026-05-12 postmortem:
+
+      q_plus_std_mean / max -- direct measure of the value network's
+          discrimination ability across the K candidates, independent of
+          where V(o) happens to sit. Closest thing to "is Job B working?"
+          we can compute.
+
+      eff_k_{mean,min,max}  -- effective candidate count exp(entropy(p))
+          where p_k = max(0, Q+_k - V) / sum_k. Low eff_k => regret is
+          concentrated (discrimination); eff_k -> K => regret is uniform
+          (no signal).
+
+      degenerate_frac       -- fraction of positions where ALL candidates
+          satisfy Q+ <= V, so sum(max(0, Q+ - V)) ~= 0 and the regret
+          distribution is undefined. ARM defaults to no-update there;
+          high values indicate cold-start or Phase-3 collapse.
+
+    q_plus_candidates: [N_active, K]
+    v_all:             [N_active]
+    """
+    import math
+    n_active, K = q_plus_candidates.shape
+    if n_active == 0:
+        _LOGGER.info("ARM_DISCRIM_DIAG n_active=0 K=%d", K)
+        return
+
+    # Primary: Q+ spread across the K candidates, reduced over positions.
+    q_std = q_plus_candidates.float().std(dim=1)  # [N_active]
+    q_std_mean = q_std.mean().item()
+    q_std_max = q_std.max().item()
+
+    # Secondary: effective candidate count from the regret-matching distribution.
+    q_vals = torch.clamp(
+        q_plus_candidates.float() - v_all.float().unsqueeze(1), min=0.0
+    )  # [N_active, K]
+    total = q_vals.sum(dim=1)  # [N_active]
+    eps = 1e-8
+    nondeg = total >= eps
+    degenerate_frac = float((~nondeg).sum().item()) / float(n_active)
+
+    if nondeg.any():
+        p = q_vals[nondeg] / total[nondeg].unsqueeze(1)  # [N_nondeg, K]
+        # Stable entropy: only sum over nonzero entries (0 * log(0) -> 0).
+        p_log_p = torch.where(p > 0, p * torch.log(p), torch.zeros_like(p))
+        entropy = -p_log_p.sum(dim=1)  # [N_nondeg]
+        eff_k = torch.exp(entropy)
+        eff_k_mean = eff_k.mean().item()
+        eff_k_min = eff_k.min().item()
+        eff_k_max = eff_k.max().item()
+    else:
+        eff_k_mean = float("nan")
+        eff_k_min = float("nan")
+        eff_k_max = float("nan")
+
+    _LOGGER.info(
+        "ARM_DISCRIM_DIAG n_active=%d K=%d "
+        "q_plus_std_mean=%.4e q_plus_std_max=%.4e "
+        "eff_k_mean=%.3f eff_k_min=%.3f eff_k_max=%.3f "
+        "degenerate_frac=%.3f",
+        n_active, K,
+        q_std_mean, q_std_max,
+        eff_k_mean, eff_k_min, eff_k_max,
+        degenerate_frac,
+    )
 
 
 def _log_advantage_magnitudes(out: PerTokenAdvantageOutputs) -> None:

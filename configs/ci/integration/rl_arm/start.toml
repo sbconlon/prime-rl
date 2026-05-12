@@ -40,6 +40,10 @@ algorithm = "arm"
 max_tokens = 128
 return_top_k_token_ids = true
 top_k_action_set_size = 32
+# Postmortem 2026-05-12 §7: widen the top-K candidate distribution so the
+# Q+ network sees more off-policy tokens during training. The standard
+# RLHF exploration knob; cost is noisier short-term rollout reward.
+temperature = 1.5
 
 # Orchestrator-side client config: how the orchestrator reaches the
 # Advantage Server. Must match the [advantage_server] host/port below.
