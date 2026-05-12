@@ -19,6 +19,12 @@ class LossInputs:
     teacher_logprobs: Float[Tensor, " seq"] | None
     advantages: Float[Tensor, " seq"]
     loss_mask: Bool[Tensor, " seq"]
+    # Per-token entropy of the policy at each generated token. Optional;
+    # set by compute_loss when the trainer has computed it (train.py
+    # populates out["entropy"] post-forward for metric logging). When
+    # None, default_loss_fn falls back to no entropy term regardless of
+    # ent_tau.
+    entropy_per_token: "Float[Tensor, ' seq'] | None" = None
 
 
 @dataclass
@@ -165,7 +171,17 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
 
     pg_loss = keep_mask * advantages * importance_ratio
     kl_loss = loss_mask * log_importance_ratio**2
-    loss = (-pg_loss + loss_config.kl_tau * kl_loss).sum()
+
+    # Entropy bonus (postmortem 2026-05-12 follow-up). Standard PPO trick:
+    # subtract ent_tau * entropy from the loss so the optimizer pushes
+    # toward higher entropy. Skipped when ent_tau == 0 (default) or
+    # entropy_per_token is None.
+    if loss_config.ent_tau > 0.0 and inputs.entropy_per_token is not None:
+        ent_term = loss_config.ent_tau * (loss_mask * inputs.entropy_per_token)
+        loss = (-pg_loss + loss_config.kl_tau * kl_loss - ent_term).sum()
+    else:
+        ent_term = None
+        loss = (-pg_loss + loss_config.kl_tau * kl_loss).sum()
 
     # Phase 10 ARM diagnostic: surface advantage / pg_loss magnitudes per step
     # so we can confirm the value-network signal actually reaches the policy
@@ -185,6 +201,10 @@ def default_loss_fn(inputs: LossInputs, loss_config: DefaultLossConfig) -> LossO
         "adv_abs_max": adv_abs.max().detach(),
         "pg_loss_abs_mean": _safe_mean(pg_abs, loss_mask),
     }
+    if ent_term is not None:
+        # Mean absolute contribution per trainable token; comparable to
+        # pg_loss_abs_mean for the "on the same scale" sanity check.
+        metrics["ent_term_abs_mean"] = _safe_mean(ent_term.abs(), loss_mask)
     if teacher_kl is not None:
         metrics["teacher_kl"] = _safe_mean(teacher_kl, loss_mask)
 
@@ -231,6 +251,7 @@ def compute_loss(
     loss_mask: list[Bool[Tensor, " seq_i"]],
     loss_fn: LossFn,
     loss_scale: int,
+    entropy_per_token: list[Float[Tensor, " seq_i"]] | None = None,
 ) -> tuple[Float[Tensor, ""], dict[str, Any]]:
     """
     Compute loss for packed sequences (batch size = 1, multiple sequences packed along sequence dimension).
@@ -253,8 +274,13 @@ def compute_loss(
     if teacher_logprobs is None:
         teacher_logprobs = [None] * len(trainer_logprobs)
 
-    for t_logp, i_logp, teach_logp, adv, mask in zip(
-        trainer_logprobs, inference_logprobs, teacher_logprobs, advantages, loss_mask
+    # Fan out None across the batch when entropy_per_token isn\'t provided so
+    # zip aligns. default_loss_fn treats per-sample entropy=None as
+    # "no entropy term."
+    _entropy_list = entropy_per_token if entropy_per_token is not None else [None] * len(trainer_logprobs)
+
+    for t_logp, i_logp, teach_logp, adv, mask, ent in zip(
+        trainer_logprobs, inference_logprobs, teacher_logprobs, advantages, loss_mask, _entropy_list
     ):
         inputs = LossInputs(
             trainer_logprobs=t_logp,
@@ -262,6 +288,7 @@ def compute_loss(
             teacher_logprobs=teach_logp,
             advantages=adv,
             loss_mask=mask,
+            entropy_per_token=ent,
         )
 
         result = loss_fn(inputs)

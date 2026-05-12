@@ -570,6 +570,20 @@ class DefaultLossConfig(BaseModel):
     adv_tau: Annotated[float, Field(ge=0, description="The tau for advantages.")] = 1.0
     teacher_tau: Annotated[float, Field(ge=0, description="The tau for teacher logprobs.")] = 0.0
     kl_tau: Annotated[float, Field(ge=0, description="The tau for KL divergence.")] = 1e-3
+    ent_tau: Annotated[
+        float,
+        Field(
+            ge=0,
+            description=(
+                "The tau for the entropy bonus. loss -= ent_tau * entropy_per_token.sum(). "
+                "ent_tau >= 0 maximizes policy entropy (standard PPO entropy bonus); "
+                "ent_tau = 0 (default) disables the term and preserves the pre-entropy "
+                "behavior. Magnitudes: entropy per token is ~1-3 nats for typical RLHF "
+                "settings; pick ent_tau so ent_tau*entropy is on the scale of pg_loss "
+                "(~0.3 for adv_tau=100 currently)."
+            ),
+        ),
+    ] = 0.0
 
 
 class SFTLossConfig(BaseModel):

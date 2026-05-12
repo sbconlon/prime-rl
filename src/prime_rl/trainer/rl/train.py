@@ -450,6 +450,7 @@ def train(config: TrainerConfig):
                 loss_mask=loss_mask.squeeze().split(response_lengths),
                 loss_fn=loss_fn,
                 loss_scale=loss_scale,
+                entropy_per_token=out["entropy"].squeeze().split(response_lengths),
             )
 
             # Backward pass
