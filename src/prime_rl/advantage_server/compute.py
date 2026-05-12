@@ -83,6 +83,7 @@ def compute_advantages_and_targets_arm(
     *,
     gamma: float = 0.99,
     n_step: int = 5,
+    arm_advantage_formula: str = "regret_matching",
 ) -> list[tuple[TrainingSample, AdvantageTrainingSample]]:
     """ARM regret-matching per-token advantages + v_targets + q_plus_targets,
     optimized path.
@@ -115,6 +116,7 @@ def compute_advantages_and_targets_arm(
             q_plus_candidates=q_plus_candidates,
             gamma=gamma,
             n_step=n_step,
+            arm_advantage_formula=arm_advantage_formula,
         )
         # Job B canary (postmortem 2026-05-12): Q+ discrimination metrics
         # over the top-K candidates, computed before advantage normalization
@@ -233,7 +235,7 @@ def compute_advantages_and_targets(
     is_terminal: bool,
     algorithm: Literal["ppo", "arm"],
     backbone: ValueNetworkBackbone,
-    **kwargs: float | int,
+    **kwargs: float | int | str,
 ) -> list[tuple[TrainingSample, AdvantageTrainingSample]]:
     """Dispatch to the per-algorithm compute path."""
     if algorithm == "ppo":

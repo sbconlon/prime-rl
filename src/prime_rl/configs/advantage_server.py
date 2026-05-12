@@ -13,7 +13,7 @@ integration and the actual HTTP server entrypoint land in Phase 6b.
 
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import Field
 
@@ -102,6 +102,24 @@ class AdvantageServerConfig(BaseConfig):
             description="GAE lambda (PPO only). Ignored for ARM.",
         ),
     ] = 0.95
+
+    arm_advantage_formula: Annotated[
+        Literal["regret_matching", "log_regret_ratio"],
+        Field(
+            description=(
+                "Which ARM LLM-advantage formula to use. "
+                "\"regret_matching\" (default, original Phase 3 behavior): "
+                "A(a*) = p_RM(a*) - 1/K. p_RM never shrinks just because the "
+                "inference policy already matches it, allowing a runaway-positive-"
+                "advantage feedback loop. "
+                "\"log_regret_ratio\" (2026-05-13 follow-up): "
+                "A(a*) = log(p_RM(a*)) - log(pi_inference(a*)). Stabilizing: "
+                "advantage approaches 0 as pi_inference -> p_RM, and goes "
+                "negative when pi_inference overshoots p_RM. Closer in spirit "
+                "to CFR\'s policy-tracking-target semantics."
+            ),
+        ),
+    ] = "regret_matching"
 
 
 class AdvantageServerClientConfig(BaseConfig):

@@ -95,6 +95,7 @@ class ArmAdvantageInputs:
     v_target_all: Tensor                    # [N_active] -- V_target(o_k; mu)
     gamma: float = 0.99
     n_step: int = 5                         # n-step return horizon
+    arm_advantage_formula: 'str' = "regret_matching"  # or "log_regret_ratio"
 
 
 @dataclass
@@ -374,10 +375,37 @@ def arm_regret_matching_advantage_fn(inputs: ArmAdvantageInputs) -> PerTokenAdva
 
     advantages_active = torch.zeros(n_active, dtype=dtype)
     nondegenerate = total >= 1e-8
-    if nondegenerate.any():
-        advantages_active[nondegenerate] = (
-            torch.clamp(a_plus[nondegenerate], min=0.0) / total[nondegenerate]
-            - 1.0 / K
+
+    if inputs.arm_advantage_formula == "regret_matching":
+        # Original Phase 3 formula: A(a*) = p_RM(a*) - 1/K.
+        if nondegenerate.any():
+            advantages_active[nondegenerate] = (
+                torch.clamp(a_plus[nondegenerate], min=0.0) / total[nondegenerate]
+                - 1.0 / K
+            )
+    elif inputs.arm_advantage_formula == "log_regret_ratio":
+        # 2026-05-13 stabilizing formula: A(a*) = log(p_RM(a*)) - log(pi_inference(a*)).
+        # Advantage approaches 0 as pi_inference catches up to p_RM (preventing
+        # the runaway-positive feedback loop the original formula admits).
+        # p_RM floored at 1e-6 so log(p_RM) is bounded below at ~-13.8;
+        # log(pi_inference) comes from completion_logprobs (vLLM at sampling time).
+        if nondegenerate.any():
+            p_rm = torch.clamp(a_plus[nondegenerate], min=0.0) / total[nondegenerate]
+            log_p_rm = torch.log(p_rm.clamp(min=1e-6))
+            # Build [n_active] tensor of inference logprobs at active positions.
+            log_pi_active = torch.tensor(
+                [
+                    samples[i].completion_logprobs[j]
+                    for i, active_indices in enumerate(active_idx_per_sample)
+                    for j in active_indices
+                ],
+                dtype=dtype,
+            )
+            advantages_active[nondegenerate] = log_p_rm - log_pi_active[nondegenerate]
+    else:
+        raise ValueError(
+            f"Unknown arm_advantage_formula: {inputs.arm_advantage_formula!r}. "
+            f"Expected one of: 'regret_matching', 'log_regret_ratio'."
         )
 
     return PerTokenAdvantageOutputs(
