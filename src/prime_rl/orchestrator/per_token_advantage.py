@@ -95,6 +95,7 @@ class ArmAdvantageInputs:
     v_target_all: Tensor                    # [N_active] -- V_target(o_k; mu)
     gamma: float = 0.99
     n_step: int = 5                         # n-step return horizon
+    arm_phi_decay: float = 1.0                       # CFR+ phi decay; 1.0 = no decay (original)
     arm_advantage_formula: 'str' = "regret_matching"  # or "log_regret_ratio"
 
 
@@ -362,7 +363,11 @@ def arm_regret_matching_advantage_fn(inputs: ArmAdvantageInputs) -> PerTokenAdva
     g = _n_step_return(rewards, v_target_all, n_step, gamma, inputs.is_terminal)
 
     # ----- 2. CFR+ accumulation term phi_k -----
-    phi = torch.clamp(q_plus_sampled - v_all, min=0.0)
+    # arm_phi_decay (default 1.0) shrinks the carried regret per iteration.
+    # gamma=1.0 is original CFR+; gamma<1 bounds Q+ at steady-state
+    # Q+_eq = (g - gamma * V) / (1 - gamma), preventing unbounded growth
+    # when Q+ > V persistently.
+    phi = inputs.arm_phi_decay * torch.clamp(q_plus_sampled - v_all, min=0.0)
 
     # ----- 3. Regression targets -----
     q_plus_targets_active = phi + g

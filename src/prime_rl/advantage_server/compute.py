@@ -83,6 +83,7 @@ def compute_advantages_and_targets_arm(
     *,
     gamma: float = 0.99,
     n_step: int = 5,
+    arm_phi_decay: float = 1.0,
     arm_advantage_formula: str = "regret_matching",
 ) -> list[tuple[TrainingSample, AdvantageTrainingSample]]:
     """ARM regret-matching per-token advantages + v_targets + q_plus_targets,
@@ -116,6 +117,7 @@ def compute_advantages_and_targets_arm(
             q_plus_candidates=q_plus_candidates,
             gamma=gamma,
             n_step=n_step,
+            arm_phi_decay=arm_phi_decay,
             arm_advantage_formula=arm_advantage_formula,
         )
         # Job B canary (postmortem 2026-05-12): Q+ discrimination metrics

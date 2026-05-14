@@ -103,6 +103,21 @@ class AdvantageServerConfig(BaseConfig):
         ),
     ] = 0.95
 
+    arm_phi_decay: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "CFR+ accumulation decay. phi = arm_phi_decay * max(0, "
+                "Q+_prev - V_prev). gamma=1.0 (default) preserves original "
+                "behavior where regret accumulates unbounded; gamma<1 bounds "
+                "Q+ at steady-state. Typical: 0.9 (10%% per-iteration decay). "
+                "Q+_eq = (g - gamma * V) / (1 - gamma) when gamma < 1."
+            ),
+        ),
+    ] = 1.0
+
     arm_advantage_formula: Annotated[
         Literal["regret_matching", "log_regret_ratio"],
         Field(
