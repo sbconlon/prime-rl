@@ -248,11 +248,59 @@ def train(config: AdvantageTrainerConfig) -> None:
     backbone = backbone.to(device=device, dtype=dtype)
     logger.success("Value backbone loaded")
 
-    trainable_params = [p for p in backbone.parameters() if p.requires_grad]
-    n_trainable = sum(p.numel() for p in trainable_params)
-    logger.info(f"Trainable parameters: {n_trainable:,}")
+    # Phase 10 LR decoupling: split trainable params into V / Q+ / V_target
+    # groups so the optimizer can apply per-slot learning rates. V_target
+    # params get gradient = 0 (no loss flows through them) and are
+    # overwritten by polyak_update_v_target after optimizer.step, so
+    # putting them in an lr=0 group is just explicit + defensive.
+    v_params: list = []
+    q_plus_params: list = []
+    v_target_params: list = []
+    other_trainable: list[tuple[str, "torch.nn.Parameter"]] = []
+    for name, p_ in backbone.named_parameters():
+        if not p_.requires_grad:
+            continue
+        if name.endswith(".lora_A.0") or name.endswith(".lora_B.0") or (
+            "v_head" in name and "v_target_head" not in name
+        ):
+            v_params.append(p_)
+        elif name.endswith(".lora_A.1") or name.endswith(".lora_B.1") or "q_plus_head" in name:
+            q_plus_params.append(p_)
+        elif name.endswith(".lora_A.2") or name.endswith(".lora_B.2") or "v_target_head" in name:
+            v_target_params.append(p_)
+        else:
+            other_trainable.append((name, p_))
 
-    optimizer = optim.AdamW(trainable_params, lr=config.learning_rate)
+    if other_trainable:
+        logger.warning(
+            f"AdvTrainer found {len(other_trainable)} trainable params outside the "
+            f"V/Q+/V_target partition; assigning them to the V group as a "
+            f"conservative default. First few names: "
+            f"{[name for name, _ in other_trainable[:5]]}"
+        )
+        v_params.extend(p_ for _, p_ in other_trainable)
+
+    n_trainable = sum(p_.numel() for p_ in v_params + q_plus_params + v_target_params)
+    logger.info(
+        f"Trainable parameters: {n_trainable:,} "
+        f"(V={sum(p_.numel() for p_ in v_params):,}, "
+        f"Q+={sum(p_.numel() for p_ in q_plus_params):,}, "
+        f"V_target={sum(p_.numel() for p_ in v_target_params):,})"
+    )
+
+    v_lr = config.v_learning_rate if config.v_learning_rate is not None else config.learning_rate
+    q_plus_lr = (
+        config.q_plus_learning_rate if config.q_plus_learning_rate is not None else config.learning_rate
+    )
+    logger.info(f"Per-slot learning rates: V={v_lr:.2e}, Q+={q_plus_lr:.2e}, V_target=0.0")
+
+    optimizer = optim.AdamW(
+        [
+            {"params": v_params, "lr": v_lr},
+            {"params": q_plus_params, "lr": q_plus_lr},
+            {"params": v_target_params, "lr": 0.0},
+        ]
+    )
 
     receiver = setup_advantage_training_batch_receiver(
         config.transport, input_dir=config.transport_input_dir

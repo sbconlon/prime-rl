@@ -75,8 +75,41 @@ class AdvantageTrainerConfig(BaseConfig):
     # algorithmic-core tests construct their own optimizers directly.
     learning_rate: Annotated[
         float,
-        Field(gt=0.0, description="Learning rate for the value-network LoRA adapters and value heads."),
+        Field(
+            gt=0.0,
+            description=(
+                "Learning rate for the value-network LoRA adapters and value heads. "
+                "Used as the fallback when v_learning_rate / q_plus_learning_rate "
+                "are unset (the single-LR / pre-decoupling regime)."
+            ),
+        ),
     ] = 1e-3
+
+    v_learning_rate: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0.0,
+            description=(
+                "Override learning rate for V\'s LoRA slot + v_head. If None "
+                "(default), falls back to `learning_rate`. Set this to use a "
+                "different LR for V than for Q+."
+            ),
+        ),
+    ] = None
+
+    q_plus_learning_rate: Annotated[
+        float | None,
+        Field(
+            default=None,
+            gt=0.0,
+            description=(
+                "Override learning rate for Q+\'s LoRA slot + q_plus_head. If None "
+                "(default), falls back to `learning_rate`. Set this to use a "
+                "different LR for Q+ than for V."
+            ),
+        ),
+    ] = None
 
     # Phase 10 lever 2: how many samples per forward+backward chunk inside
     # a training step. Larger = better GPU utilization (matmul efficiency),
