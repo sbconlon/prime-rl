@@ -97,6 +97,14 @@ class FakeAdvantageServer:
     constructs paired outputs from the input samples; this lets a test
     pin specific values (e.g., for the sync invariant test that needs to
     verify the prompt/completion fields propagate verbatim).
+
+    Weight-step state: mirrors the real AdvServer's `app.state.weight_step`.
+    Starts at 0; tests can call `advance_weight_step()` to simulate the
+    AdvTrainer broadcasting a new state_dict. `wait_for_weight_step`
+    short-circuits when satisfied or polls until the condition is met (or
+    timeout). For tests that need to verify the orchestrator actually waits,
+    use `weight_step_event` to manually unblock the wait at a chosen point
+    in the test.
     """
 
     def __init__(
@@ -105,9 +113,20 @@ class FakeAdvantageServer:
         output_factory: (
             Any | None
         ) = None,  # callable: (samples, ep_reward, is_terminal, algorithm) -> list[(TrainingSample, AdvantageTrainingSample)]
+        initial_weight_step: int = 0,
     ):
         self._output_factory = output_factory
         self.calls: list[dict[str, Any]] = []
+        # AdvTrainer broadcast counter. Tests advance this manually to
+        # simulate AdvTrainer broadcasts; the orchestrator's
+        # wait_for_weight_step polls this value.
+        self.weight_step: int = initial_weight_step
+        self.wait_calls: list[dict[str, Any]] = []
+
+    def advance_weight_step(self, n: int = 1) -> int:
+        """Simulate `n` AdvTrainer broadcasts. Returns the new weight_step."""
+        self.weight_step += n
+        return self.weight_step
 
     async def compute_advantages_and_targets(
         self,
@@ -116,13 +135,19 @@ class FakeAdvantageServer:
         is_terminal: bool,
         algorithm: Literal["ppo", "arm"],
     ) -> list[tuple[TrainingSample, AdvantageTrainingSample]]:
-        """Return per-input-sample paired outputs. Records the call for assertions."""
+        """Return per-input-sample paired outputs. Records the call for assertions.
+
+        Also records the weight_step at the moment of the call -- tests can
+        assert "compute was only called when the AdvServer had received the
+        expected number of broadcasts."
+        """
         self.calls.append(
             {
                 "samples": samples,
                 "episodic_reward": episodic_reward,
                 "is_terminal": is_terminal,
                 "algorithm": algorithm,
+                "weight_step_at_call": self.weight_step,
             }
         )
         if self._output_factory is not None:
@@ -139,6 +164,45 @@ class FakeAdvantageServer:
     ) -> None:
         """Always ready; no real server to poll."""
         return None
+
+    async def wait_for_weight_step(
+        self,
+        min_step: int,
+        timeout: float = 3600.0,
+        poll_interval: float = 1.0,
+    ) -> int:
+        """Block until self.weight_step >= min_step (or raise on timeout).
+
+        Records the call for assertions. Polls with `asyncio.sleep` so other
+        coroutines (e.g., a simulated AdvTrainer that calls
+        `advance_weight_step` after some delay) can run between polls.
+
+        For step 0 the condition is trivially satisfied (weight_step starts
+        at 0 >= 0); we still record the call so tests can assert the gate
+        was hit. This matches the real client's behavior of short-circuiting
+        when min_step <= 0.
+        """
+        import asyncio
+
+        self.wait_calls.append(
+            {
+                "min_step": min_step,
+                "weight_step_at_entry": self.weight_step,
+            }
+        )
+        if min_step <= 0:
+            return self.weight_step
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while self.weight_step < min_step:
+            if loop.time() >= deadline:
+                raise TimeoutError(
+                    f"FakeAdvantageServer.wait_for_weight_step: weight_step "
+                    f"{self.weight_step} < {min_step} after {timeout}s"
+                )
+            await asyncio.sleep(poll_interval)
+        return self.weight_step
 
 
 def _zero_paired_for_sample(

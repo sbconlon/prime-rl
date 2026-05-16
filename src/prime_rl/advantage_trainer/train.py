@@ -122,28 +122,46 @@ def _train_step(
     batch: AdvantageTrainingBatch,
     algorithm: Literal["ppo", "arm"],
     polyak_tau: float,
+    n_epochs: int = 1,
+    minibatch_size: int | None = None,
     inner_batch_size: int = 1,
+    generator: torch.Generator | None = None,
 ) -> dict[str, float]:
-    """Run one training step over a batch.
+    """Run one Jin-aligned training cycle over a batch.
 
-    Micro-batches the N samples into chunks of `inner_batch_size`. For
-    each chunk:
-      1. Right-pad K samples into [K, S_max] tensors via the batched
-         data adapter.
-      2. One forward through V (and Q+ if ARM) over [K, S_max].
-      3. Vectorized MSE regression loss with per-sample-mean semantics
-         (so long rollouts don't dominate gradient).
-      4. Scaled backward (chunk_loss * K_chunk / n_total) so summing
-         across chunks recovers the original mean-of-per-sample-mean.
-    Then one optimizer step + Polyak update of V_target.
+    Per-cycle structure (spec 20260516):
+        for epoch in range(n_epochs):
+            reshuffle batch.examples into minibatches of `minibatch_size`
+            for mb in minibatches:
+                optimizer.zero_grad()
+                forward + backward over chunks of `inner_batch_size`
+                  (grad accumulates inside the minibatch)
+                optimizer.step()
+        polyak_update_v_target(tau)
 
-    inner_batch_size=1 recovers the pre-lever-2 per-sample backward
-    behavior (one Python forward per sample). inner_batch_size=8 (the
-    default in config) amortizes Python overhead and improves GPU
-    utilization on the projection matmuls.
+    Targets (v_targets, q_plus_targets) are computed once by the AdvServer
+    under V_prev/Q+_prev and frozen for the entire cycle -- the AdvTrainer
+    cannot recompute them, which structurally enforces the CFR+
+    convergence invariant. Polyak update + weight broadcast fire ONCE per
+    cycle, after the inner loop completes.
 
-    The Polyak update fires AFTER the optimizer step (so V_target tracks
-    the just-updated V) and BEFORE any weight broadcast (so the Server
+    Three-knob hierarchy:
+        n_epochs       -- passes over the cycle's batch
+        minibatch_size -- samples per optimizer step (SGD knob; Jin's MB_SIZE)
+        inner_batch_size -- samples per forward+backward chunk (memory knob)
+
+    `minibatch_size=None` means "use the full batch as one minibatch"
+    (legacy behavior: one optimizer step per cycle). This recovers the
+    pre-spec single-step behavior when paired with n_epochs=1; useful for
+    parity tests and emergency rollback.
+
+    Loss scaling: each chunk's loss is multiplied by K_chunk/mb_size_actual
+    so the accumulated gradient is the mean-of-per-sample-means over the
+    minibatch (matches Adam's expected scale; learning rate stays
+    interpretable across minibatch sizes).
+
+    The Polyak update fires AFTER the inner loop (so V_target tracks the
+    fully-updated V) and BEFORE the weight broadcast (so the Server
     receives the latest V_target).
     """
     device = next(backbone.parameters()).device
@@ -151,60 +169,166 @@ def _train_step(
 
     n_total = len(batch.examples)
     if n_total == 0:
-        return {"loss": 0.0, "mean_loss": 0.0, "l_v": 0.0, "l_q": 0.0, "n_samples": 0}
+        return {
+            "loss": 0.0,
+            "mean_loss": 0.0,
+            "l_v": 0.0,
+            "l_q": 0.0,
+            "l_v_first_epoch": 0.0,
+            "l_v_last_epoch": 0.0,
+            "l_q_first_epoch": 0.0,
+            "l_q_last_epoch": 0.0,
+            "q_plus_target_abs_mean": 0.0,
+            "inner_steps": 0,
+            "n_samples": 0,
+        }
 
-    optimizer.zero_grad()
-    total_loss_scalar = 0.0
-    total_l_v = 0.0
-    total_l_q = 0.0
+    # Pre-compute a cycle-level diagnostic: |q_plus_target| averaged over
+    # all valid positions across the batch. Spec's race-condition predicts
+    # this stays bounded under the Jin-aligned loop instead of growing
+    # 0.2 -> 0.9 as observed in the K=4 collapse run.
+    q_plus_target_abs_sum = 0.0
+    q_plus_target_count = 0
+    if algorithm == "arm":
+        for s in batch.examples:
+            if s.q_plus_targets is None:
+                continue
+            for t in s.q_plus_targets:
+                q_plus_target_abs_sum += abs(float(t))
+                q_plus_target_count += 1
+    q_plus_target_abs_mean = (
+        q_plus_target_abs_sum / q_plus_target_count if q_plus_target_count else 0.0
+    )
 
-    # Iterate chunks of size inner_batch_size (last chunk may be smaller).
-    for start in range(0, n_total, inner_batch_size):
-        chunk = batch.examples[start : start + inner_batch_size]
-        K = len(chunk)
+    # Resolve minibatch_size: None -> full batch (one optimizer step per epoch).
+    mb_size = minibatch_size if minibatch_size is not None else n_total
 
-        prepared = prepare_batched_advantage_samples(chunk, device=device)
+    # Cycle-level accumulators.
+    l_v_sum = 0.0
+    l_q_sum = 0.0
+    loss_sum = 0.0
+    n_inner_steps = 0
+    # Per-epoch accumulators -- the race diagnostic compares first-epoch
+    # mean vs. last-epoch mean. Each epoch sweeps all n_total samples
+    # (just shuffled differently), so the mean across an epoch's
+    # minibatches is comparable across epochs apples-to-apples.
+    # Comparing first-minibatch vs. last-minibatch directly would be
+    # noisy because the shuffle makes them different sample subsets.
+    first_epoch_l_v_sum = 0.0
+    first_epoch_l_q_sum = 0.0
+    first_epoch_steps = 0
+    last_epoch_l_v_sum = 0.0
+    last_epoch_l_q_sum = 0.0
+    last_epoch_steps = 0
 
-        v_pred, q_plus_pred = value_forward(
-            backbone, prepared.input_ids, algorithm=algorithm
-        )
+    for epoch in range(n_epochs):
+        # Fresh shuffle each epoch (spec invariant: keeps consecutive
+        # minibatch gradients directionally varied; reshuffling defeats
+        # accidental correlation across epochs).
+        if generator is not None:
+            perm = torch.randperm(n_total, generator=generator).tolist()
+        else:
+            perm = torch.randperm(n_total).tolist()
+        shuffled = [batch.examples[i] for i in perm]
 
-        loss_inputs = BatchedValueLossInputs(
-            v_predictions=v_pred,
-            v_targets=prepared.v_targets,
-            q_plus_predictions=q_plus_pred if q_plus_pred is not None else None,
-            q_plus_targets=prepared.q_plus_targets,
-            loss_mask=prepared.loss_mask,
-            algorithm=algorithm,
-        )
-        out: ValueLossOutputs = value_regression_loss_fn_batched(loss_inputs)
+        epoch_l_v = 0.0
+        epoch_l_q = 0.0
+        epoch_n_inner = 0
 
-        # Scale by K/n_total before backward so summing across chunks
-        # recovers mean-of-per-sample-mean. (Each chunk_loss is already a
-        # mean over its K samples; multiplying by K gives sum-over-samples;
-        # dividing by n_total at the end of summation gives the overall
-        # mean-of-per-sample.)
-        chunk_scale = float(K) / float(n_total)
-        (out.loss * chunk_scale).backward()
+        # Walk minibatches; the last minibatch may be smaller than mb_size.
+        for mb_start in range(0, n_total, mb_size):
+            mb = shuffled[mb_start : mb_start + mb_size]
+            mb_size_actual = len(mb)
 
-        # Track unscaled per-chunk metrics, weight by K/n_total for the
-        # reported mean across the whole batch.
-        total_loss_scalar += out.loss.detach().item() * chunk_scale
-        total_l_v += out.metrics["l_v"].item() * chunk_scale
-        total_l_q += out.metrics["l_q"].item() * chunk_scale
+            optimizer.zero_grad()
+            mb_loss = 0.0
+            mb_l_v = 0.0
+            mb_l_q = 0.0
 
-    optimizer.step()
+            # Memory chunking INSIDE the minibatch -- gradient accumulates,
+            # one optimizer.step() applies the mb's mean-gradient.
+            for chunk_start in range(0, mb_size_actual, inner_batch_size):
+                chunk = mb[chunk_start : chunk_start + inner_batch_size]
+                K = len(chunk)
+
+                prepared = prepare_batched_advantage_samples(chunk, device=device)
+
+                v_pred, q_plus_pred = value_forward(
+                    backbone, prepared.input_ids, algorithm=algorithm
+                )
+
+                loss_inputs = BatchedValueLossInputs(
+                    v_predictions=v_pred,
+                    v_targets=prepared.v_targets,
+                    q_plus_predictions=q_plus_pred if q_plus_pred is not None else None,
+                    q_plus_targets=prepared.q_plus_targets,
+                    loss_mask=prepared.loss_mask,
+                    algorithm=algorithm,
+                )
+                out: ValueLossOutputs = value_regression_loss_fn_batched(loss_inputs)
+
+                # Scale by K/mb_size_actual so the accumulated gradient is
+                # the minibatch's mean-of-per-sample-means. (Each chunk's
+                # loss is already a mean over its K samples; K/mb_size_actual
+                # converts to "this chunk's contribution to the minibatch
+                # mean".)
+                chunk_scale = float(K) / float(mb_size_actual)
+                (out.loss * chunk_scale).backward()
+
+                mb_loss += out.loss.detach().item() * chunk_scale
+                mb_l_v += out.metrics["l_v"].item() * chunk_scale
+                mb_l_q += out.metrics["l_q"].item() * chunk_scale
+
+            optimizer.step()
+            n_inner_steps += 1
+            epoch_l_v += mb_l_v
+            epoch_l_q += mb_l_q
+            epoch_n_inner += 1
+            l_v_sum += mb_l_v
+            l_q_sum += mb_l_q
+            loss_sum += mb_loss
+
+        # End-of-epoch: stash first / last epoch's mean for the race
+        # diagnostic. Each epoch's mean is the average loss over the full
+        # batch's minibatches in this epoch's shuffle order; that's the
+        # same n_total samples as every other epoch, so first- vs. last-
+        # epoch means are apples-to-apples.
+        if epoch == 0:
+            first_epoch_l_v_sum = epoch_l_v
+            first_epoch_l_q_sum = epoch_l_q
+            first_epoch_steps = epoch_n_inner
+        last_epoch_l_v_sum = epoch_l_v
+        last_epoch_l_q_sum = epoch_l_q
+        last_epoch_steps = epoch_n_inner
+
     backbone.polyak_update_v_target(tau=polyak_tau)
 
-    # mean_loss is the same as total_loss_scalar here -- both already
-    # weighted by K/n_total. Kept as two fields for backward-compat with
-    # the previous return schema and downstream logging.
+    # Means across inner steps (the cycle-level summary), and per-epoch
+    # first/last means for the within-cycle race diagnostic.
+    l_v_mean = l_v_sum / n_inner_steps if n_inner_steps else 0.0
+    l_q_mean = l_q_sum / n_inner_steps if n_inner_steps else 0.0
+    loss_mean = loss_sum / n_inner_steps if n_inner_steps else 0.0
+    l_v_first_epoch = first_epoch_l_v_sum / first_epoch_steps if first_epoch_steps else 0.0
+    l_q_first_epoch = first_epoch_l_q_sum / first_epoch_steps if first_epoch_steps else 0.0
+    l_v_last_epoch = last_epoch_l_v_sum / last_epoch_steps if last_epoch_steps else 0.0
+    l_q_last_epoch = last_epoch_l_q_sum / last_epoch_steps if last_epoch_steps else 0.0
+
     return {
-        "loss": float(total_loss_scalar),
-        "mean_loss": float(total_loss_scalar),
-        "l_v": total_l_v,
-        "l_q": total_l_q,
+        # Backward-compat keys (existing log consumers expect these):
+        "loss": float(loss_mean),
+        "mean_loss": float(loss_mean),
+        "l_v": float(l_v_mean),
+        "l_q": float(l_q_mean),
         "n_samples": n_total,
+        # New diagnostic keys: per-epoch mean compares full-batch sweeps,
+        # not individual minibatches (which are non-comparable under
+        # per-epoch reshuffling).
+        "l_v_first_epoch": float(l_v_first_epoch),
+        "l_v_last_epoch": float(l_v_last_epoch),
+        "l_q_first_epoch": float(l_q_first_epoch),
+        "l_q_last_epoch": float(l_q_last_epoch),
+        "q_plus_target_abs_mean": float(q_plus_target_abs_mean),
+        "inner_steps": int(n_inner_steps),
     }
 
 
@@ -325,6 +449,8 @@ def train(config: AdvantageTrainerConfig) -> None:
                 batch=batch,
                 algorithm=config.algorithm,
                 polyak_tau=config.polyak_tau,
+                n_epochs=config.n_epochs,
+                minibatch_size=config.minibatch_size,
                 inner_batch_size=config.inner_batch_size,
             )
 
@@ -337,9 +463,20 @@ def train(config: AdvantageTrainerConfig) -> None:
                 if not broadcast_ok:
                     logger.warning(f"step={step}: weight broadcast failed")
 
+            # Race-condition diagnostic on every cycle line: first/last
+            # epoch mean L_V/L_Q captures whether the inner loop is
+            # converging the value networks within a cycle (spec 20260516);
+            # q_plus_target_abs_mean tracks the predicted-bounded-vs-
+            # growing CFR+ target invariant.
             logger.info(
-                f"step={step} mean_loss={metrics['mean_loss']:.4f} "
-                f"l_v={metrics['l_v']:.4f} l_q={metrics['l_q']:.4f} "
+                f"step={step} inner_steps={metrics['inner_steps']} "
+                f"l_v_first_epoch={metrics['l_v_first_epoch']:.4f} "
+                f"l_v_last_epoch={metrics['l_v_last_epoch']:.4f} "
+                f"l_v_mean={metrics['l_v']:.4f} "
+                f"l_q_first_epoch={metrics['l_q_first_epoch']:.4f} "
+                f"l_q_last_epoch={metrics['l_q_last_epoch']:.4f} "
+                f"l_q_mean={metrics['l_q']:.4f} "
+                f"q_tgt_abs={metrics['q_plus_target_abs_mean']:.4f} "
                 f"n_samples={metrics['n_samples']}"
             )
             step += 1

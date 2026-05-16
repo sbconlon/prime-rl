@@ -60,6 +60,15 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
     app.state.gamma = config.gamma
     app.state.lam = config.lam
     app.state.n_step = config.n_step
+    # Tracks how many weight broadcasts the AdvServer has received from the
+    # AdvTrainer. Initialized to 0 (= initial zero-init backbone, no broadcast
+    # yet). Incremented by /update_weights AFTER the state dict is loaded.
+    # Surfaced via /weight_status so the orchestrator can gate its per-step
+    # compute calls on `weight_step >= step` (enforces that orchestrator
+    # step N's targets are computed under value weights post-AdvTrainer
+    # training on batch N-1; closes the cross-step race in the
+    # AdvTrainer<->orchestrator pipeline).
+    app.state.weight_step = 0
 
     @app.on_event("startup")
     async def _load_backbone() -> None:
@@ -94,6 +103,21 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
         return Response(
             status_code=503, content=b'{"status":"loading"}', media_type="application/json"
         )
+
+    @app.get("/weight_status")
+    async def weight_status() -> Response:
+        """Report the number of weight broadcasts received from the AdvTrainer.
+
+        Starts at 0 (initial zero-init backbone). Incremented by /update_weights
+        each time the AdvTrainer successfully broadcasts a new state_dict.
+        The orchestrator polls this between steps to enforce the
+        lockstep-with-AdvTrainer invariant: before issuing step N's
+        /compute_advantages_and_targets calls, the orchestrator waits until
+        weight_step >= N (= AdvTrainer has applied the broadcast resulting
+        from training on batch N-1).
+        """
+        body = msgspec.json.encode({"weight_step": int(app.state.weight_step)})
+        return Response(status_code=200, content=body, media_type="application/json")
 
     @app.post("/compute_advantages_and_targets")
     async def compute_endpoint(request: Request) -> Response:
@@ -177,12 +201,17 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
                 "config mismatch between Trainer and Server)",
                 n_unexpected,
             )
+        # Increment AFTER the state_dict load completes synchronously inside
+        # the executor. This guarantees that when the AdvTrainer's POST
+        # returns 200, app.state.weight_step has advanced AND the new
+        # weights are live in the backbone. The orchestrator's
+        # wait_for_weight_step gate can therefore rely on the counter as
+        # an "applied-and-active" signal, not a "received-but-pending" one.
+        app.state.weight_step = app.state.weight_step + 1
         _LOGGER.debug(
-            "update_weights: applied state_dict (%d missing, %d unexpected)",
-            n_missing,
-            n_unexpected,
+            "update_weights: applied state_dict (weight_step=%d, %d missing, %d unexpected)",
+            app.state.weight_step, n_missing, n_unexpected,
         )
-        app.state.weight_step = getattr(app.state, "weight_step", 0) + 1
         return Response(
             status_code=200,
             content=b'{"status":"ok"}',

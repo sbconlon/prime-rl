@@ -217,3 +217,184 @@ def test_client_construction_uses_config_base_url_and_timeout():
     assert str(client._client.base_url).rstrip("/") == "http://localhost:9999"
     assert client._client.timeout.read == pytest.approx(42.0)
     asyncio.run(client.aclose())
+
+
+# ---------------------------------------------------------------------------
+# wait_for_weight_step -- AdvTrainer<->orchestrator lockstep barrier
+# ---------------------------------------------------------------------------
+
+
+def test_fake_wait_for_weight_step_zero_short_circuits():
+    """min_step=0 returns immediately; AdvServer starts at weight_step=0,
+    condition trivially satisfied. This is the step-0 bootstrap case."""
+    fake = FakeAdvantageServer()
+    assert fake.weight_step == 0
+    result = asyncio.run(fake.wait_for_weight_step(min_step=0))
+    assert result == 0
+    assert len(fake.wait_calls) == 1
+    assert fake.wait_calls[0]["min_step"] == 0
+
+
+def test_fake_wait_for_weight_step_satisfied_returns_immediately():
+    """When weight_step already meets the bar, no polling is needed."""
+    fake = FakeAdvantageServer(initial_weight_step=3)
+    result = asyncio.run(fake.wait_for_weight_step(min_step=3))
+    assert result == 3
+    # Pre-advance via the test helper -> condition met before the loop body
+    # would sleep.
+    result = asyncio.run(fake.wait_for_weight_step(min_step=2))
+    assert result == 3
+
+
+def test_fake_wait_for_weight_step_blocks_until_advance():
+    """Wait blocks until a concurrent task advances weight_step.
+
+    Models the AdvTrainer broadcasting mid-orchestrator-wait: the orchestrator
+    enters wait_for_weight_step(1), the AdvTrainer broadcasts (advance to 1),
+    the wait returns. Uses asyncio.gather to schedule both as concurrent
+    coroutines.
+    """
+    fake = FakeAdvantageServer()  # weight_step=0
+
+    async def slow_advance():
+        # Simulate AdvTrainer finishing a cycle; advances weight_step after
+        # a short delay.
+        await asyncio.sleep(0.05)
+        fake.advance_weight_step(1)
+
+    async def run() -> int:
+        # Use a small poll_interval so the test runs quickly; the wait should
+        # complete after the advance happens.
+        waiter = fake.wait_for_weight_step(min_step=1, poll_interval=0.01)
+        advancer = slow_advance()
+        result, _ = await asyncio.gather(waiter, advancer)
+        return result
+
+    result = asyncio.run(run())
+    assert result == 1
+    assert fake.weight_step == 1
+
+
+def test_fake_wait_for_weight_step_raises_on_timeout():
+    """Timeout fires if weight_step never advances enough."""
+    fake = FakeAdvantageServer()  # weight_step=0
+    with pytest.raises(TimeoutError, match="weight_step"):
+        asyncio.run(
+            fake.wait_for_weight_step(min_step=5, timeout=0.05, poll_interval=0.01)
+        )
+
+
+def _build_weight_status_only_app(initial_weight_step: int = 0):
+    """Minimal FastAPI app exposing just /weight_status, no startup lifespan.
+
+    Avoids the full create_app's HuggingFace download + backbone load -- those
+    aren't needed for client-side wait_for_weight_step tests. The app's
+    weight_step is mutable from the outside (set `app.state.weight_step`).
+    """
+    import msgspec
+    from fastapi import FastAPI, Response
+
+    app = FastAPI(title="Test AdvServer (weight_status only)")
+    app.state.weight_step = initial_weight_step
+
+    @app.get("/weight_status")
+    async def weight_status():
+        body = msgspec.json.encode({"weight_step": int(app.state.weight_step)})
+        return Response(status_code=200, content=body, media_type="application/json")
+
+    return app
+
+
+def _make_asgi_client(app, base_url: str = "http://testserver", timeout: float = 5.0):
+    """Construct an AdvantageServerClient whose underlying httpx routes through
+    `app`'s ASGI transport (no real socket, no uvicorn, no startup lifespan)."""
+    import httpx
+
+    config = AdvantageServerClientConfig(base_url=base_url, request_timeout=timeout)
+    client = AdvantageServerClient(config)
+    # Replace the default httpx client with one bound to the ASGI app.
+    asyncio.run(client._client.aclose())
+    client._client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url=base_url,
+        timeout=httpx.Timeout(timeout),
+    )
+    return client
+
+
+def test_real_client_wait_for_weight_step_against_advserver():
+    """Real AdvantageServerClient + minimal ASGI-mounted app: real httpx.
+    Verifies the wire-level integration end-to-end (HTTP GET + JSON parse +
+    polling loop) without needing a real subprocess.
+
+    Simulates the AdvTrainer broadcast by mutating app.state.weight_step
+    from inside the asyncio event loop (the same loop running the wait).
+    """
+    app = _build_weight_status_only_app(initial_weight_step=0)
+    client = _make_asgi_client(app)
+
+    async def run():
+        # Initial state: weight_step=0, min_step=0 short-circuits.
+        assert await client.wait_for_weight_step(min_step=0) == 0
+
+        # Schedule a background coroutine that advances the server's
+        # weight_step (simulates the AdvTrainer's /update_weights side
+        # effect).
+        async def server_advance():
+            await asyncio.sleep(0.05)
+            app.state.weight_step = 1
+
+        advancer = asyncio.create_task(server_advance())
+        result = await client.wait_for_weight_step(
+            min_step=1, timeout=5.0, poll_interval=0.02
+        )
+        await advancer
+        return result
+
+    observed = asyncio.run(run())
+    assert observed == 1
+    asyncio.run(client.aclose())
+
+
+def test_real_client_wait_for_weight_step_raises_on_timeout():
+    """Real client raises TimeoutError when the server's counter never catches up."""
+    app = _build_weight_status_only_app(initial_weight_step=0)
+    client = _make_asgi_client(app)
+
+    try:
+        with pytest.raises(TimeoutError, match="weight_step"):
+            asyncio.run(
+                client.wait_for_weight_step(
+                    min_step=5, timeout=0.15, poll_interval=0.03
+                )
+            )
+    finally:
+        asyncio.run(client.aclose())
+
+
+def test_real_client_wait_for_weight_step_short_circuits_at_min_step_zero():
+    """min_step=0 never issues an HTTP call (the orchestrator's step-0 case)."""
+    app = _build_weight_status_only_app(initial_weight_step=0)
+    client = _make_asgi_client(app)
+
+    try:
+        # If this hit the network, the FastAPI app would respond with
+        # weight_step=0 (still satisfied), so we can't distinguish a real
+        # call from a short-circuit by the return value alone. Verify by
+        # the wall-time being below the poll_interval -- a real call
+        # would take a tiny amount of time even on ASGI; short-circuit is
+        # essentially instant.
+        import time as _time
+        t0 = _time.perf_counter()
+        result = asyncio.run(
+            client.wait_for_weight_step(min_step=0, poll_interval=1.0)
+        )
+        elapsed = _time.perf_counter() - t0
+        assert result == 0
+        # Short-circuit path returns without hitting httpx.
+        assert elapsed < 0.05, (
+            f"wait_for_weight_step(min_step=0) should short-circuit; "
+            f"took {elapsed:.3f}s"
+        )
+    finally:
+        asyncio.run(client.aclose())

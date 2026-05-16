@@ -51,7 +51,9 @@ def _build_tiny_app(monkeypatch: pytest.MonkeyPatch):
 
     class _TinyAutoModel:
         @staticmethod
-        def from_pretrained(name: str):
+        def from_pretrained(name: str, **kwargs):  # noqa: ARG004 -- accept kwargs (dtype=)
+            # Server passes `dtype=` since the 2026-05-11 dtype-on-load fix;
+            # accept and ignore -- the tiny test model stays in fp32.
             torch.manual_seed(0)
             return Qwen2Model(_tiny_qwen2_config())
 
@@ -218,3 +220,98 @@ def test_compute_endpoint_serial_consistency(monkeypatch: pytest.MonkeyPatch):
         )
     assert r1.status_code == r2.status_code == 200
     assert r1.content == r2.content
+
+
+# ---------------------------------------------------------------------------
+# Weight status endpoint (AdvTrainer<->orchestrator lockstep barrier)
+# ---------------------------------------------------------------------------
+
+
+def test_weight_status_initial_value_is_zero(monkeypatch: pytest.MonkeyPatch):
+    """/weight_status reports 0 before any /update_weights POST.
+
+    This is the initial state the orchestrator's step-0 wait_for_weight_step
+    short-circuits against: AdvServer.weight_step=0 satisfies min_step=0 with
+    no AdvTrainer broadcast required (the zero-init backbone is the correct
+    bootstrap state).
+    """
+    app = _build_tiny_app(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/weight_status")
+        assert response.status_code == 200
+        assert response.json() == {"weight_step": 0}
+
+
+def test_weight_status_increments_after_update_weights(monkeypatch: pytest.MonkeyPatch):
+    """Each successful /update_weights POST increments weight_step by 1.
+
+    Simulates the AdvTrainer broadcast: serialize the backbone's own state_dict
+    (trivially-valid bytes), POST it to /update_weights, observe weight_step
+    advance. Two POSTs -> weight_step goes 0 -> 1 -> 2. This is the signal the
+    orchestrator's wait_for_weight_step polls; pre-increment means the
+    orchestrator can rely on weight_step as an "applied" not "received" counter.
+    """
+    import io
+    import torch
+
+    app = _build_tiny_app(monkeypatch)
+    with TestClient(app) as client:
+        # Sanity: starts at 0.
+        assert client.get("/weight_status").json() == {"weight_step": 0}
+
+        # Build a trivially-valid LoRA+heads state_dict by reading the live
+        # backbone's trainable params. POSTing this back is a no-op
+        # mathematically but exercises the full /update_weights path.
+        backbone = app.state.backbone
+        trainable_state = {
+            name: param.detach().cpu()
+            for name, param in backbone.named_parameters()
+            if param.requires_grad
+        }
+        buf = io.BytesIO()
+        torch.save(trainable_state, buf)
+        body = buf.getvalue()
+
+        r1 = client.post(
+            "/update_weights",
+            content=body,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert r1.status_code == 200
+        assert client.get("/weight_status").json() == {"weight_step": 1}
+
+        r2 = client.post(
+            "/update_weights",
+            content=body,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert r2.status_code == 200
+        assert client.get("/weight_status").json() == {"weight_step": 2}
+
+
+def test_weight_status_independent_of_compute_calls(monkeypatch: pytest.MonkeyPatch):
+    """/compute_advantages_and_targets does NOT modify weight_step.
+
+    The two endpoints are independent: compute is read-only on weight_step;
+    only /update_weights advances the counter. Without this guarantee the
+    orchestrator's barrier could be accidentally satisfied by issuing
+    compute calls instead of by the AdvTrainer's broadcast.
+    """
+    app = _build_tiny_app(monkeypatch)
+    sample = _make_sample(completion_len=2)
+    request = ComputeAdvantagesRequest(
+        samples=[sample], episodic_reward=1.0, is_terminal=True, algorithm="ppo"
+    )
+    body = msgspec.msgpack.encode(request)
+
+    with TestClient(app) as client:
+        assert client.get("/weight_status").json() == {"weight_step": 0}
+        for _ in range(3):
+            r = client.post(
+                "/compute_advantages_and_targets",
+                content=body,
+                headers={"Content-Type": "application/x-msgpack"},
+            )
+            assert r.status_code == 200
+        # No /update_weights -> weight_step unchanged.
+        assert client.get("/weight_status").json() == {"weight_step": 0}

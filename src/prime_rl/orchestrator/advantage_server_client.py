@@ -78,6 +78,14 @@ class AdvantageServerClientProtocol(Protocol):
     async def wait_for_ready(self, timeout: float = 600.0, poll_interval: float = 1.0) -> None:
         ...
 
+    async def wait_for_weight_step(
+        self,
+        min_step: int,
+        timeout: float = 3600.0,
+        poll_interval: float = 1.0,
+    ) -> int:
+        ...
+
 
 # ---------------------------------------------------------------------------
 # Real HTTP client (httpx async)
@@ -156,4 +164,65 @@ class AdvantageServerClient:
         raise TimeoutError(
             f"Advantage Server at {self._config.base_url} did not become ready "
             f"within {timeout}s. Last error: {last_error}"
+        )
+
+    async def wait_for_weight_step(
+        self,
+        min_step: int,
+        timeout: float = 3600.0,
+        poll_interval: float = 1.0,
+    ) -> int:
+        """Block until the AdvServer's weight_step >= min_step.
+
+        Polls GET /weight_status. Used by the orchestrator to enforce the
+        AdvTrainer<->orchestrator lockstep invariant: before issuing step N's
+        /compute_advantages_and_targets calls, the orchestrator confirms the
+        AdvServer has applied the AdvTrainer's broadcast for batch N-1
+        (which advances weight_step from N-1 to N).
+
+        Returns the AdvServer's weight_step at the moment the condition was
+        satisfied (useful for diagnostics / drift logging). Returns
+        immediately when the condition is already satisfied at first poll.
+
+        The timeout default (1 hour) is generous because the AdvTrainer's
+        Jin-aligned inner loop can take 10+ minutes per cycle at ALFWorld
+        scale. Hitting it indicates the AdvTrainer is hung or has crashed --
+        failing the run is correct.
+
+        Args:
+            min_step: required minimum value of AdvServer's weight_step
+                counter. Pass 0 to short-circuit the wait (always satisfied).
+            timeout: maximum time to wait in seconds. Raises TimeoutError
+                if exceeded.
+            poll_interval: seconds between polls of /weight_status.
+        """
+        import asyncio
+
+        if min_step <= 0:
+            # weight_step starts at 0 at app construction; condition is
+            # always satisfied. No HTTP call needed.
+            return 0
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        last_seen: int | None = None
+        last_error: str | None = None
+        while loop.time() < deadline:
+            try:
+                response = await self._client.get("/weight_status")
+                if response.status_code == 200:
+                    payload = msgspec.json.decode(response.content)
+                    last_seen = int(payload["weight_step"])
+                    if last_seen >= min_step:
+                        return last_seen
+                else:
+                    last_error = f"http {response.status_code}"
+            except Exception as e:  # noqa: BLE001
+                last_error = type(e).__name__ + ": " + str(e)
+            await asyncio.sleep(poll_interval)
+        raise TimeoutError(
+            f"Advantage Server at {self._config.base_url} did not reach "
+            f"weight_step >= {min_step} within {timeout}s. "
+            f"Last observed weight_step: {last_seen}. Last error: {last_error}. "
+            f"AdvTrainer may be hung or crashed."
         )

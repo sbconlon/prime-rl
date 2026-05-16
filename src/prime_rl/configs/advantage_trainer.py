@@ -112,22 +112,77 @@ class AdvantageTrainerConfig(BaseConfig):
     ] = None
 
     # Phase 10 lever 2: how many samples per forward+backward chunk inside
-    # a training step. Larger = better GPU utilization (matmul efficiency),
-    # but more activation memory per chunk. Default 8 fits comfortably on
-    # a 40GB MIG slice at canary-shape sequences. Set to 1 to recover the
-    # pre-lever-2 per-sample backward behavior (useful for debugging or
-    # parity checks against earlier runs).
+    # ONE minibatch (memory knob). Used purely for activation-memory control.
+    # Defaults to 8, comfortable on a 40GB MIG slice at canary-shape sequences.
+    # When `minibatch_size <= inner_batch_size` (canary defaults), the
+    # minibatch is forwarded in a single chunk and grad accumulation
+    # collapses to a no-op.
+    #
+    # NOT to be confused with `minibatch_size` (SGD knob): inner_batch_size
+    # controls how a single optimizer step's gradient is computed (one
+    # chunk vs. K accumulated chunks both producing the same final
+    # gradient up to floating-point ordering); minibatch_size controls how
+    # often `optimizer.step()` fires within a cycle.
     inner_batch_size: Annotated[
         int,
         Field(
             ge=1,
             description=(
-                "Samples per forward+backward chunk inside a training step. "
-                "1 = per-sample backward (pre-lever-2); 8 = default; larger "
-                "amortizes Python overhead but grows activation memory."
+                "Activation-memory chunk size INSIDE one minibatch. "
+                "When >= minibatch_size the minibatch is forwarded in one "
+                "chunk; smaller values use gradient accumulation across "
+                "multiple chunks before each optimizer step. Memory-only "
+                "knob; does not affect SGD semantics (the per-minibatch "
+                "mean-of-per-sample-means is recovered regardless)."
             ),
         ),
     ] = 8
+
+    # ---- Jin-aligned inner training loop (2026-05-16 spec) ---------------
+    #
+    # Per-cycle structure:
+    #   1 cycle  = n_epochs epochs over the cycle's batch
+    #   1 epoch  = ceil(batch_size / minibatch_size) minibatches (reshuffled)
+    #   1 mb     = 1 optimizer.step() + grad accumulation over ceil(MB/IB) chunks
+    # Polyak update + weight broadcast fire ONCE per cycle, after the inner
+    # loop completes. Targets are frozen for the cycle (structurally
+    # enforced by the transport boundary: AdvServer produced them under
+    # V_prev / Q+_prev and they cannot be recomputed without those weights).
+    #
+    # At canary defaults (batch_size=128, minibatch_size=32, n_epochs=8):
+    # 4 minibatches/epoch x 8 epochs = 32 inner Adam steps per cycle. Matches
+    # Jin's intent of running the value-network regression to (near-)
+    # convergence within each cycle before letting the policy respond,
+    # closing the race condition diagnosed in 20260516.
+
+    n_epochs: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Number of passes over the cycle's batch per AdvTrainer step. "
+                "Jin's effective epoch count is ~7.7 (3000 grad steps x mb=32 "
+                "/ 12,500 transitions). 8 is the spec default; ablate up to "
+                "16 if needed. Past that, risk overfitting LoRA adapters to a "
+                "single cycle's batch."
+            ),
+        ),
+    ] = 8
+
+    minibatch_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Samples per optimizer step (Jin's MB_SIZE). When less than "
+                "the cycle's batch size, drives genuine minibatch SGD: each "
+                "epoch shuffles the batch and the optimizer takes one step "
+                "per minibatch. When >= batch size, each epoch is a single "
+                "full-batch step. Spec default 32; combines with n_epochs=8 "
+                "and batch_size=128 to give 32 inner steps per cycle."
+            ),
+        ),
+    ] = 32
 
     # Where to write logs / checkpoints. Mirrors trainer.output_dir.
     output_dir: Annotated[

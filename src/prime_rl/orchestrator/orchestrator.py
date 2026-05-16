@@ -631,6 +631,43 @@ async def orchestrate(config: OrchestratorConfig):
         ]
         results = await asyncio.gather(*futures)
 
+        # AdvTrainer<->orchestrator lockstep barrier. Before issuing step
+        # N's AdvServer compute calls, wait for the AdvServer to have
+        # received the AdvTrainer's broadcast that resulted from training
+        # on batch N-1 (= AdvServer.weight_step >= N).
+        #
+        # Combined with the existing LLM-side `max_async_level` barrier
+        # (which gates step N on the LLM Trainer's STABLE marker for ckpt
+        # N-1, in scheduler._apply_policy_update), this enforces that
+        # both trainers have completed step N-1 before orchestrator step
+        # N's compute calls run. Both trainers therefore process each
+        # batch under matching weight versions, and neither can race
+        # ahead of the other.
+        #
+        # Step 0: wait_for_weight_step(min_step=0) short-circuits (AdvServer
+        # starts at weight_step=0; condition trivially satisfied). The
+        # AdvServer's zero-init backbone is the correct bootstrap state
+        # for step 0; the first real broadcast lands at the end of step 0
+        # (AdvTrainer trains on batch_0, broadcasts -> weight_step=1) and
+        # gates step 1.
+        if config.algorithm in ("ppo", "arm") and advantage_server_client is not None:
+            wait_start = time.perf_counter()
+            observed_weight_step = await advantage_server_client.wait_for_weight_step(
+                min_step=progress.step
+            )
+            advtrainer_wait_time = time.perf_counter() - wait_start
+            if advtrainer_wait_time > 0.5:
+                logger.info(
+                    f"Orchestrator step {progress.step}: waited "
+                    f"{advtrainer_wait_time:.2f}s for AdvTrainer broadcast "
+                    f"(AdvServer.weight_step={observed_weight_step})"
+                )
+            else:
+                logger.debug(
+                    f"AdvTrainer barrier: weight_step={observed_weight_step} "
+                    f"(needed >= {progress.step}, wait={advtrainer_wait_time:.3f}s)"
+                )
+
         # Collect results and assign advantages
         train_examples: list[TrainingSample] = []
         # Phase 6: collected for ppo/arm but currently unused. Phase 7 wires the

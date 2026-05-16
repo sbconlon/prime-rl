@@ -12,6 +12,14 @@ algorithm = "arm"
 max_steps = 20
 learning_rate = 1e-3
 
+# Jin-aligned inner training loop (spec 20260516). 4 minibatches/epoch x
+# 8 epochs = 32 inner Adam steps per cycle on a 128-sample batch. Closes
+# the race condition diagnosed in the K=4 reverse-text collapse where
+# Q+ only got 1 corrective step per cycle while the policy took a full
+# step against the not-yet-corrected p_RM.
+n_epochs = 8
+minibatch_size = 32
+
 [model]
 base_model_name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
 polyak_tau = 0.005

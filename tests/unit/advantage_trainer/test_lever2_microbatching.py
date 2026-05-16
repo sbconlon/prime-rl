@@ -210,7 +210,13 @@ def test_batched_train_step_gradients_match_per_sample():
     """Running _train_step at inner_batch_size=K should produce LoRA
     gradients that match (within tight tolerance) running it at
     inner_batch_size=1. Both branches should converge to mean-of-per-sample
-    semantics on the same batch."""
+    semantics on the same batch.
+
+    This pins the memory-chunking invariant: at fixed (n_epochs=1,
+    minibatch_size=batch_size), inner_batch_size only controls how the
+    minibatch's gradient is computed (one chunk vs. K accumulated chunks)
+    -- it must not change the final gradient up to float ordering.
+    """
     samples = [
         _make_sample(prompt_len=4, completion_len=6, seed=10),
         _make_sample(prompt_len=5, completion_len=4, seed=11),
@@ -225,12 +231,16 @@ def test_batched_train_step_gradients_match_per_sample():
         [p for p in backbone_a.parameters() if p.requires_grad], lr=0.0  # lr=0: we only inspect grads
     )
     # Run one step; the LR=0 SGD will compute grads but not move params.
+    # Pin n_epochs=1, minibatch_size=None (full batch) so this remains a
+    # pure memory-chunking parity test -- not a Jin-loop test.
     metrics_a = _train_step(
         backbone=backbone_a,
         optimizer=optimizer_a,
         batch=batch,
         algorithm="arm",
         polyak_tau=0.0,  # disable polyak so V_target doesn't drift
+        n_epochs=1,
+        minibatch_size=None,
         inner_batch_size=1,
     )
     grads_a = _grad_snapshot(backbone_a)
@@ -246,6 +256,8 @@ def test_batched_train_step_gradients_match_per_sample():
         batch=batch,
         algorithm="arm",
         polyak_tau=0.0,
+        n_epochs=1,
+        minibatch_size=None,
         inner_batch_size=4,  # one chunk of 4 samples
     )
     grads_b = _grad_snapshot(backbone_b)
@@ -281,7 +293,8 @@ def test_batched_train_step_handles_fractional_last_chunk():
     optimizer_a = optim.SGD([p for p in backbone_a.parameters() if p.requires_grad], lr=0.0)
     metrics_a = _train_step(
         backbone=backbone_a, optimizer=optimizer_a, batch=batch,
-        algorithm="arm", polyak_tau=0.0, inner_batch_size=1,
+        algorithm="arm", polyak_tau=0.0,
+        n_epochs=1, minibatch_size=None, inner_batch_size=1,
     )
     grads_a = _grad_snapshot(backbone_a)
 
@@ -289,7 +302,8 @@ def test_batched_train_step_handles_fractional_last_chunk():
     optimizer_b = optim.SGD([p for p in backbone_b.parameters() if p.requires_grad], lr=0.0)
     metrics_b = _train_step(
         backbone=backbone_b, optimizer=optimizer_b, batch=batch,
-        algorithm="arm", polyak_tau=0.0, inner_batch_size=2,
+        algorithm="arm", polyak_tau=0.0,
+        n_epochs=1, minibatch_size=None, inner_batch_size=2,
     )
     grads_b = _grad_snapshot(backbone_b)
 
