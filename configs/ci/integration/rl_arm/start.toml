@@ -1,4 +1,4 @@
-# Phase 10 -- ARM end-to-end canary CI config.
+ Phase 10 -- ARM end-to-end canary CI config.
 #
 # Mirrors configs/ci/integration/rl/start.toml (the GRPO canary) with the
 # four ARM-specific deltas:
@@ -60,6 +60,7 @@ max_logprobs = 8
 model_name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
 host = "127.0.0.1"
 port = 8200
+gamma = 1.0
 [advantage_server.lora]
 rank = 16
 alpha = 32.0
@@ -73,7 +74,7 @@ dropout = 0.0
 [advantage_trainer]
 algorithm = "arm"
 max_steps = 100
-learning_rate = 1e-3
+learning_rate = 5e-4
 n_epochs = 8
 minibatch_size = 32
 [advantage_trainer.model]
