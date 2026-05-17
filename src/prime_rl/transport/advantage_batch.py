@@ -26,7 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from time import time
 
-from prime_rl.configs.shared import TransportConfig
+from prime_rl.configs.shared import TransportConfig, ZMQTransportConfig
 from prime_rl.transport.base import TrainingBatchReceiver
 from prime_rl.transport.filesystem import (
     BATCH_FILE_NAME,
@@ -130,18 +130,81 @@ class ZMQAdvantageTrainingBatchSender(ZMQTrainingBatchSender):
         super().send(batch)  # type: ignore[arg-type]
 
 
-class ZMQAdvantageTrainingBatchReceiver(ZMQTrainingBatchReceiver):
-    """ZMQ-based receiver for AdvantageTrainingBatch.
+class ZMQAdvantageTrainingBatchReceiver(TrainingBatchReceiver):
+    """ZMQ-based receiver for AdvantageTrainingBatch (self-contained).
 
-    Continues to inherit from ZMQTrainingBatchReceiver -- ZMQ transport is
-    a network socket, not a path, so the multi-run coupling doesn\'t bite
-    the way it does for filesystem. Phase 10 cluster e2e will validate.
+    Phase 10 cluster e2e revealed that inheriting from
+    ZMQTrainingBatchReceiver dragged in get_multi_run_manager() at
+    __init__ time, a hard dependency on the LLM trainer multi-run
+    infrastructure that the AdvTrainer never initializes. The AdvTrainer
+    is single-run by design, so this class skips the entire multi-run
+    routing layer:
+
+      - PULL socket bind (same as parent pattern)
+      - Drain incoming msgpack-encoded batches into a step-keyed dict
+      - Return all pending batches in step order on each receive() call
+
+    Matches FileSystemAdvantageTrainingBatchReceiver semantics.
     """
 
     _batch_type = AdvantageTrainingBatch
 
+    def __init__(self, transport: ZMQTransportConfig) -> None:
+        super().__init__()
+        # Lazy zmq import: parent transport.zmq does the same so the module
+        # stays importable in CPU-only test environments without pyzmq.
+        import zmq
+
+        self._zmq = zmq
+        self.context = zmq.Context.instance()
+        self.socket = self.context.socket(zmq.PULL)
+        self.socket.setsockopt(zmq.RCVHWM, transport.hwm)
+        self.socket.bind(f"tcp://{transport.host}:{transport.port}")
+
+        self.poller = zmq.Poller()
+        self.poller.register(self.socket, zmq.POLLIN)
+
+        # Single-run: flat step-keyed pending buffer (no per-run-id routing).
+        self._pending_by_step: dict[int, AdvantageTrainingBatch] = {}
+
+        self.logger.info(
+            f"ZMQ advantage training batch receiver initialized: "
+            f"endpoint=tcp://{transport.host}:{transport.port} hwm={transport.hwm}"
+        )
+
+    def can_receive(self) -> bool:
+        if self._pending_by_step:
+            return True
+        events = dict(self.poller.poll(timeout=0))
+        return self.socket in events
+
+    def _drain_into_pending(self) -> None:
+        while True:
+            try:
+                _sender_id, payload = self.socket.recv_multipart(
+                    flags=self._zmq.NOBLOCK, copy=False
+                )
+            except self._zmq.Again:
+                break
+            try:
+                batch: AdvantageTrainingBatch = self.decoder.decode(payload)
+            except Exception as e:
+                self.logger.error(f"Error decoding advantage batch: {e}")
+                continue
+            self._pending_by_step[batch.step] = batch
+
     def receive(self) -> list[AdvantageTrainingBatch]:  # type: ignore[override]
-        return super().receive()  # type: ignore[return-value]
+        self._drain_into_pending()
+        if not self._pending_by_step:
+            return []
+        steps = sorted(self._pending_by_step.keys())
+        return [self._pending_by_step.pop(s) for s in steps]
+
+    def close(self) -> None:
+        try:
+            self.socket.close(linger=0)
+        finally:
+            self.logger.info("ZMQ advantage training batch receiver closed")
 
 
 # ---------------------------------------------------------------------------
