@@ -408,11 +408,21 @@ async def orchestrate(config: OrchestratorConfig):
     if config.algorithm in ("ppo", "arm"):
         advantage_trainer_output_dir = config.output_dir / "advantage_trainer_transport"
         advantage_trainer_output_dir.mkdir(parents=True, exist_ok=True)
+        # Use advantage_rollout_transport if set; otherwise fall back to
+        # rollout_transport (the historical single-config behavior; works
+        # for filesystem but breaks for ZMQ since both senders push to
+        # the same port).
+        advantage_transport = (
+            config.advantage_rollout_transport
+            if config.advantage_rollout_transport is not None
+            else config.rollout_transport
+        )
         advantage_trainer_sender = setup_advantage_training_batch_sender(
-            advantage_trainer_output_dir, config.rollout_transport
+            advantage_trainer_output_dir, advantage_transport
         )
         logger.info(
-            f"Advantage Trainer transport sender ready (output_dir={advantage_trainer_output_dir})"
+            f"Advantage Trainer transport sender ready "
+            f"(output_dir={advantage_trainer_output_dir}, transport={advantage_transport.type})"
         )
 
     # Track last online eval checkpoint step for this process

@@ -873,6 +873,14 @@ class OrchestratorConfig(BaseConfig):
 
     rollout_transport: TransportConfig = FileSystemTransportConfig()
 
+    # Separate transport for orchestrator -> AdvTrainer (Phase 10
+    # ZMQ-for-both fix). When None (default), the AdvTrainer pipeline
+    # shares rollout_transport. Set this when running ZMQ on both
+    # pipelines: each receiver binds a distinct port, so the orchestrator
+    # needs distinct sender ports too. Filesystem mode works either way
+    # (output directory disambiguates the two batch types).
+    advantage_rollout_transport: TransportConfig | None = None
+
     output_dir: Annotated[
         Path,
         Field(
