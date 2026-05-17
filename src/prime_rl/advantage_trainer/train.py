@@ -40,7 +40,9 @@ from prime_rl.advantage_trainer.data import (
     prepare_advantage_sample,
     prepare_batched_advantage_samples,
 )
+from prime_rl.advantage_trainer.ckpt import setup_advantage_ckpt_manager
 from prime_rl.advantage_trainer.forward import value_forward
+from prime_rl.utils.utils import resolve_latest_ckpt_step
 from prime_rl.advantage_trainer.loss import (
     BatchedValueLossInputs,
     ValueLossInputs,
@@ -426,6 +428,27 @@ def train(config: AdvantageTrainerConfig) -> None:
         ]
     )
 
+    # Checkpoint manager. Mirrors the LLM trainer\'s setup_ckpt_managers
+    # pattern: returns None when config.ckpt is None (no checkpointing
+    # configured), in which case downstream save/load blocks no-op.
+    ckpt_manager = setup_advantage_ckpt_manager(config.output_dir, config.ckpt)
+    checkpoint_step: int | None = None
+    if config.ckpt and config.ckpt.resume_step is not None and ckpt_manager is not None:
+        if config.ckpt.resume_step == -1:
+            checkpoint_step = resolve_latest_ckpt_step(ckpt_manager.ckpt_dir)
+        else:
+            checkpoint_step = config.ckpt.resume_step
+
+    if checkpoint_step is not None and ckpt_manager is not None:
+        loaded_step = ckpt_manager.load(checkpoint_step, backbone, optimizer)
+        logger.info(
+            f"Resuming AdvTrainer from checkpoint step {loaded_step} "
+            f"(loaded from {ckpt_manager.get_ckpt_path(checkpoint_step)})"
+        )
+        resume_start_step = loaded_step
+    else:
+        resume_start_step = 0
+
     receiver = setup_advantage_training_batch_receiver(
         config.transport, input_dir=config.transport_input_dir
     )
@@ -434,7 +457,7 @@ def train(config: AdvantageTrainerConfig) -> None:
         f"input_dir={config.transport_input_dir})"
     )
 
-    step = 0
+    step = resume_start_step
     while step < config.max_steps:
         # Wait for at least one batch.
         if not receiver.can_receive():
@@ -480,8 +503,31 @@ def train(config: AdvantageTrainerConfig) -> None:
                 f"n_samples={metrics['n_samples']}"
             )
             step += 1
+
+            # Save checkpoint at interval (mirrors LLM trainer\'s save block).
+            if (
+                ckpt_manager is not None
+                and config.ckpt is not None
+                and config.ckpt.interval is not None
+                and step % config.ckpt.interval == 0
+                and step < config.max_steps
+            ):
+                logger.info(f"Saving AdvTrainer checkpoint at step {step}")
+                ckpt_manager.save(step, backbone, optimizer)
+                ckpt_manager.maybe_clean()
+
             if step >= config.max_steps:
                 break
+
+    # Final checkpoint at end of training (mirrors LLM trainer is_last_step).
+    if (
+        ckpt_manager is not None
+        and config.ckpt is not None
+        and config.ckpt.interval is not None
+    ):
+        logger.info(f"Saving final AdvTrainer checkpoint at step {step}")
+        ckpt_manager.save(step, backbone, optimizer)
+        ckpt_manager.maybe_clean()
 
     logger.success(f"Advantage Trainer finished after {step} steps.")
     receiver.close()

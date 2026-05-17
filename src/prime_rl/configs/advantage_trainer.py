@@ -24,6 +24,7 @@ from pydantic import Field
 
 from prime_rl.configs.shared import FileSystemTransportConfig, LogConfig, TransportConfig
 from prime_rl.orchestrator.value_networks import ValueNetworkConfig
+from prime_rl.configs.trainer import CheckpointConfig
 from prime_rl.utils.config import BaseConfig
 
 
@@ -218,6 +219,23 @@ class AdvantageTrainerConfig(BaseConfig):
         LogConfig,
         Field(description="Logging configuration."),
     ] = LogConfig()
+
+    # Checkpoint config. Mirrors the LLM trainer's [trainer.ckpt] -- same
+    # CheckpointConfig type, same fields (interval, resume_step, keep_last,
+    # keep_interval, weights_only, skip_optimizer, ...). None disables
+    # checkpointing entirely (current behavior pre-Phase-10).
+    # Save: trainable params (LoRA slots + value heads) + optimizer state.
+    # Load on startup: if ckpt.resume_step is set, load that step\'s
+    # checkpoint (resume_step = -1 means "latest available").
+    ckpt: Annotated[
+        CheckpointConfig | None,
+        Field(
+            description=(
+                "Checkpoint config for the AdvTrainer. Mirrors the LLM "
+                "trainer\'s ckpt config. None disables checkpointing."
+            ),
+        ),
+    ] = None
 
     # URL of the Advantage Server (Phase 7c). When set, the Trainer POSTs
     # serialized LoRA + value-head weights to {url}/update_weights after each
