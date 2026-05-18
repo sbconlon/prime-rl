@@ -19,6 +19,7 @@ from typing import Literal
 
 from torch import Tensor
 
+from prime_rl.advantage_trainer._prof import prof
 from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
 
 
@@ -48,10 +49,13 @@ def value_forward(
         - The forwards are NOT wrapped in torch.no_grad() -- the Trainer
           NEEDS the autograd graph for the subsequent loss.backward() call.
     """
-    v_predictions, _ = backbone.forward_v_all_positions(input_ids)
+    B, S = input_ids.shape
+    with prof("advtrainer.forward.v", sync_cuda=True, B=B, S=S):
+        v_predictions, _ = backbone.forward_v_all_positions(input_ids)
 
     if algorithm == "arm":
-        q_plus_predictions, _ = backbone.forward_q_plus_sampled_all_positions(input_ids)
+        with prof("advtrainer.forward.q_plus", sync_cuda=True, B=B, S=S):
+            q_plus_predictions, _ = backbone.forward_q_plus_sampled_all_positions(input_ids)
     else:
         q_plus_predictions = None
 

@@ -475,58 +475,67 @@ def train(config: AdvantageTrainerConfig) -> None:
 
         for batch in batches:
             set_request_id(str(step))
-            with prof("advtrainer.train_step", sync_cuda=True):
-                metrics = _train_step(
-                    backbone=backbone,
-                    optimizer=optimizer,
-                    batch=batch,
-                    algorithm=config.algorithm,
-                    polyak_tau=config.polyak_tau,
-                    n_epochs=config.n_epochs,
-                    minibatch_size=config.minibatch_size,
-                    inner_batch_size=config.inner_batch_size,
-                )
-
-            # Phase 7c: broadcast updated weights to the Advantage Server
-            # (best-effort; failures logged but non-fatal).
-            if config.advantage_server_url and metrics["n_samples"] > 0:
-                with prof("advtrainer.broadcast", sync_cuda=True):
-                    broadcast_ok = _broadcast_weights(
-                        backbone, config.advantage_server_url
+            if torch.cuda.is_available():
+                mem_start_gb = torch.cuda.memory_allocated() / 1e9
+                torch.cuda.reset_peak_memory_stats()
+                logger.info(f"step={step} cuda_allocated_start={mem_start_gb:.2f}GB")
+            with prof("advtrainer.step.TOTAL", sync_cuda=True, step=step):
+                with prof("advtrainer.train_step", sync_cuda=True):
+                    metrics = _train_step(
+                        backbone=backbone,
+                        optimizer=optimizer,
+                        batch=batch,
+                        algorithm=config.algorithm,
+                        polyak_tau=config.polyak_tau,
+                        n_epochs=config.n_epochs,
+                        minibatch_size=config.minibatch_size,
+                        inner_batch_size=config.inner_batch_size,
                     )
-                if not broadcast_ok:
-                    logger.warning(f"step={step}: weight broadcast failed")
 
-            # Race-condition diagnostic on every cycle line: first/last
-            # epoch mean L_V/L_Q captures whether the inner loop is
-            # converging the value networks within a cycle (spec 20260516);
-            # q_plus_target_abs_mean tracks the predicted-bounded-vs-
-            # growing CFR+ target invariant.
-            logger.info(
-                f"step={step} inner_steps={metrics['inner_steps']} "
-                f"l_v_first_epoch={metrics['l_v_first_epoch']:.4f} "
-                f"l_v_last_epoch={metrics['l_v_last_epoch']:.4f} "
-                f"l_v_mean={metrics['l_v']:.4f} "
-                f"l_q_first_epoch={metrics['l_q_first_epoch']:.4f} "
-                f"l_q_last_epoch={metrics['l_q_last_epoch']:.4f} "
-                f"l_q_mean={metrics['l_q']:.4f} "
-                f"q_tgt_abs={metrics['q_plus_target_abs_mean']:.4f} "
-                f"n_samples={metrics['n_samples']}"
-            )
-            step += 1
+                # Phase 7c: broadcast updated weights to the Advantage Server
+                # (best-effort; failures logged but non-fatal).
+                if config.advantage_server_url and metrics["n_samples"] > 0:
+                    with prof("advtrainer.broadcast", sync_cuda=True):
+                        broadcast_ok = _broadcast_weights(
+                            backbone, config.advantage_server_url
+                        )
+                    if not broadcast_ok:
+                        logger.warning(f"step={step}: weight broadcast failed")
 
-            # Save checkpoint at interval (mirrors LLM trainer\'s save block).
-            if (
-                ckpt_manager is not None
-                and config.ckpt is not None
-                and config.ckpt.interval is not None
-                and step % config.ckpt.interval == 0
-                and step < config.max_steps
-            ):
-                with prof("advtrainer.ckpt.save", step=step):
-                    logger.info(f"Saving AdvTrainer checkpoint at step {step}")
-                    ckpt_manager.save(step, backbone, optimizer)
-                    ckpt_manager.maybe_clean()
+                # Race-condition diagnostic on every cycle line: first/last
+                # epoch mean L_V/L_Q captures whether the inner loop is
+                # converging the value networks within a cycle (spec 20260516);
+                # q_plus_target_abs_mean tracks the predicted-bounded-vs-
+                # growing CFR+ target invariant.
+                logger.info(
+                    f"step={step} inner_steps={metrics['inner_steps']} "
+                    f"l_v_first_epoch={metrics['l_v_first_epoch']:.4f} "
+                    f"l_v_last_epoch={metrics['l_v_last_epoch']:.4f} "
+                    f"l_v_mean={metrics['l_v']:.4f} "
+                    f"l_q_first_epoch={metrics['l_q_first_epoch']:.4f} "
+                    f"l_q_last_epoch={metrics['l_q_last_epoch']:.4f} "
+                    f"l_q_mean={metrics['l_q']:.4f} "
+                    f"q_tgt_abs={metrics['q_plus_target_abs_mean']:.4f} "
+                    f"n_samples={metrics['n_samples']}"
+                )
+                step += 1
+
+                # Save checkpoint at interval (mirrors LLM trainer\'s save block).
+                if (
+                    ckpt_manager is not None
+                    and config.ckpt is not None
+                    and config.ckpt.interval is not None
+                    and step % config.ckpt.interval == 0
+                    and step < config.max_steps
+                ):
+                    with prof("advtrainer.ckpt.save", step=step):
+                        logger.info(f"Saving AdvTrainer checkpoint at step {step}")
+                        ckpt_manager.save(step, backbone, optimizer)
+                        ckpt_manager.maybe_clean()
+
+            if torch.cuda.is_available():
+                mem_peak_gb = torch.cuda.max_memory_allocated() / 1e9
+                logger.info(f"step={step - 1} cuda_peak={mem_peak_gb:.2f}GB")
 
             if step >= config.max_steps:
                 break
