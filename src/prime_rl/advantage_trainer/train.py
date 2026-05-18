@@ -40,6 +40,7 @@ from prime_rl.advantage_trainer.data import (
     prepare_advantage_sample,
     prepare_batched_advantage_samples,
 )
+from prime_rl.advantage_trainer._prof import prof, set_request_id
 from prime_rl.advantage_trainer.ckpt import setup_advantage_ckpt_manager
 from prime_rl.advantage_trainer.forward import value_forward
 from prime_rl.utils.utils import resolve_latest_ckpt_step
@@ -253,11 +254,13 @@ def _train_step(
                 chunk = mb[chunk_start : chunk_start + inner_batch_size]
                 K = len(chunk)
 
-                prepared = prepare_batched_advantage_samples(chunk, device=device)
+                with prof("advtrainer.prepare_batch", K=K):
+                    prepared = prepare_batched_advantage_samples(chunk, device=device)
 
-                v_pred, q_plus_pred = value_forward(
-                    backbone, prepared.input_ids, algorithm=algorithm
-                )
+                with prof("advtrainer.forward", sync_cuda=True, K=K, S=prepared.input_ids.shape[1]):
+                    v_pred, q_plus_pred = value_forward(
+                        backbone, prepared.input_ids, algorithm=algorithm
+                    )
 
                 loss_inputs = BatchedValueLossInputs(
                     v_predictions=v_pred,
@@ -267,7 +270,8 @@ def _train_step(
                     loss_mask=prepared.loss_mask,
                     algorithm=algorithm,
                 )
-                out: ValueLossOutputs = value_regression_loss_fn_batched(loss_inputs)
+                with prof("advtrainer.loss_fn", sync_cuda=True):
+                    out: ValueLossOutputs = value_regression_loss_fn_batched(loss_inputs)
 
                 # Scale by K/mb_size_actual so the accumulated gradient is
                 # the minibatch's mean-of-per-sample-means. (Each chunk's
@@ -275,13 +279,15 @@ def _train_step(
                 # converts to "this chunk's contribution to the minibatch
                 # mean".)
                 chunk_scale = float(K) / float(mb_size_actual)
-                (out.loss * chunk_scale).backward()
+                with prof("advtrainer.backward", sync_cuda=True, K=K):
+                    (out.loss * chunk_scale).backward()
 
                 mb_loss += out.loss.detach().item() * chunk_scale
                 mb_l_v += out.metrics["l_v"].item() * chunk_scale
                 mb_l_q += out.metrics["l_q"].item() * chunk_scale
 
-            optimizer.step()
+            with prof("advtrainer.optimizer_step", sync_cuda=True):
+                optimizer.step()
             n_inner_steps += 1
             epoch_l_v += mb_l_v
             epoch_l_q += mb_l_q
@@ -303,7 +309,8 @@ def _train_step(
         last_epoch_l_q_sum = epoch_l_q
         last_epoch_steps = epoch_n_inner
 
-    backbone.polyak_update_v_target(tau=polyak_tau)
+    with prof("advtrainer.polyak", sync_cuda=True):
+        backbone.polyak_update_v_target(tau=polyak_tau)
 
     # Means across inner steps (the cycle-level summary), and per-epoch
     # first/last means for the within-cycle race diagnostic.
@@ -463,26 +470,30 @@ def train(config: AdvantageTrainerConfig) -> None:
         if not receiver.can_receive():
             time.sleep(0.1)
             continue
-        batches = receiver.receive()
+        with prof("advtrainer.recv"):
+            batches = receiver.receive()
 
         for batch in batches:
-            metrics = _train_step(
-                backbone=backbone,
-                optimizer=optimizer,
-                batch=batch,
-                algorithm=config.algorithm,
-                polyak_tau=config.polyak_tau,
-                n_epochs=config.n_epochs,
-                minibatch_size=config.minibatch_size,
-                inner_batch_size=config.inner_batch_size,
-            )
+            set_request_id(str(step))
+            with prof("advtrainer.train_step", sync_cuda=True):
+                metrics = _train_step(
+                    backbone=backbone,
+                    optimizer=optimizer,
+                    batch=batch,
+                    algorithm=config.algorithm,
+                    polyak_tau=config.polyak_tau,
+                    n_epochs=config.n_epochs,
+                    minibatch_size=config.minibatch_size,
+                    inner_batch_size=config.inner_batch_size,
+                )
 
             # Phase 7c: broadcast updated weights to the Advantage Server
             # (best-effort; failures logged but non-fatal).
             if config.advantage_server_url and metrics["n_samples"] > 0:
-                broadcast_ok = _broadcast_weights(
-                    backbone, config.advantage_server_url
-                )
+                with prof("advtrainer.broadcast", sync_cuda=True):
+                    broadcast_ok = _broadcast_weights(
+                        backbone, config.advantage_server_url
+                    )
                 if not broadcast_ok:
                     logger.warning(f"step={step}: weight broadcast failed")
 
@@ -512,9 +523,10 @@ def train(config: AdvantageTrainerConfig) -> None:
                 and step % config.ckpt.interval == 0
                 and step < config.max_steps
             ):
-                logger.info(f"Saving AdvTrainer checkpoint at step {step}")
-                ckpt_manager.save(step, backbone, optimizer)
-                ckpt_manager.maybe_clean()
+                with prof("advtrainer.ckpt.save", step=step):
+                    logger.info(f"Saving AdvTrainer checkpoint at step {step}")
+                    ckpt_manager.save(step, backbone, optimizer)
+                    ckpt_manager.maybe_clean()
 
             if step >= config.max_steps:
                 break
