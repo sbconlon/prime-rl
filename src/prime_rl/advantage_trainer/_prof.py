@@ -14,11 +14,14 @@ stage and prints mean/p50/p95/max/total per step.
 Activation: profiling is on iff env var ``PRIME_RL_ADVTRAINER_PROF`` is set
 to a truthy value (e.g. ``1``). Off by default so production runs pay zero
 cost.
+
+Routes through `prime_rl.utils.logger.get_logger()` (loguru) rather than
+stdlib `logging`, because the AdvTrainer only configures loguru handlers --
+stdlib `logging.getLogger(...).info(...)` calls would silently drop.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 import time
 import uuid
@@ -28,7 +31,8 @@ from typing import Iterator
 
 import torch
 
-_PROF_LOGGER = logging.getLogger("prime_rl.advantage_trainer.prof")
+from prime_rl.utils.logger import get_logger
+
 _REQUEST_ID: ContextVar[str] = ContextVar("_REQUEST_ID", default="-")
 
 
@@ -76,6 +80,6 @@ def prof(stage: str, *, sync_cuda: bool = False, **extras: object) -> Iterator[N
         rid = _REQUEST_ID.get()
         extras_str = " ".join(f"{k}={v}" for k, v in extras.items())
         suffix = f" {extras_str}" if extras_str else ""
-        _PROF_LOGGER.info(
+        get_logger().info(
             f"PROF rid={rid} stage={stage} duration_ms={elapsed_ms:.3f}{suffix}"
         )
