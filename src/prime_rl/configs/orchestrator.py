@@ -881,6 +881,26 @@ class OrchestratorConfig(BaseConfig):
     # (output directory disambiguates the two batch types).
     advantage_rollout_transport: TransportConfig | None = None
 
+    advantage_server_max_async_level: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Maximum number of orchestrator steps the Advantage Server's weight "
+                "version can lag behind the current orchestrator step. Mirrors "
+                "max_async_level (which gates inference vs LLM trainer) for the "
+                "AdvSrv vs AdvTrainer dimension. 0 = strict lockstep: orchestrator "
+                "step N blocks until AdvSrv weight_step >= N (AdvTrainer broadcast "
+                "for batch N-1 applied). 1 = orchestrator step N proceeds when "
+                "weight_step >= N-1; AdvSrv may compute step N's advantages using "
+                "weights from AdvTrainer batch N-2. Trades trainer-inference drift "
+                "for the AdvSrv compute stage running in parallel with the previous "
+                "AdvTrainer step instead of waiting for it. Step 0 is unaffected "
+                "(min_step clamps to 0 regardless)."
+            ),
+        ),
+    ] = 0
+
     output_dir: Annotated[
         Path,
         Field(

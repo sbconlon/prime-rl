@@ -641,41 +641,48 @@ async def orchestrate(config: OrchestratorConfig):
         ]
         results = await asyncio.gather(*futures)
 
-        # AdvTrainer<->orchestrator lockstep barrier. Before issuing step
-        # N's AdvServer compute calls, wait for the AdvServer to have
-        # received the AdvTrainer's broadcast that resulted from training
-        # on batch N-1 (= AdvServer.weight_step >= N).
+        # AdvTrainer<->orchestrator barrier. Parameterized by
+        # config.advantage_server_max_async_level (K):
         #
-        # Combined with the existing LLM-side `max_async_level` barrier
-        # (which gates step N on the LLM Trainer's STABLE marker for ckpt
-        # N-1, in scheduler._apply_policy_update), this enforces that
-        # both trainers have completed step N-1 before orchestrator step
-        # N's compute calls run. Both trainers therefore process each
-        # batch under matching weight versions, and neither can race
-        # ahead of the other.
+        # K=0 (strict lockstep): orchestrator step N blocks until AdvServer
+        #     weight_step >= N (AdvTrainer broadcast for batch N-1 applied).
+        #     Both AdvTrainer and orchestrator process each batch under
+        #     matching weight versions; neither can race ahead.
         #
-        # Step 0: wait_for_weight_step(min_step=0) short-circuits (AdvServer
-        # starts at weight_step=0; condition trivially satisfied). The
-        # AdvServer's zero-init backbone is the correct bootstrap state
-        # for step 0; the first real broadcast lands at the end of step 0
-        # (AdvTrainer trains on batch_0, broadcasts -> weight_step=1) and
-        # gates step 1.
+        # K>=1 (async): orchestrator step N proceeds when weight_step >= N-K.
+        #     AdvSrv may compute step N's advantages using weights from
+        #     AdvTrainer batch (N-K-1). Trades K steps of value-network
+        #     staleness for the AdvSrv stage running in parallel with the
+        #     previous AdvTrainer step instead of sequentially after it.
+        #     Mirrors the LLM-side `max_async_level` semantic.
+        #
+        # Combined with the LLM-side `max_async_level` barrier (which gates
+        # step N on the LLM Trainer's STABLE marker for ckpt N-1, in
+        # scheduler._apply_policy_update), the two knobs control
+        # independent async dimensions: max_async_level for inference vs
+        # LLM trainer, advantage_server_max_async_level for AdvSrv vs
+        # AdvTrainer.
+        #
+        # Step 0: min_step = max(0, 0 - K) = 0 short-circuits regardless of K.
+        # AdvServer's zero-init backbone is the correct bootstrap state.
         if config.algorithm in ("ppo", "arm") and advantage_server_client is not None:
+            min_step = max(0, progress.step - config.advantage_server_max_async_level)
             wait_start = time.perf_counter()
             observed_weight_step = await advantage_server_client.wait_for_weight_step(
-                min_step=progress.step
+                min_step=min_step
             )
             advtrainer_wait_time = time.perf_counter() - wait_start
             if advtrainer_wait_time > 0.5:
                 logger.info(
                     f"Orchestrator step {progress.step}: waited "
                     f"{advtrainer_wait_time:.2f}s for AdvTrainer broadcast "
-                    f"(AdvServer.weight_step={observed_weight_step})"
+                    f"(AdvServer.weight_step={observed_weight_step}, "
+                    f"required>={min_step}, async_level={config.advantage_server_max_async_level})"
                 )
             else:
                 logger.debug(
                     f"AdvTrainer barrier: weight_step={observed_weight_step} "
-                    f"(needed >= {progress.step}, wait={advtrainer_wait_time:.3f}s)"
+                    f"(needed >= {min_step}, wait={advtrainer_wait_time:.3f}s)"
                 )
 
         # Collect results and assign advantages
