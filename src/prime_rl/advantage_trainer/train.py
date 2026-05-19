@@ -42,15 +42,7 @@ from prime_rl.advantage_trainer.data import (
 )
 from prime_rl.advantage_trainer._prof import prof, set_request_id
 from prime_rl.advantage_trainer.ckpt import setup_advantage_ckpt_manager
-from prime_rl.advantage_trainer.forward import value_forward
 from prime_rl.utils.utils import resolve_latest_ckpt_step
-from prime_rl.advantage_trainer.loss import (
-    BatchedValueLossInputs,
-    ValueLossInputs,
-    ValueLossOutputs,
-    value_regression_loss_fn,
-    value_regression_loss_fn_batched,
-)
 from prime_rl.configs.advantage_trainer import AdvantageTrainerConfig
 from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
 from prime_rl.transport.advantage_batch import (
@@ -257,34 +249,50 @@ def _train_step(
                 with prof("advtrainer.prepare_batch", K=K):
                     prepared = prepare_batched_advantage_samples(chunk, device=device)
 
-                with prof("advtrainer.forward", sync_cuda=True, K=K, S=prepared.input_ids.shape[1]):
-                    v_pred, q_plus_pred = value_forward(
-                        backbone, prepared.input_ids, algorithm=algorithm
-                    )
-
-                loss_inputs = BatchedValueLossInputs(
-                    v_predictions=v_pred,
-                    v_targets=prepared.v_targets,
-                    q_plus_predictions=q_plus_pred if q_plus_pred is not None else None,
-                    q_plus_targets=prepared.q_plus_targets,
-                    loss_mask=prepared.loss_mask,
-                    algorithm=algorithm,
-                )
-                with prof("advtrainer.loss_fn", sync_cuda=True):
-                    out: ValueLossOutputs = value_regression_loss_fn_batched(loss_inputs)
-
-                # Scale by K/mb_size_actual so the accumulated gradient is
-                # the minibatch's mean-of-per-sample-means. (Each chunk's
-                # loss is already a mean over its K samples; K/mb_size_actual
-                # converts to "this chunk's contribution to the minibatch
-                # mean".)
+                # Path B-simple: serialized V/Q+ backward. Each leg forwards,
+                # computes its leg-specific loss, runs backward, and drops
+                # its autograd graph before the next leg allocates. V's params
+                # and Q+'s params are disjoint LoRA slots + disjoint heads, so
+                # the two backwards produce identical gradients to the combined
+                # backward -- see loss.py docstring. Peak activation memory is
+                # max(V_graph, Q+_graph), not V_graph + Q+_graph.
+                B_chunk, S = prepared.input_ids.shape
+                mask_f = prepared.loss_mask.to(dtype=prepared.v_targets.dtype)
+                valid_count = prepared.loss_mask.sum(dim=1).clamp(min=1)
                 chunk_scale = float(K) / float(mb_size_actual)
-                with prof("advtrainer.backward", sync_cuda=True, K=K):
-                    (out.loss * chunk_scale).backward()
 
-                mb_loss += out.loss.detach().item() * chunk_scale
-                mb_l_v += out.metrics["l_v"].item() * chunk_scale
-                mb_l_q += out.metrics["l_q"].item() * chunk_scale
+                # --- V leg ---
+                with prof("advtrainer.forward.v", sync_cuda=True, B=B_chunk, S=S):
+                    v_pred, _ = backbone.forward_v_all_positions(prepared.input_ids)
+                v_diff_sq = (v_pred - prepared.v_targets) ** 2
+                l_v = ((v_diff_sq * mask_f).sum(dim=1) / valid_count).mean()
+                with prof("advtrainer.backward.v", sync_cuda=True, K=K):
+                    (l_v * chunk_scale).backward()
+                l_v_value = l_v.detach().item()
+                del v_pred, v_diff_sq, l_v
+
+                # --- Q+ leg (ARM only) ---
+                if algorithm == "arm":
+                    if prepared.q_plus_targets is None:
+                        raise ValueError(
+                            "ARM requires q_plus_targets in the prepared batch."
+                        )
+                    with prof("advtrainer.forward.q_plus", sync_cuda=True, B=B_chunk, S=S):
+                        q_plus_pred, _ = backbone.forward_q_plus_sampled_all_positions(
+                            prepared.input_ids
+                        )
+                    q_diff_sq = (q_plus_pred - prepared.q_plus_targets) ** 2
+                    l_q = ((q_diff_sq * mask_f).sum(dim=1) / valid_count).mean()
+                    with prof("advtrainer.backward.q_plus", sync_cuda=True, K=K):
+                        (l_q * chunk_scale).backward()
+                    l_q_value = l_q.detach().item()
+                    del q_plus_pred, q_diff_sq, l_q
+                else:
+                    l_q_value = 0.0
+
+                mb_loss += (l_v_value + l_q_value) * chunk_scale
+                mb_l_v += l_v_value * chunk_scale
+                mb_l_q += l_q_value * chunk_scale
 
             with prof("advtrainer.optimizer_step", sync_cuda=True):
                 optimizer.step()
