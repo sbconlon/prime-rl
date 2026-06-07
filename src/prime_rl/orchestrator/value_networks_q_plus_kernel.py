@@ -507,3 +507,192 @@ def forward_q_plus_sampled_all_positions_flex_kernel(
     h = backbone.base_model.norm(h)
     q_plus_seq = backbone.q_plus_head(h)  # [B, S]
     return q_plus_seq, cache
+
+
+# ---------------------------------------------------------------------------
+# Action-level ARM: batched multi-token Q+ over A(o) off a shared o-cache
+# (Phase 8 -- the standard-causal continuation kernel; DQ8.3).
+# ---------------------------------------------------------------------------
+#
+# Contrast with forward_q_plus_candidates_batched_kernel above: that one is
+# single-token cross-attention (k=None, strict-causal) -- a token-level
+# artifact. This one is MULTI-TOKEN, STANDARD-causal: each action writes its
+# own K/V (k=action_K, v=action_V) and each action token attends to o + earlier
+# action tokens + itself; Q+ is read at the action terminal. The o-prefill is
+# computed once (by the caller) into a [1, ...] cache and shared across the |A|
+# actions by tiling it into the per-row k_cache (flash appends each row's action
+# K/V to its own tiled slot -- cache_batch_idx=zeros cannot be used here because
+# appending writes per-row and would collide on a single shared slot). The
+# saving vs the naive path is the o-PREFILL: one o forward + one batched action
+# continuation, not |A| full [o, a] forwards.
+#
+# CPU testing: when flash_attn is unavailable / pre-Ampere, an FP32 Python
+# attention reference computes the identical math (parity-gated against the naive
+# forward_q_plus_action oracle). Production on Ampere uses flash_attn.
+
+
+def _action_attention_python(
+    Q: Tensor,       # [A, n_q, A_max, d]
+    K: Tensor,       # [A, n_kv, A_max, d]
+    V: Tensor,       # [A, n_kv, A_max, d]
+    o_K: Tensor,     # [1, n_kv, o_len, d]  (HF cache layout; rotated at prefill)
+    o_V: Tensor,     # [1, n_kv, o_len, d]
+    o_len: int,
+    *,
+    scaling: float,
+) -> Tensor:
+    """FP32 Python reference for the standard-causal action continuation.
+
+    Each action token (query i, absolute position o_len+i) attends to the full o
+    prefix (o_len keys) plus action keys 0..i (causal, self-inclusive). Returns
+    [A, n_q, A_max, d]. Padded action positions (i >= true length) are computed
+    but ignored by the caller's terminal read; under the causal mask they never
+    influence valid (<= terminal) positions.
+    """
+    A, n_q, A_max, d = Q.shape
+    n_kv = K.shape[1]
+    repeat = n_q // n_kv
+    L = o_len + A_max
+    qpos = (o_len + torch.arange(A_max, device=Q.device)).view(1, A_max, 1)
+    kpos = torch.arange(L, device=Q.device).view(1, 1, L)
+    masked = kpos > qpos  # True where the key is in the future -> masked out
+    out_rows: list[Tensor] = []
+    for r in range(A):
+        Kr = torch.cat([o_K[0], K[r]], dim=1).to(torch.float32)  # [n_kv, L, d]
+        Vr = torch.cat([o_V[0], V[r]], dim=1).to(torch.float32)
+        Kr = Kr.repeat_interleave(repeat, dim=0)                 # [n_q, L, d]
+        Vr = Vr.repeat_interleave(repeat, dim=0)
+        Qr = Q[r].to(torch.float32)                              # [n_q, A_max, d]
+        scores = (Qr @ Kr.transpose(-2, -1)) * scaling          # [n_q, A_max, L]
+        scores = scores.masked_fill(masked, float("-inf"))
+        attn = torch.softmax(scores, dim=-1)
+        out_rows.append(attn @ Vr)                               # [n_q, A_max, d]
+    return torch.stack(out_rows, dim=0).to(Q.dtype)             # [A, n_q, A_max, d]
+
+
+def _action_attention_flash(
+    Q: Tensor,       # [A, n_q, A_max, d]
+    K: Tensor,       # [A, n_kv, A_max, d]
+    V: Tensor,       # [A, n_kv, A_max, d]
+    o_K: Tensor,     # [1, n_kv, o_len, d]
+    o_V: Tensor,     # [1, n_kv, o_len, d]
+    o_len: int,
+) -> Tensor:
+    """flash_attn_with_kvcache standard-causal continuation. Returns [A, n_q, A_max, d].
+
+    The shared o-cache is tiled across the A rows into per-row k/v caches sized
+    [A, o_len + A_max, n_kv, d]; flash appends each row's action K/V at
+    cache_seqlens=o_len and computes causal attention (GQA handled internally).
+    """
+    assert _flash_attn_with_kvcache is not None, "flash_attn not available"
+    A, n_q, A_max, d = Q.shape
+    n_kv = K.shape[1]
+    q_fa = Q.transpose(1, 2).contiguous()  # [A, A_max, n_q, d]
+    k_fa = K.transpose(1, 2).contiguous()  # [A, A_max, n_kv, d]
+    v_fa = V.transpose(1, 2).contiguous()
+    o_K_fa = o_K.transpose(1, 2)           # [1, o_len, n_kv, d]
+    o_V_fa = o_V.transpose(1, 2)
+    k_cache = q_fa.new_zeros((A, o_len + A_max, n_kv, d))
+    v_cache = q_fa.new_zeros((A, o_len + A_max, n_kv, d))
+    k_cache[:, :o_len] = o_K_fa.expand(A, o_len, n_kv, d)
+    v_cache[:, :o_len] = o_V_fa.expand(A, o_len, n_kv, d)
+    cache_seqlens = torch.full((A,), o_len, dtype=torch.int32, device=Q.device)
+    out = _flash_attn_with_kvcache(
+        q=q_fa,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        k=k_fa,
+        v=v_fa,
+        cache_seqlens=cache_seqlens,
+        causal=True,
+    )  # [A, A_max, n_q, d]
+    return out.transpose(1, 2)  # [A, n_q, A_max, d]
+
+
+def forward_q_plus_action_batched_kernel(
+    backbone: "ValueNetworkBackbone",
+    o_cache: "DynamicCache",
+    action_ids: Tensor,      # [A, A_max] int64, right-padded admissible-action suffixes
+    action_lens: Tensor,     # [A] true lengths (read Q+ at each terminal)
+    *,
+    use_flash_attn: bool | None = None,
+) -> Tensor:
+    """Batched Q+(o, a) over the admissible set off a single shared o-prefill cache.
+
+    Args:
+      backbone: ValueNetworkBackbone (HF Qwen2/Qwen3 base wrapped with MultiLoRA).
+      o_cache: DynamicCache from ONE standard-causal prefill of o under the Q+
+        adapter (batch dim 1). Shared (tiled) across the A actions.
+      action_ids: [A, A_max] right-padded action token suffixes (terminator incl.).
+      action_lens: [A] true (unpadded) action lengths.
+      use_flash_attn: force flash / Python fallback. Default: flash iff available
+        and on CUDA.
+
+    Returns: [A] Q+(o, a) for each admissible action.
+    """
+    from prime_rl.orchestrator.value_networks import Q_PLUS_SLOT, _adapter_routing
+
+    A, A_max = action_ids.shape
+    device = action_ids.device
+    if A == 0:
+        return torch.zeros((0,), dtype=torch.float32, device=device)
+
+    o_len = o_cache.layers[0].keys.shape[-2]  # HF layout [1, n_kv, o_len, d]
+
+    if use_flash_attn is None:
+        use_flash_attn = _HAS_FLASH_ATTN and device.type == "cuda"
+    if use_flash_attn and not _HAS_FLASH_ATTN:
+        raise RuntimeError("use_flash_attn=True but flash_attn is not installed")
+
+    # Sliding-window guard (mirrors the candidate kernel).
+    for layer in backbone.base_model.layers:
+        sw = getattr(layer.self_attn, "sliding_window", None)
+        assert sw is None, (
+            f"layer {layer.self_attn.layer_idx} has sliding_window={sw}; the action "
+            "Q+ kernel only supports full attention."
+        )
+
+    h = backbone.base_model.embed_tokens(action_ids)  # [A, A_max, hidden]
+    position_ids = (o_len + torch.arange(A_max, device=device)).unsqueeze(0).expand(A, -1)
+    cos, sin = backbone.base_model.rotary_emb(h, position_ids)  # [A, A_max, d]
+
+    with _adapter_routing(Q_PLUS_SLOT, A * A_max):
+        for layer in backbone.base_model.layers:
+            attn = layer.self_attn
+            d = attn.head_dim
+            n_q = attn.q_proj.out_features // d
+            n_kv = attn.k_proj.out_features // d
+
+            residual = h
+            h_norm = layer.input_layernorm(h)
+            Q = attn.q_proj(h_norm).view(A, A_max, n_q, d).transpose(1, 2)    # [A, n_q,  A_max, d]
+            K = attn.k_proj(h_norm).view(A, A_max, n_kv, d).transpose(1, 2)   # [A, n_kv, A_max, d]
+            V = attn.v_proj(h_norm).view(A, A_max, n_kv, d).transpose(1, 2)
+            if hasattr(attn, "q_norm"):
+                Q = attn.q_norm(Q)
+            if hasattr(attn, "k_norm"):
+                K = attn.k_norm(K)
+            Q, K = _apply_rotary_qk(Q, K, cos, sin)
+
+            cache_layer = o_cache.layers[attn.layer_idx]
+            o_K = cache_layer.keys      # [1, n_kv, o_len, d]
+            o_V = cache_layer.values
+            if use_flash_attn:
+                attn_out = _action_attention_flash(Q, K, V, o_K, o_V, o_len)
+            else:
+                attn_out = _action_attention_python(
+                    Q, K, V, o_K, o_V, o_len, scaling=attn.scaling
+                )
+            # [A, n_q, A_max, d] -> [A, A_max, n_q*d]
+            attn_out = attn_out.transpose(1, 2).reshape(A, A_max, n_q * d)
+            attn_out = attn.o_proj(attn_out)
+            h = residual + attn_out
+
+            residual2 = h
+            h = layer.post_attention_layernorm(h)
+            h = residual2 + layer.mlp(h)
+
+    h = backbone.base_model.norm(h)  # [A, A_max, hidden]
+    term = (action_lens.to(device) - 1).clamp(min=0).long()
+    h_term = h[torch.arange(A, device=device), term]  # [A, hidden]
+    return backbone.q_plus_head(h_term)  # [A]

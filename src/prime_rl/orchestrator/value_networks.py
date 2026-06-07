@@ -398,6 +398,63 @@ class ValueNetworkBackbone(nn.Module):
             results.append(self.q_plus_head(out.last_hidden_state[:, -1, :])[0])
         return torch.stack(results)
 
+    def forward_q_plus_action_batched(
+        self,
+        observation_ids: Tensor,
+        action_ids_list: list[Tensor],
+        *,
+        use_flash_attn: bool | None = None,
+    ) -> Tensor:
+        """Phase 8 max-throughput Q+ over A(o): prefill o once, then continue ALL
+        |A| actions in ONE batched forward off the shared o-cache via the
+        flash_attn_with_kvcache continuation kernel (standard causal). Exact-equal
+        to the naive forward_q_plus_action loop (the parity oracle).
+
+        On CPU / pre-Ampere the kernel auto-falls back to an FP32 Python attention
+        reference (correct but slow); production on Ampere uses flash_attn. Prefer
+        forward_q_plus_action_shared_o (HF cache continuation, arch-agnostic) when
+        flash is unavailable -- this method exists for the GPU throughput win of
+        batching the |A| actions into one kernel call.
+
+        Args:
+            observation_ids: [1, o_len] (or [o_len]) -- the bare observation o.
+            action_ids_list: list of [a_len] action token tensors (terminator incl.).
+        Returns:
+            [len(action_ids_list)] -- Q+(o, a) for each action.
+        """
+        from transformers import DynamicCache
+
+        from prime_rl.orchestrator.value_networks_q_plus_kernel import (
+            forward_q_plus_action_batched_kernel,
+        )
+
+        if observation_ids.dim() == 1:
+            observation_ids = observation_ids.unsqueeze(0)
+        device = observation_ids.device
+        o_len = observation_ids.shape[-1]
+        if not action_ids_list:
+            return torch.empty(0, device=device)
+
+        # One o prefill under the Q+ adapter -> shared standard-causal cache.
+        o_cache = DynamicCache()
+        with _adapter_routing(Q_PLUS_SLOT, o_len):
+            self.base_model(observation_ids, past_key_values=o_cache, use_cache=True)
+
+        # Right-pad the action suffixes into [A, A_max] + true lengths.
+        norm = [
+            (a.squeeze(0) if a.dim() == 2 else a).to(device=device, dtype=torch.long)
+            for a in action_ids_list
+        ]
+        lengths = torch.tensor([t.shape[0] for t in norm], dtype=torch.long, device=device)
+        a_max = int(lengths.max().item())
+        action_ids = torch.zeros((len(norm), a_max), dtype=torch.long, device=device)
+        for i, t in enumerate(norm):
+            action_ids[i, : t.shape[0]] = t
+
+        return forward_q_plus_action_batched_kernel(
+            self, o_cache, action_ids, lengths, use_flash_attn=use_flash_attn
+        )
+
     # -------------------------------------------------------------------
     # Phase 6.5: optimized forwards
     # -------------------------------------------------------------------

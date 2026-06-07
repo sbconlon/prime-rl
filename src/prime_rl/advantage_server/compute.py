@@ -24,6 +24,7 @@ a deferred edit pass.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Literal
 
 import torch
@@ -150,12 +151,42 @@ def compute_advantages_and_targets_arm(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_q_plus_mode(mode: str | None, device: torch.device) -> str:
+    """Resolve the AdvServer Q+ evaluation mode (Phase 8).
+
+    Precedence: explicit arg > PRIME_RL_ADV_Q_PLUS_MODE env var > "auto".
+    "auto" picks the flash continuation kernel on an Ampere+ CUDA device (max
+    throughput) and the arch-agnostic HF shared-o-cache path otherwise (CPU /
+    pre-Ampere). Modes: "naive" | "shared_o" | "kernel" | "auto".
+    """
+    if mode is None:
+        mode = os.environ.get("PRIME_RL_ADV_Q_PLUS_MODE", "auto")
+    if mode == "auto":
+        from prime_rl.orchestrator.value_networks_q_plus_kernel import _HAS_FLASH_ATTN
+
+        if _HAS_FLASH_ATTN and device.type == "cuda":
+            # The flash continuation kernel needs Ampere+ (sm_80); flash_attn
+            # raises at runtime on older GPUs (e.g. Turing sm_75). Gate on the
+            # compute capability so "auto" picks the kernel on A100s but the
+            # arch-agnostic HF shared-o path on pre-Ampere / CPU.
+            try:
+                major = torch.cuda.get_device_capability(device)[0]
+            except Exception:
+                major = 0
+            if major >= 8:
+                return "kernel"
+        return "shared_o"
+    if mode not in ("naive", "shared_o", "kernel"):
+        raise ValueError(f"Unknown q_plus_mode {mode!r}")
+    return mode
+
+
 def _build_per_decision_point_value_tensors(
     samples: list[TrainingSample],
     backbone: ValueNetworkBackbone,
     tokenizer,
     *,
-    use_shared_o_cache: bool = True,
+    q_plus_mode: str | None = None,
 ) -> list[dict]:
     """Per decision point of the rollout (in order across samples): V(o), V_target(o)
     via the all-positions forwards indexed at the o-boundary, and Q+(o, a) over the
@@ -168,6 +199,7 @@ def _build_per_decision_point_value_tensors(
     """
     backbone.eval()
     device = next(backbone.parameters()).device
+    mode = _resolve_q_plus_mode(q_plus_mode, device)
     records: list[dict] = []
     with torch.no_grad():
         for s_idx, sample in enumerate(samples):
@@ -191,16 +223,7 @@ def _build_per_decision_point_value_tensors(
                     dtype=torch.long,
                     device=device,
                 )
-                if use_shared_o_cache:
-                    # Phase 8: prefill o once, continue the |A| actions off the
-                    # shared cache (exact parity with the naive loop below).
-                    action_ids_list = [
-                        torch.tensor(tokenize_action(tokenizer, a), dtype=torch.long, device=device)
-                        for a in dp.admissible_actions
-                    ]
-                    q_vals = backbone.forward_q_plus_action_shared_o(o_ids, action_ids_list)
-                    q_plus_k = [float(x) for x in q_vals]
-                else:
+                if mode == "naive":
                     # Naive oracle: |A| full [o, a] forwards (Phase 5/6).
                     q_plus_k = []
                     for a in dp.admissible_actions:
@@ -208,6 +231,19 @@ def _build_per_decision_point_value_tensors(
                             [tokenize_action(tokenizer, a)], dtype=torch.long, device=device
                         )
                         q_plus_k.append(float(backbone.forward_q_plus_action(o_ids, a_ids)[0]))
+                else:
+                    # Phase 8: prefill o once, continue the |A| actions off the
+                    # shared cache. "kernel" batches all |A| into one flash
+                    # continuation (Ampere); "shared_o" does |A| HF continuations.
+                    action_ids_list = [
+                        torch.tensor(tokenize_action(tokenizer, a), dtype=torch.long, device=device)
+                        for a in dp.admissible_actions
+                    ]
+                    if mode == "kernel":
+                        q_vals = backbone.forward_q_plus_action_batched(o_ids, action_ids_list)
+                    else:  # "shared_o"
+                        q_vals = backbone.forward_q_plus_action_shared_o(o_ids, action_ids_list)
+                    q_plus_k = [float(x) for x in q_vals]
                 records.append(
                     {
                         "sample_idx": s_idx,

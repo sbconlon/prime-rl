@@ -8,6 +8,7 @@ tiny CPU model (the flash_attn_with_kvcache kernel is the Phase 9 / Ampere step)
 
 from __future__ import annotations
 
+import pytest
 import torch
 from transformers import Qwen2Config, Qwen2Model
 
@@ -86,8 +87,34 @@ def test_shared_o_empty_actions():
     assert out.numel() == 0
 
 
-def test_builder_optimized_matches_naive():
-    """_build_per_decision_point_value_tensors with the shared-o cache equals the
+def test_kernel_matches_naive_oracle():
+    """forward_q_plus_action_batched (the flash continuation kernel; FP32 Python
+    fallback on this pre-Ampere CPU run) equals the naive per-action loop."""
+    bb = _backbone()
+    torch.manual_seed(5)
+    o = torch.randint(0, 256, (1, 6))
+    actions = [torch.tensor([5, 6, 7]), torch.tensor([10, 11]), torch.tensor([20, 21, 22, 23])]
+    with torch.no_grad():
+        kernel = bb.forward_q_plus_action_batched(o, actions, use_flash_attn=False)
+        naive = torch.stack([bb.forward_q_plus_action(o, a.unsqueeze(0))[0] for a in actions])
+    assert torch.allclose(kernel, naive, atol=1e-4), f"{kernel} vs {naive}"
+
+
+def test_kernel_matches_shared_o():
+    """The two o-sharing paths (flash kernel fallback and HF continuation) agree."""
+    bb = _backbone()
+    torch.manual_seed(6)
+    o = torch.randint(0, 256, (1, 5))
+    actions = [torch.tensor([9]), torch.tensor([9, 8, 7, 6]), torch.tensor([3, 4])]
+    with torch.no_grad():
+        kernel = bb.forward_q_plus_action_batched(o, actions, use_flash_attn=False)
+        shared = bb.forward_q_plus_action_shared_o(o, actions)
+    assert torch.allclose(kernel, shared, atol=1e-4)
+
+
+@pytest.mark.parametrize("mode", ["shared_o", "kernel"])
+def test_builder_optimized_matches_naive(mode):
+    """_build_per_decision_point_value_tensors in each optimized mode equals the
     naive-loop oracle for the q_plus records."""
     bb = _backbone()
     tok = _CharTok()
@@ -103,8 +130,8 @@ def test_builder_optimized_matches_naive():
             DecisionPoint(4, 6, ["take", "look"], 1, pi_hat=0.3),
         ],
     )
-    opt = _build_per_decision_point_value_tensors([sample], bb, tok, use_shared_o_cache=True)
-    naive = _build_per_decision_point_value_tensors([sample], bb, tok, use_shared_o_cache=False)
+    opt = _build_per_decision_point_value_tensors([sample], bb, tok, q_plus_mode=mode)
+    naive = _build_per_decision_point_value_tensors([sample], bb, tok, q_plus_mode="naive")
     assert len(opt) == len(naive) == 2
     for ro, rn in zip(opt, naive):
         assert len(ro["q_plus"]) == len(rn["q_plus"])
