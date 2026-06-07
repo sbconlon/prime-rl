@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from prime_rl.advantage_server.action_advantage import tokenize_action
 from prime_rl.transport.types import AdvantageTrainingSample
 
 
@@ -227,4 +228,107 @@ def prepare_batched_advantage_samples(
         q_plus_targets=q_plus_targets,
         loss_mask=loss_mask,
         lens=lens,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Action-level ARM: per-decision-point data prep (Phase 7)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class PreparedActionAdvantageInputs:
+    """Per-chunk tensors for the action-level forward/loss.
+
+    V side (one all-positions forward per sample, then gather at boundaries):
+        trajectory_input_ids [K, S_max] right-padded prompt+completion.
+        dp_sample_idx [D]    which sample (row) each decision point belongs to.
+        dp_v_pos [D]         full-input index prompt_len + response_start - 1 (the
+                             o-boundary, the token before the response begins).
+    Q+ side (evaluated per decision point -- right-padding obs would break
+    forward_q_plus_action's cat, so o/a stay as ragged python lists; batching is
+    Phase 8):
+        q_plus_obs_ids  list[list[int]]  o_k = prompt + completion[:response_start]
+        q_plus_action_ids list[list[int]]  tokenize_action(a*_k) (terminator incl.)
+    Targets + per-sample-equal weighting:
+        v_targets [D], q_plus_targets [D]
+        weights [D]          1/(S * c_s) so per-dp weighted sum == per-sample mean
+                             then mean across the S samples that have decision points.
+        n_samples K
+    """
+
+    trajectory_input_ids: Tensor
+    dp_sample_idx: Tensor
+    dp_v_pos: Tensor
+    q_plus_obs_ids: list[list[int]]
+    q_plus_action_ids: list[list[int]]
+    v_targets: Tensor
+    q_plus_targets: Tensor
+    weights: Tensor
+    n_samples: int
+
+
+def prepare_action_advantage_samples(
+    samples: list[AdvantageTrainingSample],
+    tokenizer,
+    *,
+    device: torch.device | str = "cpu",
+    pad_token_id: int = 0,
+) -> PreparedActionAdvantageInputs:
+    """Build the action-level forward/loss tensors from decision_point_targets.
+
+    The trainer consumes AdvantageTrainingSample alone (no TrainingSample pairing),
+    so o is sliced from the sample's own ids via response_start and a* is tokenized
+    from executed_action text (the shared tokenize_action helper, matching the
+    AdvServer Q+ builder and the rollout-side pi_hat).
+    """
+    K = len(samples)
+    lens_list = [len(s.prompt_ids) + len(s.completion_ids) for s in samples]
+    S_max = max(lens_list) if lens_list else 0
+
+    trajectory_input_ids = torch.full((K, S_max), pad_token_id, dtype=torch.long, device=device)
+    for k, s in enumerate(samples):
+        ids = list(s.prompt_ids) + list(s.completion_ids)
+        trajectory_input_ids[k, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+
+    dp_sample_idx: list[int] = []
+    dp_v_pos: list[int] = []
+    q_plus_obs_ids: list[list[int]] = []
+    q_plus_action_ids: list[list[int]] = []
+    v_targets: list[float] = []
+    q_plus_targets: list[float] = []
+    per_sample_counts = [0] * K
+
+    for k, s in enumerate(samples):
+        dpts = s.decision_point_targets
+        if not dpts:
+            continue
+        prompt_len = len(s.prompt_ids)
+        for dpt in dpts:
+            dp_sample_idx.append(k)
+            dp_v_pos.append(prompt_len + dpt.response_start - 1)
+            q_plus_obs_ids.append(
+                list(s.prompt_ids) + list(s.completion_ids[: dpt.response_start])
+            )
+            q_plus_action_ids.append(tokenize_action(tokenizer, dpt.executed_action))
+            v_targets.append(float(dpt.v_target))
+            q_plus_targets.append(float(dpt.q_plus_target))
+            per_sample_counts[k] += 1
+
+    n_present = sum(1 for c in per_sample_counts if c > 0)
+    weights = [
+        1.0 / (n_present * per_sample_counts[k]) if n_present > 0 else 0.0
+        for k in dp_sample_idx
+    ]
+
+    return PreparedActionAdvantageInputs(
+        trajectory_input_ids=trajectory_input_ids,
+        dp_sample_idx=torch.tensor(dp_sample_idx, dtype=torch.long, device=device),
+        dp_v_pos=torch.tensor(dp_v_pos, dtype=torch.long, device=device),
+        q_plus_obs_ids=q_plus_obs_ids,
+        q_plus_action_ids=q_plus_action_ids,
+        v_targets=torch.tensor(v_targets, dtype=torch.float32, device=device),
+        q_plus_targets=torch.tensor(q_plus_targets, dtype=torch.float32, device=device),
+        weights=torch.tensor(weights, dtype=torch.float32, device=device),
+        n_samples=K,
     )

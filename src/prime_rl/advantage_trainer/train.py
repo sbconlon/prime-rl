@@ -34,9 +34,10 @@ from typing import Literal
 import httpx
 import torch
 from torch import optim
-from transformers import AutoModel
+from transformers import AutoModel, AutoTokenizer
 
 from prime_rl.advantage_trainer.data import (
+    prepare_action_advantage_samples,
     prepare_advantage_sample,
     prepare_batched_advantage_samples,
 )
@@ -349,6 +350,135 @@ def _train_step(
     }
 
 
+def _train_step_action(
+    backbone: ValueNetworkBackbone,
+    optimizer: optim.Optimizer,
+    batch: AdvantageTrainingBatch,
+    tokenizer,
+    polyak_tau: float,
+    n_epochs: int = 1,
+    minibatch_size: int | None = None,
+    inner_batch_size: int = 1,
+    generator: torch.Generator | None = None,
+) -> dict[str, float]:
+    """Action-level ARM training cycle: regress V/Q+ against the per-decision-point
+    targets (AdvantageTrainingSample.decision_point_targets, Phase 6).
+
+    Same Jin-aligned scaffolding as _train_step (epoch/minibatch reshuffle,
+    zero_grad/step, serialized V-then-Q+ backward, chunk_scale, Polyak once after
+    the inner loop) -- only the forward/loss change to per-decision-point:
+      V:  forward_v_all_positions(trajectory) read at each o-boundary -> V(o_k).
+      Q+: forward_q_plus_action([o_k, a*_k]) (Phase 5; o excludes the reasoning
+          block, evaluated per decision point) -> Q+(o_k, a*_k).
+    Loss is per-decision-point MSE with per-sample-equal weighting (weights from
+    prepare_action_advantage_samples), so a many-turn rollout doesn't dominate.
+    The weight broadcast stays in train() (as for the token-level path).
+    """
+    device = next(backbone.parameters()).device
+    backbone.train()
+
+    n_total = len(batch.examples)
+    empty = {
+        "loss": 0.0, "mean_loss": 0.0, "l_v": 0.0, "l_q": 0.0, "n_samples": 0,
+        "l_v_first_epoch": 0.0, "l_v_last_epoch": 0.0,
+        "l_q_first_epoch": 0.0, "l_q_last_epoch": 0.0,
+        "q_plus_target_abs_mean": 0.0, "inner_steps": 0,
+    }
+    if n_total == 0:
+        return empty
+
+    q_abs_sum, q_abs_cnt = 0.0, 0
+    for s in batch.examples:
+        for dpt in (s.decision_point_targets or []):
+            q_abs_sum += abs(float(dpt.q_plus_target))
+            q_abs_cnt += 1
+    q_plus_target_abs_mean = q_abs_sum / q_abs_cnt if q_abs_cnt else 0.0
+
+    mb_size = minibatch_size if minibatch_size is not None else n_total
+    l_v_sum = l_q_sum = loss_sum = 0.0
+    n_inner_steps = 0
+    first_lv = first_lq = first_steps = 0.0
+    last_lv = last_lq = last_steps = 0.0
+
+    for epoch in range(n_epochs):
+        perm = (
+            torch.randperm(n_total, generator=generator).tolist()
+            if generator is not None
+            else torch.randperm(n_total).tolist()
+        )
+        shuffled = [batch.examples[i] for i in perm]
+        epoch_lv = epoch_lq = epoch_n = 0.0
+
+        for mb_start in range(0, n_total, mb_size):
+            mb = shuffled[mb_start : mb_start + mb_size]
+            mb_size_actual = len(mb)
+            optimizer.zero_grad()
+            mb_l_v = mb_l_q = 0.0
+
+            for chunk_start in range(0, mb_size_actual, inner_batch_size):
+                chunk = mb[chunk_start : chunk_start + inner_batch_size]
+                K = len(chunk)
+                with prof("advtrainer.prepare_batch_action", K=K):
+                    prep = prepare_action_advantage_samples(chunk, tokenizer, device=device)
+                chunk_scale = float(K) / float(mb_size_actual)
+                D = int(prep.dp_sample_idx.numel())
+                if D == 0:
+                    continue
+
+                # --- V leg (batched all-positions forward, gather at boundaries) ---
+                with prof("advtrainer.forward.v_action", sync_cuda=True):
+                    v_all, _ = backbone.forward_v_all_positions(prep.trajectory_input_ids)
+                v_pred = v_all[prep.dp_sample_idx, prep.dp_v_pos]
+                l_v = (prep.weights * (v_pred - prep.v_targets) ** 2).sum()
+                with prof("advtrainer.backward.v_action", sync_cuda=True):
+                    (l_v * chunk_scale).backward()
+                mb_l_v += float(l_v.detach().item()) * chunk_scale
+                del v_all, v_pred, l_v
+
+                # --- Q+ leg: per decision point (right-padded obs would break the
+                # append-and-read cat); per-dp backward keeps peak memory to one
+                # Q+ graph. Batching is Phase 8. ---
+                l_q_value = 0.0
+                for d in range(D):
+                    o_ids = torch.tensor([prep.q_plus_obs_ids[d]], dtype=torch.long, device=device)
+                    a_ids = torch.tensor([prep.q_plus_action_ids[d]], dtype=torch.long, device=device)
+                    q_pred = backbone.forward_q_plus_action(o_ids, a_ids)[0]
+                    w = float(prep.weights[d].item())
+                    sq = (q_pred - prep.q_plus_targets[d]) ** 2
+                    (sq * (w * chunk_scale)).backward()
+                    l_q_value += float(sq.detach().item()) * w * chunk_scale
+                mb_l_q += l_q_value
+
+            optimizer.step()
+            n_inner_steps += 1
+            epoch_lv += mb_l_v
+            epoch_lq += mb_l_q
+            epoch_n += 1
+            l_v_sum += mb_l_v
+            l_q_sum += mb_l_q
+            loss_sum += mb_l_v + mb_l_q
+
+        if epoch == 0:
+            first_lv, first_lq, first_steps = epoch_lv, epoch_lq, epoch_n
+        last_lv, last_lq, last_steps = epoch_lv, epoch_lq, epoch_n
+
+    backbone.polyak_update_v_target(tau=polyak_tau)
+
+    return {
+        "loss": float(loss_sum / n_inner_steps) if n_inner_steps else 0.0,
+        "mean_loss": float(loss_sum / n_inner_steps) if n_inner_steps else 0.0,
+        "l_v": float(l_v_sum / n_inner_steps) if n_inner_steps else 0.0,
+        "l_q": float(l_q_sum / n_inner_steps) if n_inner_steps else 0.0,
+        "n_samples": n_total,
+        "l_v_first_epoch": float(first_lv / first_steps) if first_steps else 0.0,
+        "l_v_last_epoch": float(last_lv / last_steps) if last_steps else 0.0,
+        "l_q_first_epoch": float(first_lq / first_steps) if first_steps else 0.0,
+        "l_q_last_epoch": float(last_lq / last_steps) if last_steps else 0.0,
+        "q_plus_target_abs_mean": float(q_plus_target_abs_mean),
+        "inner_steps": int(n_inner_steps),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Process entrypoint
 # ---------------------------------------------------------------------------
@@ -388,6 +518,16 @@ def train(config: AdvantageTrainerConfig) -> None:
     )
     backbone = backbone.to(device=device, dtype=dtype)
     logger.success("Value backbone loaded")
+
+    # Action-level ARM: tokenizer for the executed-action -> Q+ token-ids (shared
+    # tokenize_action helper). Best-effort; the per-token (token-level/PPO) path
+    # does not need it.
+    tokenizer = None
+    if config.algorithm == "arm":
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(config.model.base_model_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Could not load tokenizer for action-level ARM: {exc}")
 
     # Phase 10 LR decoupling: split trainable params into V / Q+ / V_target
     # groups so the optimizer can apply per-slot learning rates. V_target
@@ -489,16 +629,31 @@ def train(config: AdvantageTrainerConfig) -> None:
                 logger.info(f"step={step} cuda_allocated_start={mem_start_gb:.2f}GB")
             with prof("advtrainer.step.TOTAL", sync_cuda=True, step=step):
                 with prof("advtrainer.train_step", sync_cuda=True):
-                    metrics = _train_step(
-                        backbone=backbone,
-                        optimizer=optimizer,
-                        batch=batch,
-                        algorithm=config.algorithm,
-                        polyak_tau=config.polyak_tau,
-                        n_epochs=config.n_epochs,
-                        minibatch_size=config.minibatch_size,
-                        inner_batch_size=config.inner_batch_size,
-                    )
+                    # On this branch "arm" is action-level: regress per-decision-
+                    # point targets via _train_step_action. The token-level
+                    # _train_step stays for PPO (and as dead-code ARM regression).
+                    if config.algorithm == "arm":
+                        metrics = _train_step_action(
+                            backbone=backbone,
+                            optimizer=optimizer,
+                            batch=batch,
+                            tokenizer=tokenizer,
+                            polyak_tau=config.polyak_tau,
+                            n_epochs=config.n_epochs,
+                            minibatch_size=config.minibatch_size,
+                            inner_batch_size=config.inner_batch_size,
+                        )
+                    else:
+                        metrics = _train_step(
+                            backbone=backbone,
+                            optimizer=optimizer,
+                            batch=batch,
+                            algorithm=config.algorithm,
+                            polyak_tau=config.polyak_tau,
+                            n_epochs=config.n_epochs,
+                            minibatch_size=config.minibatch_size,
+                            inner_batch_size=config.inner_batch_size,
+                        )
 
                 # Phase 7c: broadcast updated weights to the Advantage Server
                 # (best-effort; failures logged but non-fatal).
