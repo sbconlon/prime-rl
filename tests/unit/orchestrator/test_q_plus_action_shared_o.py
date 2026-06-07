@@ -112,6 +112,29 @@ def test_kernel_matches_shared_o():
     assert torch.allclose(kernel, shared, atol=1e-4)
 
 
+@pytest.mark.gpu
+def test_flash_kernel_matches_naive_on_gpu():
+    """CLUSTER (Ampere) parity: the REAL flash_attn path of the batched kernel
+    equals the naive per-action loop. Skipped off-GPU. bf16 tolerance (flash_attn
+    requires fp16/bf16). Run on an A100 with:  uv run pytest \
+    tests/unit/orchestrator/test_q_plus_action_shared_o.py -m gpu -v"""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("flash_attn needs Ampere+ (sm_80); this GPU is pre-Ampere")
+    bb = _backbone().to(device="cuda", dtype=torch.bfloat16)
+    o = torch.randint(0, 256, (1, 6), device="cuda")
+    actions = [
+        torch.tensor([5, 6, 7], device="cuda"),
+        torch.tensor([10, 11], device="cuda"),
+        torch.tensor([20, 21, 22, 23], device="cuda"),
+    ]
+    with torch.no_grad():
+        flash = bb.forward_q_plus_action_batched(o, actions, use_flash_attn=True)
+        naive = torch.stack([bb.forward_q_plus_action(o, a.unsqueeze(0))[0] for a in actions])
+    assert torch.allclose(flash.float(), naive.float(), atol=5e-2), f"{flash} vs {naive}"
+
+
 @pytest.mark.parametrize("mode", ["shared_o", "kernel"])
 def test_builder_optimized_matches_naive(mode):
     """_build_per_decision_point_value_tensors in each optimized mode equals the
