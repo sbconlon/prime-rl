@@ -332,6 +332,72 @@ class ValueNetworkBackbone(nn.Module):
             terminal = hidden[torch.arange(batch, device=hidden.device), term_idx, :]
         return self.q_plus_head(terminal)
 
+    def forward_q_plus_action_shared_o(
+        self,
+        observation_ids: Tensor,
+        action_ids_list: list[Tensor],
+    ) -> Tensor:
+        """Phase 8 optimization of Q+ over an admissible set: prefill o ONCE, then
+        continue each action off the shared o KV-cache (HF native cache
+        continuation), instead of re-forwarding the full [o, a] for every action.
+
+        This is the "don't recompute o" saving for the AdvServer Q+ over A(o): a
+        single o prefill (length o_len) plus |A| short action continuations,
+        rather than |A| full forwards each re-prefilling o. Exact-equal to the
+        naive forward_q_plus_action loop (KV caching is exact, modulo fp) -- the
+        parity oracle. Standard causal: each action token attends to o + earlier
+        action tokens + itself; Q+ is read at the action terminal.
+
+        For maximum GPU throughput a flash_attn_with_kvcache batched kernel (one
+        shared o-cache across all |A| via cache_batch_idx, no per-action copies)
+        is the further step -- deferred to Phase 9, where Ampere hardware can
+        validate the flash path (this laptop is pre-Ampere).
+
+        Args:
+            observation_ids: [1, o_len] -- the bare observation o (no reasoning).
+            action_ids_list: list of [a_len] (or [1, a_len]) action token tensors,
+                terminator included.
+        Returns:
+            [len(action_ids_list)] -- Q+(o, a) for each action.
+        """
+        from transformers import DynamicCache
+
+        if observation_ids.dim() == 1:
+            observation_ids = observation_ids.unsqueeze(0)
+        device = observation_ids.device
+        o_len = observation_ids.shape[-1]
+        if not action_ids_list:
+            return torch.empty(0, device=device)
+
+        # Prefill o once under the Q+ adapter, capturing the standard-causal KV cache.
+        o_cache = DynamicCache()
+        with _adapter_routing(Q_PLUS_SLOT, o_len):
+            self.base_model(observation_ids, past_key_values=o_cache, use_cache=True)
+        # Snapshot the per-layer o keys/values (shared, read-only across actions:
+        # DynamicCache.update concatenates into fresh tensors, never mutating these).
+        o_layers = [(layer.keys, layer.values) for layer in o_cache.layers]
+
+        results: list[Tensor] = []
+        for a_ids in action_ids_list:
+            a_ids_t = a_ids if a_ids.dim() == 2 else a_ids.unsqueeze(0)
+            a_ids_t = a_ids_t.to(device=device, dtype=torch.long)
+            a_len = a_ids_t.shape[-1]
+            # Fresh cache referencing the shared o K/V (no copy).
+            cache = DynamicCache()
+            for i, (k, v) in enumerate(o_layers):
+                cache.update(k, v, i)
+            pos = torch.arange(o_len, o_len + a_len, device=device).unsqueeze(0)
+            with _adapter_routing(Q_PLUS_SLOT, a_len):
+                out = self.base_model(
+                    a_ids_t,
+                    past_key_values=cache,
+                    use_cache=True,
+                    position_ids=pos,
+                    cache_position=pos[0],
+                )
+            results.append(self.q_plus_head(out.last_hidden_state[:, -1, :])[0])
+        return torch.stack(results)
+
     # -------------------------------------------------------------------
     # Phase 6.5: optimized forwards
     # -------------------------------------------------------------------

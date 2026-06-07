@@ -154,6 +154,8 @@ def _build_per_decision_point_value_tensors(
     samples: list[TrainingSample],
     backbone: ValueNetworkBackbone,
     tokenizer,
+    *,
+    use_shared_o_cache: bool = True,
 ) -> list[dict]:
     """Per decision point of the rollout (in order across samples): V(o), V_target(o)
     via the all-positions forwards indexed at the o-boundary, and Q+(o, a) over the
@@ -189,12 +191,23 @@ def _build_per_decision_point_value_tensors(
                     dtype=torch.long,
                     device=device,
                 )
-                q_plus_k: list[float] = []
-                for a in dp.admissible_actions:
-                    a_ids = torch.tensor(
-                        [tokenize_action(tokenizer, a)], dtype=torch.long, device=device
-                    )
-                    q_plus_k.append(float(backbone.forward_q_plus_action(o_ids, a_ids)[0]))
+                if use_shared_o_cache:
+                    # Phase 8: prefill o once, continue the |A| actions off the
+                    # shared cache (exact parity with the naive loop below).
+                    action_ids_list = [
+                        torch.tensor(tokenize_action(tokenizer, a), dtype=torch.long, device=device)
+                        for a in dp.admissible_actions
+                    ]
+                    q_vals = backbone.forward_q_plus_action_shared_o(o_ids, action_ids_list)
+                    q_plus_k = [float(x) for x in q_vals]
+                else:
+                    # Naive oracle: |A| full [o, a] forwards (Phase 5/6).
+                    q_plus_k = []
+                    for a in dp.admissible_actions:
+                        a_ids = torch.tensor(
+                            [tokenize_action(tokenizer, a)], dtype=torch.long, device=device
+                        )
+                        q_plus_k.append(float(backbone.forward_q_plus_action(o_ids, a_ids)[0]))
                 records.append(
                     {
                         "sample_idx": s_idx,
