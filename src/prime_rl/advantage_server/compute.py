@@ -37,9 +37,18 @@ from prime_rl.orchestrator.per_token_advantage import (
     arm_regret_matching_advantage_fn,
     ppo_gae_advantage_fn,
 )
+from prime_rl.advantage_server.action_advantage import (
+    ActionAdvantageInputs,
+    action_advantage_fn,
+    tokenize_action,
+)
 from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
 from prime_rl.advantage_server._prof import prof
-from prime_rl.transport.types import AdvantageTrainingSample, TrainingSample
+from prime_rl.transport.types import (
+    AdvantageTrainingSample,
+    DecisionPointTarget,
+    TrainingSample,
+)
 
 
 def compute_advantages_and_targets_ppo(
@@ -134,6 +143,234 @@ def compute_advantages_and_targets_arm(
         _log_advantage_magnitudes(out)
         with prof("compute.arm.build_paired_outputs"):
             return _build_paired_outputs(samples, out)
+
+
+# ---------------------------------------------------------------------------
+# Action-level ARM (this branch's production "arm" path)
+# ---------------------------------------------------------------------------
+
+
+def _build_per_decision_point_value_tensors(
+    samples: list[TrainingSample],
+    backbone: ValueNetworkBackbone,
+    tokenizer,
+) -> list[dict]:
+    """Per decision point of the rollout (in order across samples): V(o), V_target(o)
+    via the all-positions forwards indexed at the o-boundary, and Q+(o, a) over the
+    admissible set via the multi-token append-and-read (Phase 5). Returns one record
+    per decision point carrying the value reads plus the routing/splay metadata.
+
+    o excludes the reasoning block: o = prompt_ids + completion_ids[:response_start].
+    V(o_k) is read at full-input position prompt_len + response_start - 1 (the token
+    before the response begins), matching the per-token V convention.
+    """
+    backbone.eval()
+    device = next(backbone.parameters()).device
+    records: list[dict] = []
+    with torch.no_grad():
+        for s_idx, sample in enumerate(samples):
+            dps = sample.decision_points
+            if not dps:
+                continue
+            prompt_len = len(sample.prompt_ids)
+            full_ids = torch.tensor(
+                [list(sample.prompt_ids) + list(sample.completion_ids)],
+                dtype=torch.long,
+                device=device,
+            )
+            v_all_seq, _ = backbone.forward_v_all_positions(full_ids)
+            v_target_all_seq, _ = backbone.forward_v_target_all_positions(full_ids)
+            for dp in dps:
+                read_pos = prompt_len + dp.response_start - 1
+                v_k = float(v_all_seq[0, read_pos])
+                v_target_k = float(v_target_all_seq[0, read_pos])
+                o_ids = torch.tensor(
+                    [list(sample.prompt_ids) + list(sample.completion_ids[: dp.response_start])],
+                    dtype=torch.long,
+                    device=device,
+                )
+                q_plus_k: list[float] = []
+                for a in dp.admissible_actions:
+                    a_ids = torch.tensor(
+                        [tokenize_action(tokenizer, a)], dtype=torch.long, device=device
+                    )
+                    q_plus_k.append(float(backbone.forward_q_plus_action(o_ids, a_ids)[0]))
+                records.append(
+                    {
+                        "sample_idx": s_idx,
+                        "response_start": dp.response_start,
+                        "response_end": dp.response_end,
+                        "executed_idx": dp.executed_action_idx,
+                        "pi_hat": dp.pi_hat,
+                        "executed_action": dp.admissible_actions[dp.executed_action_idx],
+                        "q_plus": q_plus_k,
+                        "v": v_k,
+                        "v_target": v_target_k,
+                    }
+                )
+    return records
+
+
+def compute_advantages_and_targets_arm_action(
+    samples: list[TrainingSample],
+    episodic_reward: float,
+    is_terminal: bool,
+    backbone: ValueNetworkBackbone,
+    tokenizer,
+    *,
+    gamma: float = 1.0,
+    n_step: int = 1,
+) -> list[tuple[TrainingSample, AdvantageTrainingSample]]:
+    """Action-level ARM: A(a*) = log pi_RM(a*|o) - log pi_hat(a*|o) per decision
+    point, plus the action-level V/Q+ regression targets. Same four-step skeleton
+    as the token-level path, regrained from per-token to per-decision-point.
+
+    pi_hat is shipped from the rollout (Phase 4) on DecisionPoint.pi_hat. The
+    decision points of all samples form one episode sequence, so the n-step return
+    is computed once over the whole sequence (terminal reward propagates across
+    truncation splits). The advantage broadcasts across each decision point's
+    response span (per-token), while the V/Q+ regression targets are per-decision-
+    point (DecisionPointTarget) -- the AdvTrainer regresses at the o-boundary and
+    the action terminal, not per token.
+    """
+    records = _build_per_decision_point_value_tensors(samples, backbone, tokenizer)
+    K = len(records)
+
+    if K == 0:
+        # No decision points (e.g. GRPO sample mistakenly routed here): emit
+        # zero advantages and no targets, preserving the paired-output shape.
+        return [
+            (
+                __import__("msgspec").structs.replace(s, advantages=[0.0] * len(s.completion_ids)),
+                AdvantageTrainingSample(
+                    prompt_ids=list(s.prompt_ids),
+                    prompt_mask=list(s.prompt_mask),
+                    completion_ids=list(s.completion_ids),
+                    completion_mask=list(s.completion_mask),
+                ),
+            )
+            for s in samples
+        ]
+
+    rewards = [0.0] * K
+    if is_terminal:
+        rewards[-1] = float(episodic_reward)
+
+    pi_hat_raw = [r["pi_hat"] for r in records]
+    # Placeholder for missing pi_hat (e.g. error turns where Phase 4 skipped
+    # scoring); the resulting advantage is zeroed below so no LLM update flows.
+    pi_hat_star = [ph if ph is not None else 1.0 for ph in pi_hat_raw]
+
+    inputs = ActionAdvantageInputs(
+        q_plus=[r["q_plus"] for r in records],
+        v=[r["v"] for r in records],
+        executed_idx=[r["executed_idx"] for r in records],
+        pi_hat_star=pi_hat_star,
+        rewards=rewards,
+        v_target=[r["v_target"] for r in records],
+        gamma=gamma,
+        n_step=n_step,
+    )
+    _log_q_plus_distribution_action(records)
+    out = action_advantage_fn(inputs)
+    for k, ph in enumerate(pi_hat_raw):
+        if ph is None:
+            out.advantage[k] = 0.0
+    _log_advantage_magnitudes_action(out)
+
+    return _build_paired_outputs_action(samples, records, out)
+
+
+def _build_paired_outputs_action(
+    samples: list[TrainingSample],
+    records: list[dict],
+    out,
+) -> list[tuple[TrainingSample, AdvantageTrainingSample]]:
+    """Splay action-level outputs back: the per-decision-point advantage broadcasts
+    across its response span on TrainingSample.advantages; the V/Q+ targets become
+    one DecisionPointTarget per decision point on AdvantageTrainingSample."""
+    import msgspec.structs
+
+    per_sample_adv: list[list[float]] = [[0.0] * len(s.completion_ids) for s in samples]
+    per_sample_dpt: list[list[DecisionPointTarget]] = [[] for _ in samples]
+    for k, r in enumerate(records):
+        si = r["sample_idx"]
+        for pos in range(r["response_start"], r["response_end"]):
+            per_sample_adv[si][pos] = out.advantage[k]
+        per_sample_dpt[si].append(
+            DecisionPointTarget(
+                response_start=r["response_start"],
+                executed_action=r["executed_action"],
+                v_target=out.v_target_out[k],
+                q_plus_target=out.q_plus_target_out[k],
+            )
+        )
+
+    paired: list[tuple[TrainingSample, AdvantageTrainingSample]] = []
+    for i, sample in enumerate(samples):
+        new_llm_sample = msgspec.structs.replace(sample, advantages=per_sample_adv[i])
+        adv_sample = AdvantageTrainingSample(
+            prompt_ids=list(sample.prompt_ids),
+            prompt_mask=list(sample.prompt_mask),
+            completion_ids=list(sample.completion_ids),
+            completion_mask=list(sample.completion_mask),
+            v_targets=None,
+            q_plus_targets=None,
+            decision_point_targets=per_sample_dpt[i] or None,
+        )
+        paired.append((new_llm_sample, adv_sample))
+    return paired
+
+
+def _log_q_plus_distribution_action(records: list[dict]) -> None:
+    """ARM_DISCRIM_DIAG for action-level: Q+ discrimination over the admissible set
+    (variable |A| per decision point). Logs mean std of (Q+ - V) across actions and
+    the mean effective action count of the regret distribution."""
+    if not records:
+        return
+    import math
+
+    stds: list[float] = []
+    eff_ks: list[float] = []
+    for r in records:
+        v = r["v"]
+        regrets = [max(0.0, q - v) for q in r["q_plus"]]
+        n = len(regrets)
+        if n == 0:
+            continue
+        mean = sum(regrets) / n
+        var = sum((x - mean) ** 2 for x in regrets) / n
+        stds.append(var ** 0.5)
+        total = sum(regrets)
+        if total > 0:
+            p = [x / total for x in regrets]
+            entropy = -sum(pi * math.log(pi) for pi in p if pi > 0)
+            eff_ks.append(math.exp(entropy))
+        else:
+            eff_ks.append(float(n))  # uniform fallback
+    q_plus_std_mean = sum(stds) / len(stds) if stds else 0.0
+    eff_k_mean = sum(eff_ks) / len(eff_ks) if eff_ks else 0.0
+    _LOGGER.info(
+        "ARM_DISCRIM_DIAG n_dp=%d q_plus_std_mean=%.6f eff_k_mean=%.4f",
+        len(records), q_plus_std_mean, eff_k_mean,
+    )
+
+
+def _log_advantage_magnitudes_action(out) -> None:
+    """ARM_DIAG for action-level: advantage / target magnitudes per rollout."""
+    adv = out.advantage
+    if not adv:
+        return
+    n = len(adv)
+    abs_adv = [abs(a) for a in adv]
+    _LOGGER.info(
+        "ARM_DIAG n_dp=%d adv_mean=%.6f adv_absmax=%.6f vtg_mean=%.6f qtg_mean=%.6f",
+        n,
+        sum(adv) / n,
+        max(abs_adv),
+        sum(out.v_target_out) / n,
+        sum(out.q_plus_target_out) / n,
+    )
 
 
 def _log_q_plus_distribution(
@@ -237,9 +474,16 @@ def compute_advantages_and_targets(
     is_terminal: bool,
     algorithm: Literal["ppo", "arm"],
     backbone: ValueNetworkBackbone,
+    tokenizer=None,
     **kwargs: float | int | str,
 ) -> list[tuple[TrainingSample, AdvantageTrainingSample]]:
-    """Dispatch to the per-algorithm compute path."""
+    """Dispatch to the per-algorithm compute path.
+
+    On this (action-level) branch "arm" routes to the *action-level* path
+    (compute_advantages_and_targets_arm_action), which needs `tokenizer` to
+    tokenize admissible actions for Q+. The token-level compute_advantages_and_targets_arm
+    stays as tested dead code, callable directly but no longer on the dispatch path.
+    """
     if algorithm == "ppo":
         return compute_advantages_and_targets_ppo(
             samples=samples,
@@ -249,11 +493,16 @@ def compute_advantages_and_targets(
             **kwargs,
         )
     if algorithm == "arm":
-        return compute_advantages_and_targets_arm(
+        if tokenizer is None:
+            raise ValueError(
+                "action-level ARM requires a tokenizer to tokenize admissible actions"
+            )
+        return compute_advantages_and_targets_arm_action(
             samples=samples,
             episodic_reward=episodic_reward,
             is_terminal=is_terminal,
             backbone=backbone,
+            tokenizer=tokenizer,
             **kwargs,
         )
     raise ValueError(f"Unsupported algorithm: {algorithm!r}")

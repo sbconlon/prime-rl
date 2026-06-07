@@ -254,29 +254,42 @@ def test_compute_arm_requires_completion_top_k_token_ids(
 
 
 def test_dispatch_routes_to_correct_algorithm(tiny_backbone: ValueNetworkBackbone):
-    """compute_advantages_and_targets dispatches based on `algorithm`."""
-    K = 4
-    sample = _make_sample(
-        completion_len=2,
-        completion_top_k_token_ids=[[10 + j for j in range(K)] for _ in range(2)],
-    )
+    """compute_advantages_and_targets dispatches based on `algorithm`.
+
+    On the action-level branch "arm" routes to the action-level path (needs a
+    tokenizer + per-decision-point metadata and produces decision_point_targets);
+    the token-level compute_advantages_and_targets_arm is dead code, tested
+    directly elsewhere in this file.
+    """
+    from prime_rl.transport.types import DecisionPoint
+
+    class _CharTok:
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) % 256 for c in text]
+
+    ppo_sample = _make_sample(completion_len=2)
     out_ppo = compute_advantages_and_targets(
-        samples=[sample],
+        samples=[ppo_sample],
         episodic_reward=1.0,
         is_terminal=True,
         algorithm="ppo",
         backbone=tiny_backbone,
     )
+    arm_sample = _make_sample(completion_len=2)
+    arm_sample.decision_points = [DecisionPoint(0, 2, ["go", "look"], 0, pi_hat=0.5)]
     out_arm = compute_advantages_and_targets(
-        samples=[sample],
+        samples=[arm_sample],
         episodic_reward=1.0,
         is_terminal=True,
         algorithm="arm",
         backbone=tiny_backbone,
+        tokenizer=_CharTok(),
+        n_step=10,
     )
-    # PPO produces no q_plus_targets, ARM does.
-    assert out_ppo[0][1].q_plus_targets is None
-    assert out_arm[0][1].q_plus_targets is not None
+    # PPO -> per-token v_targets, no decision-point targets.
+    assert out_ppo[0][1].decision_point_targets is None
+    # action-level ARM -> per-decision-point targets.
+    assert out_arm[0][1].decision_point_targets is not None
 
 
 def test_dispatch_unknown_algorithm_raises(tiny_backbone: ValueNetworkBackbone):

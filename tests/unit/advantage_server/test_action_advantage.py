@@ -15,9 +15,11 @@ from prime_rl.advantage_server.action_advantage import (
     ActionAdvantageInputs,
     ActionAdvantageOutputs,
     action_advantage,
+    action_advantage_fn,
     n_step_return_action_level,
     pi_rm,
     q_plus_target,
+    tokenize_action,
     v_target_from_return,
 )
 
@@ -212,3 +214,73 @@ def test_inputs_executed_idx_out_of_range_raises():
             rewards=[1.0],
             v_target=[0.2],
         )
+
+
+# --------------------------------------------------------------------------- #
+# action_advantage_fn (Phase 6 composition)
+# --------------------------------------------------------------------------- #
+
+
+def test_composition_matches_pieces():
+    inp = ActionAdvantageInputs(
+        q_plus=[[5.0, 3.0], [2.0, 9.0]],  # k=0 regrets vs v=2 -> [3,1]; k=1 vs v=3 -> [0,6]
+        v=[2.0, 3.0],
+        executed_idx=[0, 1],
+        pi_hat_star=[0.5, 0.5],
+        rewards=[0.0, 1.0],
+        v_target=[0.2, 0.9],
+        gamma=1.0,
+        n_step=10,  # MC: every g_k == terminal reward 1.0
+    )
+    out = action_advantage_fn(inp)
+    # hand-composed
+    g = n_step_return_action_level(inp.rewards, inp.v_target, inp.gamma, inp.n_step)
+    for k in range(2):
+        rm = pi_rm(inp.q_plus[k], inp.v[k])
+        e = inp.executed_idx[k]
+        assert out.advantage[k] == pytest.approx(action_advantage(rm[e], inp.pi_hat_star[k]))
+        assert out.v_target_out[k] == pytest.approx(v_target_from_return(g[k]))
+        assert out.q_plus_target_out[k] == pytest.approx(
+            q_plus_target(inp.q_plus[k][e], inp.v[k], g[k])
+        )
+
+
+def test_composition_preserves_fixed_point():
+    """If pi_RM(a*) == pi_hat(a*), the composed advantage is 0."""
+    # k=0: q_plus [4,2] vs v=2 -> regrets [2,0] -> pi_RM = [1.0, 0.0]; executed idx 0
+    # -> pi_RM(a*) = 1.0; set pi_hat_star = 1.0 -> advantage 0.
+    inp = ActionAdvantageInputs(
+        q_plus=[[4.0, 2.0]],
+        v=[2.0],
+        executed_idx=[0],
+        pi_hat_star=[1.0],
+        rewards=[1.0],
+        v_target=[0.0],
+        gamma=1.0,
+        n_step=1,
+    )
+    out = action_advantage_fn(inp)
+    assert out.advantage[0] == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# tokenize_action (shared Q+/AdvTrainer helper)
+# --------------------------------------------------------------------------- #
+
+
+class _FakeTok:
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) for c in text]
+
+
+def test_tokenize_action_wraps_with_tags_and_terminator():
+    tok = _FakeTok()
+    ids = tokenize_action(tok, "look")
+    assert ids == [ord(c) for c in "<action>look</action>"]
+
+
+def test_tokenize_action_deterministic_same_text():
+    """The three-site consistency invariant (DQ5.5): identical text -> identical ids."""
+    tok = _FakeTok()
+    assert tokenize_action(tok, "go to cabinet 1") == tokenize_action(tok, "go to cabinet 1")
+    assert tokenize_action(tok, "go to cabinet 1") != tokenize_action(tok, "go to cabinet 12")

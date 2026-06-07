@@ -9,6 +9,7 @@ import msgspec
 from prime_rl.transport.types import (
     AdvantageTrainingBatch,
     AdvantageTrainingSample,
+    DecisionPointTarget,
 )
 
 
@@ -87,3 +88,40 @@ def test_advantage_training_batch_run_idx_omit_defaults():
     batch = AdvantageTrainingBatch(examples=[_make_minimal_adv_sample()], step=1)
     encoded = msgspec.msgpack.encode(batch)
     assert b"run_idx" not in encoded
+
+
+# --------------------------------------------------------------------------- #
+# Action-level ARM: decision_point_targets (Phase 6 contract change)
+# --------------------------------------------------------------------------- #
+
+
+def test_decision_point_target_round_trip():
+    dpt = DecisionPointTarget(
+        response_start=4, executed_action="go to cabinet 1", v_target=1.0, q_plus_target=0.3
+    )
+    decoded = msgspec.msgpack.decode(msgspec.msgpack.encode(dpt), type=DecisionPointTarget)
+    assert decoded.response_start == 4
+    assert decoded.executed_action == "go to cabinet 1"
+    assert decoded.v_target == 1.0
+    assert decoded.q_plus_target == 0.3
+
+
+def test_advantage_sample_with_decision_point_targets_round_trip():
+    sample = _make_minimal_adv_sample(completion_len=2)
+    sample.decision_point_targets = [
+        DecisionPointTarget(0, "look", 1.0, 0.5),
+        DecisionPointTarget(2, "go north", 1.0, 0.2),
+    ]
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(sample), type=AdvantageTrainingSample
+    )
+    assert decoded.decision_point_targets is not None
+    assert len(decoded.decision_point_targets) == 2
+    assert decoded.decision_point_targets[1].executed_action == "go north"
+
+
+def test_advantage_sample_decision_point_targets_default_none_omitted():
+    sample = _make_minimal_adv_sample(v_targets=[0.1, 0.2, 0.3])
+    assert sample.decision_point_targets is None
+    encoded = msgspec.msgpack.encode(sample)
+    assert b"decision_point_targets" not in encoded

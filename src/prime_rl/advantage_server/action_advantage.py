@@ -160,3 +160,41 @@ class ActionAdvantageOutputs:
     advantage: list[float]  # A(a*_k) -- Phase 6 broadcasts across the response span
     v_target_out: list[float]  # V regression target per decision point (= g_k)
     q_plus_target_out: list[float]  # Q+ regression target per decision point
+
+
+def action_advantage_fn(inputs: ActionAdvantageInputs) -> ActionAdvantageOutputs:
+    """Per-rollout composition: the action-level analog of
+    arm_regret_matching_advantage_fn. The n-step return runs once over the whole
+    decision-point sequence (so the terminal reward propagates across truncation
+    splits -- the caller assembles the full sequence); per decision point k:
+    pi_RM over A(o_k), advantage log pi_RM(a*) - log pi_hat(a*), and the V/Q+
+    regression targets. Pure -- the math is Phase 2; this just wires it.
+    """
+    g = n_step_return_action_level(inputs.rewards, inputs.v_target, inputs.gamma, inputs.n_step)
+    advantage: list[float] = []
+    v_target_out: list[float] = []
+    q_plus_target_out: list[float] = []
+    for k in range(len(inputs.v)):
+        e = inputs.executed_idx[k]
+        rm = pi_rm(inputs.q_plus[k], inputs.v[k])
+        advantage.append(action_advantage(rm[e], inputs.pi_hat_star[k]))
+        v_target_out.append(v_target_from_return(g[k]))
+        q_plus_target_out.append(q_plus_target(inputs.q_plus[k][e], inputs.v[k], g[k]))
+    return ActionAdvantageOutputs(
+        advantage=advantage,
+        v_target_out=v_target_out,
+        q_plus_target_out=q_plus_target_out,
+    )
+
+
+def tokenize_action(tokenizer, action_text: str) -> list[int]:
+    """Shared tokenization of an admissible action for Q+ append-and-read.
+
+    Encodes "<action>{action_text}</action>" with the closing terminator (so
+    prefix-overlapping actions like "go to cabinet 1" vs "12" are distinguished)
+    and no special tokens. This is the single helper the AdvServer Q+ (Phase 6)
+    and the AdvTrainer Q+ (Phase 7) both call, so a* is the *same* token sequence
+    on both sides. (Phase 4's rollout-side pi_hat scores the same "<action>...
+    </action>" span; the live equality of all three is the Phase 9 gate, DQ5.5.)
+    """
+    return tokenizer.encode("<action>" + action_text + "</action>", add_special_tokens=False)

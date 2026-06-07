@@ -78,6 +78,23 @@ class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tru
     run_idx: int | None = None
 
 
+# Action-level ARM: per-decision-point regression targets for the Advantage Trainer.
+class DecisionPointTarget(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
+    """One regression target per ALFWorld decision point (action-level ARM).
+
+    Self-contained for the Advantage Trainer (Phase 7): it slices the observation
+    o = prompt_ids + completion_ids[:response_start] from the owning
+    AdvantageTrainingSample, tokenizes executed_action (the shared tokenize_action
+    helper, terminator included), forwards V(o) and Q+(o, a*), and regresses them
+    against v_target / q_plus_target.
+    """
+
+    response_start: int  # o = prompt_ids + completion_ids[:response_start]
+    executed_action: str  # a* text; tokenized at point-of-use
+    v_target: float  # = g_k (n-step return)
+    q_plus_target: float  # = max(0, Q+(o,a*) - V(o)) + g_k
+
+
 # Phase 6: Advantage Server -> Orchestrator -> Advantage Trainer.
 class AdvantageTrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A single advantage training example, paired 1-1 with a TrainingSample.
@@ -100,6 +117,11 @@ class AdvantageTrainingSample(msgspec.Struct, array_like=True, gc=False, omit_de
     completion_mask: list[bool]
     v_targets: list[float] | None = None
     q_plus_targets: list[float] | None = None
+
+    # Action-level ARM: per-decision-point regression targets. None for PPO and
+    # token-level ARM (which use the per-token v_targets/q_plus_targets above).
+    # Kept off the wire for those paths by omit_defaults.
+    decision_point_targets: list[DecisionPointTarget] | None = None
 
 
 class AdvantageTrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):

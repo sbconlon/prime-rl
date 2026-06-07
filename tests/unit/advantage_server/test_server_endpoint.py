@@ -141,17 +141,43 @@ def test_compute_endpoint_round_trip_ppo(monkeypatch: pytest.MonkeyPatch):
     assert paired.llm_sample.advantages[-1] == pytest.approx(1.0, abs=1e-5)
 
 
-def test_compute_endpoint_round_trip_arm(monkeypatch: pytest.MonkeyPatch):
-    """POST /compute_advantages_and_targets with an ARM request returns paired outputs.
+class _CharTokenizer:
+    """Tiny deterministic tokenizer (ids < the tiny model's vocab of 256)."""
 
-    Iteration-0 regime: cold-start branch fires (advantages all zero);
-    q_plus_targets follow phi + g = 0 + g = n-step return.
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) % 256 for c in text]
+
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        return cls()
+
+
+def test_compute_endpoint_round_trip_arm(monkeypatch: pytest.MonkeyPatch):
+    """POST /compute_advantages_and_targets with an action-level ARM request.
+
+    On this branch "arm" routes to the action-level path: the request carries
+    per-decision-point metadata (admissible actions, executed idx, pi_hat) and the
+    server returns per-decision-point targets. Cold-start (zero-init q_plus_head)
+    -> pi_RM uniform -> advantage = log(uniform) - log(pi_hat), and the value
+    targets follow the n-step return.
     """
-    K = 4
+    from transformers import AutoTokenizer  # noqa: F401 -- patched below
+
+    # The server loads AutoTokenizer.from_pretrained inside _load_backbone; patch
+    # the transformers symbol so the tiny app gets a char tokenizer.
+    monkeypatch.setattr("transformers.AutoTokenizer", _CharTokenizer)
+
+    from prime_rl.transport.types import DecisionPoint
+
     app = _build_tiny_app(monkeypatch)
-    sample = _make_sample(
-        completion_len=2,
-        completion_top_k_token_ids=[[10 + j for j in range(K)] for _ in range(2)],
+    sample = TrainingSample(
+        prompt_ids=[1, 2],
+        prompt_mask=[False, False],
+        completion_ids=[10, 11],
+        completion_mask=[True, True],
+        completion_logprobs=[0.0, 0.0],
+        completion_temperatures=[1.0, 1.0],
+        decision_points=[DecisionPoint(0, 2, ["go", "look"], 0, pi_hat=0.5)],
     )
     request = ComputeAdvantagesRequest(
         samples=[sample], episodic_reward=1.0, is_terminal=True, algorithm="arm"
@@ -168,10 +194,13 @@ def test_compute_endpoint_round_trip_arm(monkeypatch: pytest.MonkeyPatch):
         decoded = msgspec.msgpack.decode(response.content, type=ComputeAdvantagesResponse)
 
     paired = decoded.paired_samples[0]
-    assert paired.advantage_sample.q_plus_targets is not None
-    # Cold-start: advantages all zero.
-    for a in paired.llm_sample.advantages or []:
-        assert abs(a) < 1e-6
+    # Action-level: per-decision-point targets, not per-token.
+    assert paired.advantage_sample.decision_point_targets is not None
+    assert len(paired.advantage_sample.decision_point_targets) == 1
+    assert paired.advantage_sample.decision_point_targets[0].executed_action == "go"
+    # v_target = g_k = terminal reward (n-step MC, gamma defaults).
+    assert paired.llm_sample.advantages is not None
+    assert len(paired.llm_sample.advantages) == 2
 
 
 def test_compute_endpoint_multi_sample_request(monkeypatch: pytest.MonkeyPatch):

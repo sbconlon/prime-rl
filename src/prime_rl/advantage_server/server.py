@@ -56,6 +56,9 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
     app = FastAPI(title="Advantage Server")
     app.state.config = config
     app.state.backbone = None
+    # Tokenizer for action-level ARM (tokenizing admissible actions for Q+).
+    # Loaded lazily alongside the backbone; None for PPO/token-level runs.
+    app.state.tokenizer = None
     app.state.ready = False
     app.state.gamma = config.gamma
     app.state.lam = config.lam
@@ -93,6 +96,19 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
         backbone = backbone.to(device=device, dtype=dtype)
         backbone.eval()
         app.state.backbone = backbone
+        # Action-level ARM tokenizer (best-effort). PPO / token-level runs don't
+        # need it, so a load failure is non-fatal here -- the action path raises a
+        # clear error only if it is actually invoked without a tokenizer.
+        try:
+            from transformers import AutoTokenizer
+
+            app.state.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
+        except Exception as exc:  # noqa: BLE001 -- non-fatal; PPO doesn't need it
+            _LOGGER.warning(
+                "Could not load tokenizer for %s; action-level ARM will fail if used: %s",
+                cfg.model_name, exc,
+            )
+            app.state.tokenizer = None
         app.state.ready = True
         _LOGGER.info("Advantage Server ready (host=%s, port=%d)", cfg.host, cfg.port)
 
@@ -154,6 +170,7 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
                     is_terminal=decoded.is_terminal,
                     algorithm=decoded.algorithm,
                     backbone=backbone,
+                    tokenizer=app.state.tokenizer,
                     **kwargs,
                 )
 
