@@ -284,6 +284,54 @@ class ValueNetworkBackbone(nn.Module):
         hidden = self._forward_base(input_ids, V_TARGET_SLOT)
         return self.v_target_head(hidden[:, -1, :])
 
+    def forward_q_plus_action(
+        self,
+        observation_ids: Tensor,
+        action_ids: Tensor,
+        action_lengths: Tensor | None = None,
+    ) -> Tensor:
+        """Q+(o, a) for a MULTI-TOKEN action, read at the action terminal token
+        under STANDARD causal attention (Phase 5; corrects D-4).
+
+        Appends `action_ids` to `observation_ids` and forwards the Q+ adapter with
+        HF's default self-inclusive causal mask -- NOT the strict-causal mask the
+        single-token `forward_q_plus` / candidate kernel use. That strict mask was a
+        *token-level optimization* (~seq_len x K candidate forwards per trajectory);
+        action-level Q+ runs ~|A| x MAX_EPISODE_STEPS forwards/episode, so it is
+        dropped. Standard causal processes `o` exactly as V does and matches how the
+        policy autoregressively generated the committed action (Q+ values the whole
+        action, all its tokens). Q+ is read at the action's terminal position.
+
+        Args:
+            observation_ids: [batch, o_len] -- the context o (no reasoning block;
+                Q+ is reasoning-independent).
+            action_ids: [batch, a_len] -- the action token sequence, terminator
+                included (must match the tokenization pi_hat scored; DQ5.5).
+            action_lengths: optional [batch] true (unpadded) action lengths. When
+                given (ragged actions right-padded to a_len), each row is read at its
+                true terminal index o_len + action_lengths[i] - 1; right padding after
+                the terminal is ignored under causal attention. When None, every row
+                is read at the last position (-1).
+
+        Returns:
+            [batch] -- Q+(o, a).
+        """
+        full_ids = torch.cat([observation_ids, action_ids], dim=-1)
+        batch, seq = full_ids.shape
+        # Standard causal: route the Q+ adapter but pass NO attention_mask, so the
+        # base model applies its default self-inclusive causal mask. (Do not route
+        # through _forward_base, which injects the strict-causal mask for Q_PLUS_SLOT.)
+        with _adapter_routing(Q_PLUS_SLOT, batch * seq):
+            output = self.base_model(full_ids)
+        hidden = output.last_hidden_state  # [batch, seq, hidden]
+        if action_lengths is None:
+            terminal = hidden[:, -1, :]
+        else:
+            o_len = observation_ids.shape[-1]
+            term_idx = (o_len + action_lengths.to(hidden.device) - 1).long()
+            terminal = hidden[torch.arange(batch, device=hidden.device), term_idx, :]
+        return self.q_plus_head(terminal)
+
     # -------------------------------------------------------------------
     # Phase 6.5: optimized forwards
     # -------------------------------------------------------------------
