@@ -11,8 +11,9 @@ import verifiers as vf
 from PIL import Image
 from transformers.tokenization_utils import PreTrainedTokenizer
 
+from prime_rl.orchestrator.admissible import substitute_executed_into_admissible
 from prime_rl.orchestrator.top_k import substitute_sampled_into_top_k
-from prime_rl.transport import TrainingSample
+from prime_rl.transport import DecisionPoint, TrainingSample
 from prime_rl.utils.chat_template import (
     common_prefix_len,
     deserialize_tool_calls,
@@ -49,6 +50,37 @@ def _align_routed_experts(
 
 def _common_prefix_len(a: list[int], b: list[int]) -> int:
     return common_prefix_len(a, b)
+
+
+def _build_decision_point(
+    extras: dict[str, Any] | None,
+    response_start: int,
+    response_end: int,
+) -> "DecisionPoint | None":
+    """Build an action-level DecisionPoint from a trajectory step's extras.
+
+    Returns None when the step carries no admissible-action metadata (the
+    GRPO/PPO/token-ARM path) -- in that case the owning sample's decision_points
+    stays None. The ALFWorld env writes the *raw* admissible set + executed
+    action text; the union invariant (substitute_executed_into_admissible) is
+    applied here, mirroring substitute_sampled_into_top_k for tokens.
+    """
+    if not extras:
+        return None
+    admissible = extras.get("admissible_actions")
+    executed = extras.get("executed_action")
+    if admissible is None or executed is None:
+        return None
+    union, idx = substitute_executed_into_admissible(list(admissible), executed)
+    return DecisionPoint(
+        response_start=response_start,
+        response_end=response_end,
+        admissible_actions=union,
+        executed_action_idx=idx,
+        # pi_hat is reserved for Phase 4; the env does not write it yet, so this
+        # is None today. Reading it here keeps Phase 4 a pure env-side change.
+        pi_hat=extras.get("pi_hat"),
+    )
 
 
 def _normalize_messages(messages: Any, default_role: str) -> list[dict[str, Any]]:
@@ -288,6 +320,10 @@ def interleave_rollout(
                 # Advantage Server rejects the request with
                 # "ARM compute requires sample.completion_top_k_token_ids".
                 "completion_top_k_token_ids": tokens.get("completion_top_k_token_ids"),
+                # Action-level ARM (Phase 1): the ALFWorld env writes the raw
+                # admissible set + executed-action text here via its
+                # add_trajectory_step override. None for GRPO/PPO/token-ARM.
+                "extras": step.get("extras"),
             }
 
         logger.warning(f"Missing rollout tokens for example {output['example_id']} step {step_idx}.")
@@ -327,6 +363,12 @@ def interleave_rollout(
         else:
             completion_top_k_token_ids = None
 
+        # Action-level ARM (Phase 1): this turn's response occupies the whole
+        # completion span [0, len(completion_ids)) of the fresh sample. None for
+        # GRPO/PPO (no extras), leaving decision_points None.
+        dp = _build_decision_point(tokens.get("extras"), 0, len(completion_ids))
+        decision_points = [dp] if dp is not None else None
+
         return TrainingSample(
             prompt_ids=list(tokens["prompt_ids"]),
             prompt_mask=[bool(i) for i in tokens["prompt_mask"]],
@@ -338,11 +380,18 @@ def interleave_rollout(
             advantages=None,
             routed_experts=routed_experts,
             completion_top_k_token_ids=completion_top_k_token_ids,
+            decision_points=decision_points,
         )
 
     def extend_sample(sample: TrainingSample, prefix_len: int, step_idx: int) -> None:
         """Extend an existing sample with a new trajectory step (extension property holds)."""
         tokens = prepared_steps[step_idx]
+
+        # Action-level ARM (Phase 1): capture the completion length *before* the
+        # extends below so this turn's response span is computed relative to the
+        # owning sample's completion_ids. The response starts after the mask=False
+        # bridge tokens this turn prepends.
+        prev_completion_len = len(sample.completion_ids)
 
         # Extend with new prompt tokens (mask=False, no gradient)
         new_prompt_ids = tokens["prompt_ids"][prefix_len:]
@@ -393,6 +442,19 @@ def interleave_rollout(
             sample.routed_experts.extend(step_routed[prefix_len:])
             expected_len = len(sample.prompt_ids) + len(sample.completion_ids)
             sample.routed_experts = _align_routed_experts(sample.routed_experts, expected_len)
+
+        # Action-level ARM (Phase 1): this merged turn's response span sits after
+        # the mask=False bridge tokens, in the owning sample's completion-id space.
+        response_start = prev_completion_len + len(new_prompt_ids)
+        response_end = response_start + len(completion_ids)
+        dp = _build_decision_point(tokens.get("extras"), response_start, response_end)
+        if dp is not None:
+            if sample.decision_points is None:
+                # First merged turn to introduce decision points (e.g. the sample's
+                # first turn had no extras). Start the list now.
+                sample.decision_points = [dp]
+            else:
+                sample.decision_points.append(dp)
 
     # Track [prefix_tokens, sample, last_step_idx] per active sample
     active_samples: list[list] = []

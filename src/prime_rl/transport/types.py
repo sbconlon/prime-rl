@@ -1,6 +1,30 @@
 import msgspec
 
 
+# Action-level ARM: per-decision-point metadata (one ALFWorld decision per turn).
+class DecisionPoint(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
+    """Per-turn metadata for action-level ARM. One per ALFWorld decision point.
+
+    Attached to the TrainingSample whose completion_ids contain this turn's
+    response (a sample may contain several turns when interleave_rollout merges
+    them under the extension property). None of these fields exist for GRPO/PPO
+    or for token-level ARM.
+    """
+
+    # Response span in *completion-id space* of the owning sample.
+    # The observation is o = prompt_ids + completion_ids[:response_start]; the
+    # advantage A(a*) broadcasts across completion_ids[response_start:response_end].
+    response_start: int
+    response_end: int
+    # Admissible action TEXT. Includes the executed action by the union invariant
+    # (DQ1.4) -- substitute_executed_into_admissible is applied in interleave_rollout.
+    admissible_actions: list[str]
+    # Index of the executed action a* within admissible_actions.
+    executed_action_idx: int
+    # π̂(a*|o), the RBMC marginal. Reserved here; populated in Phase 4. None until then.
+    pi_hat: float | None = None
+
+
 # Orchestrator -> Packer
 class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """A single training example."""
@@ -38,6 +62,12 @@ class TrainingSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=Tr
     # in completion_top_k_token_ids[i] (substitute_sampled_into_top_k upholds
     # this). None for GRPO and PPO.
     completion_top_k_token_ids: list[list[int]] | None = None
+
+    # Action-level ARM: per-decision-point metadata. None for GRPO/PPO and for
+    # token-level ARM. When non-None, each entry's [response_start, response_end)
+    # indexes this sample's completion_ids. Built by interleave_rollout from the
+    # ALFWorld env's step extras. Kept off the wire for non-ARM by omit_defaults.
+    decision_points: list[DecisionPoint] | None = None
 
 
 class TrainingBatch(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
