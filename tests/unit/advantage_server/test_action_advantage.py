@@ -168,6 +168,69 @@ def test_q_plus_target_negative_regret_branch():
 
 
 # --------------------------------------------------------------------------- #
+# arm_phi_decay: CFR+ regret-accumulation bound (run-001 collapse fix)
+# --------------------------------------------------------------------------- #
+
+
+def test_q_plus_target_phi_decay_default_is_unbounded_behavior():
+    """Default phi_decay=1.0 is byte-identical to the pre-fix behavior (no
+    regression for any existing target)."""
+    assert q_plus_target(5.0, 2.0, 1.0) == pytest.approx(max(0.0, 5.0 - 2.0) + 1.0)
+    assert q_plus_target(5.0, 2.0, 1.0, 1.0) == q_plus_target(5.0, 2.0, 1.0)
+
+
+def test_q_plus_target_phi_decay_scales_only_clipped_regret():
+    # phi_decay multiplies the clipped regret term, NOT g_k.
+    assert q_plus_target(5.0, 2.0, 1.0, phi_decay=0.5) == pytest.approx(0.5 * 3.0 + 1.0)  # 2.5
+    # negative-regret branch: clipped to 0, so phi_decay is irrelevant -> g_k.
+    assert q_plus_target(1.0, 3.0, 0.7, phi_decay=0.5) == pytest.approx(0.7)
+
+
+def test_q_plus_target_self_feeding_diverges_at_phi_1_bounded_below_1():
+    """The exact run-001 runaway, reproduced and bounded. Self-feeding recurrence
+    q_next = phi_decay*max(0, q_prev - v) + g with constant v, g (g > v)."""
+    v, g = 0.0, 1.0  # g > v, so phi=1 grows by (g - v) = 1 every step
+    # phi_decay = 1.0 -> diverges monotonically (the collapse).
+    q = 0.0
+    seq = []
+    for _ in range(50):
+        q = q_plus_target(q, v, g, phi_decay=1.0)
+        seq.append(q)
+    assert seq[-1] > seq[-2] > seq[10]  # strictly growing
+    assert seq[-1] > 40  # ~ grows by 1/step from 0
+
+    # phi_decay = 0.9 -> contraction to the fixed point (g - phi*v)/(1 - phi) = 10.
+    q = 0.0
+    for _ in range(500):
+        q = q_plus_target(q, v, g, phi_decay=0.9)
+    assert q == pytest.approx(g / (1 - 0.9), abs=1e-3)  # 10.0
+
+
+def test_action_advantage_fn_threads_phi_decay():
+    """phi_decay set on ActionAdvantageInputs reaches q_plus_target_out."""
+    inp = ActionAdvantageInputs(
+        q_plus=[[5.0, 3.0]],
+        v=[2.0],
+        executed_idx=[0],
+        pi_hat_star=[0.5],
+        rewards=[1.0],
+        v_target=[0.0],
+        gamma=1.0,
+        n_step=10,  # MC -> g_0 = terminal reward 1.0
+        phi_decay=0.5,
+    )
+    out = action_advantage_fn(inp)
+    # g_0 = 1.0; q+*-v = 5-2 = 3; target = 0.5*3 + 1 = 2.5
+    assert out.q_plus_target_out[0] == pytest.approx(2.5)
+    # default (phi_decay=1.0) would be 3 + 1 = 4.0
+    inp_default = ActionAdvantageInputs(
+        q_plus=[[5.0, 3.0]], v=[2.0], executed_idx=[0], pi_hat_star=[0.5],
+        rewards=[1.0], v_target=[0.0], gamma=1.0, n_step=10,
+    )
+    assert action_advantage_fn(inp_default).q_plus_target_out[0] == pytest.approx(4.0)
+
+
+# --------------------------------------------------------------------------- #
 # dataclasses
 # --------------------------------------------------------------------------- #
 

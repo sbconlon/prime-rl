@@ -269,6 +269,7 @@ def compute_advantages_and_targets_arm_action(
     *,
     gamma: float = 1.0,
     n_step: int = 1,
+    arm_phi_decay: float = 1.0,
 ) -> list[tuple[TrainingSample, AdvantageTrainingSample]]:
     """Action-level ARM: A(a*) = log pi_RM(a*|o) - log pi_hat(a*|o) per decision
     point, plus the action-level V/Q+ regression targets. Same four-step skeleton
@@ -319,6 +320,7 @@ def compute_advantages_and_targets_arm_action(
         v_target=[r["v_target"] for r in records],
         gamma=gamma,
         n_step=n_step,
+        phi_decay=arm_phi_decay,
     )
     _log_q_plus_distribution_action(records)
     out = action_advantage_fn(inputs)

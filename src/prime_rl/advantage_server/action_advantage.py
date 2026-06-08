@@ -103,16 +103,25 @@ def v_target_from_return(g_k: float) -> float:
     return g_k
 
 
-def q_plus_target(q_plus_star: float, v: float, g_k: float) -> float:
-    """Q+ regression target: max(0, q_plus_star - v) + g_k.
+def q_plus_target(q_plus_star: float, v: float, g_k: float, phi_decay: float = 1.0) -> float:
+    """Q+ regression target: phi_decay * max(0, q_plus_star - v) + g_k.
 
     The CFR+ accumulation's 'previous weights' are supplied implicitly by
     pipeline lag (the AdvServer's forward lags the trainer's update), so
     q_plus_star / v here are the AdvServer's current forward -- no separate
     prev-weight inputs. max(0, q+_star - v) is the carried-forward clipped
     regret; g_k is the fresh n-step return.
+
+    phi_decay (arm_phi_decay) bounds the regret accumulation: the self-feeding
+    recurrence q_next = phi_decay * max(0, q_prev - v) + g is a contraction for
+    phi_decay < 1 (bounded fixed point (g - phi_decay*v)/(1 - phi_decay)), but at
+    phi_decay = 1 with gamma=1 and g > v it grows by (g - v) every step and the
+    target diverges -- the run-001 collapse (q_tgt_abs 0.30 -> 1.37, advantages
+    spiking, discrimination cratering). Mirrors the token-level convention
+    (per_token_advantage: phi = arm_phi_decay * clamp(q+ - v, min=0)). phi_decay=1.0
+    is the previous (unbounded) behavior.
     """
-    return max(0.0, q_plus_star - v) + g_k
+    return phi_decay * max(0.0, q_plus_star - v) + g_k
 
 
 @dataclass
@@ -131,6 +140,7 @@ class ActionAdvantageInputs:
     v_target: list[float]  # V_target(o_k) for bootstrapping g_k
     gamma: float = 1.0
     n_step: int = 1  # tunable; default a placeholder, set in config (DQ2.3)
+    phi_decay: float = 1.0  # arm_phi_decay: CFR+ regret-accumulation decay (<1 bounds it)
 
     def __post_init__(self) -> None:
         k = len(self.q_plus)
@@ -179,7 +189,9 @@ def action_advantage_fn(inputs: ActionAdvantageInputs) -> ActionAdvantageOutputs
         rm = pi_rm(inputs.q_plus[k], inputs.v[k])
         advantage.append(action_advantage(rm[e], inputs.pi_hat_star[k]))
         v_target_out.append(v_target_from_return(g[k]))
-        q_plus_target_out.append(q_plus_target(inputs.q_plus[k][e], inputs.v[k], g[k]))
+        q_plus_target_out.append(
+            q_plus_target(inputs.q_plus[k][e], inputs.v[k], g[k], inputs.phi_decay)
+        )
     return ActionAdvantageOutputs(
         advantage=advantage,
         v_target_out=v_target_out,

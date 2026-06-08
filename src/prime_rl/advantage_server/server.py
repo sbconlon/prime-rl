@@ -63,6 +63,9 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
     app.state.gamma = config.gamma
     app.state.lam = config.lam
     app.state.n_step = config.n_step
+    # CFR+ regret-accumulation decay for action-level ARM q_plus_target. <1 bounds
+    # the regret accumulation (the run-001 collapse was effective phi_decay=1.0).
+    app.state.arm_phi_decay = config.arm_phi_decay
     # Tracks how many weight broadcasts the AdvServer has received from the
     # AdvTrainer. Initialized to 0 (= initial zero-init backbone, no broadcast
     # yet). Incremented by /update_weights AFTER the state dict is loaded.
@@ -164,6 +167,7 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
                     kwargs["lam"] = app.state.lam
                 else:
                     kwargs["n_step"] = app.state.n_step
+                    kwargs["arm_phi_decay"] = app.state.arm_phi_decay
                 return compute_advantages_and_targets(
                     samples=decoded.samples,
                     episodic_reward=decoded.episodic_reward,
