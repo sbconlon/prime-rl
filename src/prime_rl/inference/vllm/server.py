@@ -145,6 +145,7 @@ from prime_rl.inference.patches import (
 from prime_rl.inference.vllm.serving_chat_with_tokens import (
     ChatCompletionRequestWithTokens,
     OpenAIServingChatWithTokens,
+    ScoreRequest,
 )
 
 # NOTE: Fix harmony stop token propagation for GPT-OSS models (vLLM 0.17.0 bug)
@@ -269,6 +270,34 @@ async def _chat_with_tokens(request: ChatCompletionRequestWithTokens, raw_reques
         return JSONResponse(content=generator.model_dump())
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.post(
+    "/v1/score",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"model": None},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
+    },
+)
+@with_cancellation
+@load_aware_call
+async def _score(request: ScoreRequest, raw_request: Request):
+    """Action-level ARM pi_hat scoring: teacher-force-score token-id prompts and
+    return only each prompt's summed action-span logprob (tiny payload vs the full
+    per-position prompt_logprobs the env would otherwise pull over /v1/completions).
+    """
+    handler = chat_with_tokens(raw_request)
+    if handler is None:
+        return base(raw_request).create_error_response(message="The model does not support scoring")
+    try:
+        result = await handler.create_score(request, raw_request)
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+    if isinstance(result, ErrorResponse):
+        return JSONResponse(content=result.model_dump(), status_code=result.error.code)
+    return JSONResponse(content=result)
 
 
 async def custom_init_app_state(
