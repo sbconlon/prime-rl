@@ -136,6 +136,17 @@ class AdvantageServerConfig(BaseConfig):
         ),
     ] = "regret_matching"
 
+    warm_start_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Path to a Phase-3 value_state.pt to load at startup so step-0 "
+                "targets use warm V/Q+. MUST match the Advantage Trainer's "
+                "warm_start_path (both-warm invariant). None = zero-init cold start."
+            ),
+        ),
+    ] = None
+
 
 class AdvantageServerClientConfig(BaseConfig):
     """Orchestrator-side configuration for reaching the Advantage Server.

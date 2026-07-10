@@ -31,6 +31,7 @@ from fastapi import FastAPI, Request, Response
 from transformers import AutoModel
 
 from prime_rl.advantage_server.compute import compute_advantages_and_targets
+from prime_rl.advantage_trainer.ckpt import load_warm_start
 from prime_rl.advantage_server._prof import (
     new_request_id,
     prof,
@@ -97,6 +98,12 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
             base, lora_config=cfg.lora, polyak_tau=cfg.polyak_tau
         )
         backbone = backbone.to(device=device, dtype=dtype)
+        if cfg.warm_start_path:
+            load_warm_start(backbone, cfg.warm_start_path)
+            _LOGGER.info(
+                "Advantage Server: loaded warm-start value weights from %s",
+                cfg.warm_start_path,
+            )
         backbone.eval()
         app.state.backbone = backbone
         # Action-level ARM tokenizer (best-effort). PPO / token-level runs don't

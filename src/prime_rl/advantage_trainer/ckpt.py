@@ -224,3 +224,26 @@ def setup_advantage_ckpt_manager(
         return None
     base_dir = ckpt_config.output_dir or output_dir
     return AdvantageCheckpointManager(base_dir, ckpt_config)
+
+
+def load_warm_start(backbone: nn.Module, path: str | Path) -> None:
+    """Load warm-start value weights (LoRA slots + value heads) from a Phase-3
+    value_state.pt into `backbone`. Unwraps the ["trainable_state_dict"] payload
+    (the AdvantageCheckpointManager format, NOT a raw state_dict), moves tensors to
+    the backbone's device+dtype, and load_state_dict(strict=False) (the frozen-base
+    keys are absent). Both the Advantage Server and Advantage Trainer call this at
+    startup so they begin RL from identical warm weights (the both-warm invariant).
+    """
+    logger = get_logger()
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    first_trainable = next(p for p in backbone.parameters() if p.requires_grad)
+    state_dict = {
+        name: t.to(device=first_trainable.device, dtype=first_trainable.dtype)
+        for name, t in payload["trainable_state_dict"].items()
+    }
+    result = backbone.load_state_dict(state_dict, strict=False)
+    if len(result.unexpected_keys) > 0:
+        logger.warning(
+            f"load_warm_start: {len(result.unexpected_keys)} unexpected keys "
+            f"(first few: {result.unexpected_keys[:3]}). Continuing."
+        )

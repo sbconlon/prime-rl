@@ -246,6 +246,17 @@ class AdvantageTrainerConfig(BaseConfig):
         Field(description="Base URL of the Advantage Server (Phase 7c weight broadcast target). None to disable broadcast."),
     ] = None
 
+    warm_start_path: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Path to a Phase-3 value_state.pt to load at startup (when not "
+                "resuming) so RL begins from warm V/Q+. MUST match the Advantage "
+                "Server's warm_start_path (both-warm invariant). None = cold start."
+            ),
+        ),
+    ] = None
+
     # Phase 7d / future: optim, scheduler, ckpt, wandb, heartbeat,
     # metrics_server. For 7c, the algorithmic-core-via-train.py uses AdamW
     # with `learning_rate` directly and stubs ckpt.
