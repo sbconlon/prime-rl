@@ -11,7 +11,6 @@ from pydantic import Field
 from prime_rl.configs.orchestrator import EnvConfig, EvalSamplingConfig
 from prime_rl.configs.shared import ClientConfig, LogConfig
 from prime_rl.orchestrator.value_networks import ValueNetworkConfig
-from prime_rl.configs.trainer import CheckpointConfig
 from prime_rl.utils.config import BaseConfig
 
 
@@ -116,10 +115,6 @@ class WarmStartTrainConfig(BaseConfig):
         Path,
         Field(description="Output dir; value_state.pt is written under checkpoints/step_0/trainer/."),
     ] = Path("outputs/value_warmstart")
-    ckpt: Annotated[
-        CheckpointConfig,
-        Field(description="Checkpoint config. Set skip_optimizer=True for a weights-only artifact."),
-    ]
     seed: Annotated[
         int,
         Field(description="Shuffle seed (offset per epoch)."),

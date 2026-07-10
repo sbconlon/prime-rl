@@ -14,7 +14,8 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 from prime_rl.advantage_trainer._prof import set_request_id
-from prime_rl.advantage_trainer.ckpt import setup_advantage_ckpt_manager
+from prime_rl.advantage_trainer.ckpt import AdvantageCheckpointManager
+from prime_rl.configs.trainer import CheckpointConfig
 from prime_rl.advantage_trainer.shared import (
     setup_value_optimizer,
     value_regression_backward,
@@ -94,9 +95,7 @@ def train(config: WarmStartTrainConfig) -> None:
     # Seed V_target = V exactly, then save the weights-only value_state.pt at step 0
     # (the RL run resumes from *its* step 0; skip_optimizer keeps it weights-only).
     backbone.polyak_update_v_target(tau=1.0)
-    ckpt_manager = setup_advantage_ckpt_manager(config.output_dir, config.ckpt)
-    if ckpt_manager is None:
-        raise ValueError("WarmStartTrainConfig.ckpt is required; it produces value_state.pt.")
+    ckpt_manager = AdvantageCheckpointManager(config.output_dir, CheckpointConfig(skip_optimizer=True))
     ckpt_manager.save(step=0, backbone=backbone, optimizer=optimizer)
     logger.success(f"Warm-start done. value_state.pt at {ckpt_manager.get_ckpt_path(0)}")
 
