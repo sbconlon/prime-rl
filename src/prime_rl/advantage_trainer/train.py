@@ -37,12 +37,12 @@ from torch import optim
 from transformers import AutoModel, AutoTokenizer
 
 from prime_rl.advantage_trainer.data import (
-    prepare_action_advantage_samples,
     prepare_advantage_sample,
     prepare_batched_advantage_samples,
 )
 from prime_rl.advantage_trainer._prof import prof, set_request_id
-from prime_rl.advantage_trainer.ckpt import setup_advantage_ckpt_manager
+from prime_rl.advantage_trainer.ckpt import load_warm_start, setup_advantage_ckpt_manager
+from prime_rl.advantage_trainer.shared import setup_value_optimizer, value_regression_backward
 from prime_rl.utils.utils import resolve_latest_ckpt_step
 from prime_rl.configs.advantage_trainer import AdvantageTrainerConfig
 from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
@@ -417,37 +417,12 @@ def _train_step_action(
 
             for chunk_start in range(0, mb_size_actual, inner_batch_size):
                 chunk = mb[chunk_start : chunk_start + inner_batch_size]
-                K = len(chunk)
-                with prof("advtrainer.prepare_batch_action", K=K):
-                    prep = prepare_action_advantage_samples(chunk, tokenizer, device=device)
-                chunk_scale = float(K) / float(mb_size_actual)
-                D = int(prep.dp_sample_idx.numel())
-                if D == 0:
-                    continue
-
-                # --- V leg (batched all-positions forward, gather at boundaries) ---
-                with prof("advtrainer.forward.v_action", sync_cuda=True):
-                    v_all, _ = backbone.forward_v_all_positions(prep.trajectory_input_ids)
-                v_pred = v_all[prep.dp_sample_idx, prep.dp_v_pos]
-                l_v = (prep.weights * (v_pred - prep.v_targets) ** 2).sum()
-                with prof("advtrainer.backward.v_action", sync_cuda=True):
-                    (l_v * chunk_scale).backward()
-                mb_l_v += float(l_v.detach().item()) * chunk_scale
-                del v_all, v_pred, l_v
-
-                # --- Q+ leg: per decision point (right-padded obs would break the
-                # append-and-read cat); per-dp backward keeps peak memory to one
-                # Q+ graph. Batching is Phase 8. ---
-                l_q_value = 0.0
-                for d in range(D):
-                    o_ids = torch.tensor([prep.q_plus_obs_ids[d]], dtype=torch.long, device=device)
-                    a_ids = torch.tensor([prep.q_plus_action_ids[d]], dtype=torch.long, device=device)
-                    q_pred = backbone.forward_q_plus_action(o_ids, a_ids)[0]
-                    w = float(prep.weights[d].item())
-                    sq = (q_pred - prep.q_plus_targets[d]) ** 2
-                    (sq * (w * chunk_scale)).backward()
-                    l_q_value += float(sq.detach().item()) * w * chunk_scale
-                mb_l_q += l_q_value
+                chunk_scale = float(len(chunk)) / float(mb_size_actual)
+                l_v_contrib, l_q_contrib = value_regression_backward(
+                    backbone, chunk, tokenizer, chunk_scale, device
+                )
+                mb_l_v += l_v_contrib
+                mb_l_q += l_q_contrib
 
             optimizer.step()
             n_inner_steps += 1
@@ -529,59 +504,11 @@ def train(config: AdvantageTrainerConfig) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Could not load tokenizer for action-level ARM: {exc}")
 
-    # Phase 10 LR decoupling: split trainable params into V / Q+ / V_target
-    # groups so the optimizer can apply per-slot learning rates. V_target
-    # params get gradient = 0 (no loss flows through them) and are
-    # overwritten by polyak_update_v_target after optimizer.step, so
-    # putting them in an lr=0 group is just explicit + defensive.
-    v_params: list = []
-    q_plus_params: list = []
-    v_target_params: list = []
-    other_trainable: list[tuple[str, "torch.nn.Parameter"]] = []
-    for name, p_ in backbone.named_parameters():
-        if not p_.requires_grad:
-            continue
-        if name.endswith(".lora_A.0") or name.endswith(".lora_B.0") or (
-            "v_head" in name and "v_target_head" not in name
-        ):
-            v_params.append(p_)
-        elif name.endswith(".lora_A.1") or name.endswith(".lora_B.1") or "q_plus_head" in name:
-            q_plus_params.append(p_)
-        elif name.endswith(".lora_A.2") or name.endswith(".lora_B.2") or "v_target_head" in name:
-            v_target_params.append(p_)
-        else:
-            other_trainable.append((name, p_))
-
-    if other_trainable:
-        logger.warning(
-            f"AdvTrainer found {len(other_trainable)} trainable params outside the "
-            f"V/Q+/V_target partition; assigning them to the V group as a "
-            f"conservative default. First few names: "
-            f"{[name for name, _ in other_trainable[:5]]}"
-        )
-        v_params.extend(p_ for _, p_ in other_trainable)
-
-    n_trainable = sum(p_.numel() for p_ in v_params + q_plus_params + v_target_params)
-    logger.info(
-        f"Trainable parameters: {n_trainable:,} "
-        f"(V={sum(p_.numel() for p_ in v_params):,}, "
-        f"Q+={sum(p_.numel() for p_ in q_plus_params):,}, "
-        f"V_target={sum(p_.numel() for p_ in v_target_params):,})"
-    )
-
     v_lr = config.v_learning_rate if config.v_learning_rate is not None else config.learning_rate
     q_plus_lr = (
         config.q_plus_learning_rate if config.q_plus_learning_rate is not None else config.learning_rate
     )
-    logger.info(f"Per-slot learning rates: V={v_lr:.2e}, Q+={q_plus_lr:.2e}, V_target=0.0")
-
-    optimizer = optim.AdamW(
-        [
-            {"params": v_params, "lr": v_lr},
-            {"params": q_plus_params, "lr": q_plus_lr},
-            {"params": v_target_params, "lr": 0.0},
-        ]
-    )
+    optimizer = setup_value_optimizer(backbone, v_lr, q_plus_lr)
 
     # Checkpoint manager. Mirrors the LLM trainer\'s setup_ckpt_managers
     # pattern: returns None when config.ckpt is None (no checkpointing
@@ -601,6 +528,10 @@ def train(config: AdvantageTrainerConfig) -> None:
             f"(loaded from {ckpt_manager.get_ckpt_path(checkpoint_step)})"
         )
         resume_start_step = loaded_step
+    elif config.warm_start_path:
+        load_warm_start(backbone, config.warm_start_path)
+        logger.info(f"Advantage Trainer: warm-starting value nets from {config.warm_start_path}")
+        resume_start_step = 0
     else:
         resume_start_step = 0
 
