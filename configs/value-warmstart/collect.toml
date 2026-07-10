@@ -1,0 +1,27 @@
+# Warm-start data generation (Phase 2). Serve the SFT policy first
+# (`uv run inference @ ...`), then: `uv run warmstart-collect @ collect.toml`.
+#
+# VERIFY against your RL run's train [env] block: env.id, args.data_path,
+# args.tokenizer_path, and the [client] base_url format (list vs str).
+
+model_name = "/home/3312841/sft/checkpoint/step_40"
+output_path = "/home/3312841/warmstart/ctx2048/warmstart.msgpack"
+rollouts_per_example = 16
+num_workers = 8
+
+[env]
+id = "alfworld"
+
+[env.args]
+data_path = "/home/3312841/.cache/alfworld/json_2.1.1"
+split = "train"
+max_context_tokens = 2048
+max_turns = 15
+num_reasoning_blocks = 1
+tokenizer_path = "/home/3312841/sft/checkpoint/step_40"
+
+[client]
+base_url = ["http://127.0.0.1:8000/v1"]
+
+[sampling]
+temperature = 1.0

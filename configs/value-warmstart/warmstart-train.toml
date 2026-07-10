@@ -1,0 +1,19 @@
+# Offline value warm-start (Phase 3): `uv run warmstart-train @ warmstart-train.toml`.
+# Regress V and Q+ on the MC-return dataset from warmstart-collect; emit value_state.pt.
+
+v_learning_rate = 1e-3
+q_plus_learning_rate = 1e-3
+max_epochs = 20
+output_dir = "/home/3312841/warmstart/ctx2048/value_nets"
+
+[model]
+base_model_name = "/home/3312841/sft/checkpoint/step_40"
+
+[data]
+path = "/home/3312841/warmstart/ctx2048/warmstart.msgpack"
+batch_size = 32
+inner_batch_size = 8
+
+[ckpt]
+# Weights-only artifact: RL loads warm weights with its own fresh Adam moments.
+skip_optimizer = true
