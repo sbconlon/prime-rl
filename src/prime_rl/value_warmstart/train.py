@@ -62,6 +62,11 @@ def train(config: WarmStartTrainConfig) -> None:
     if len(dataset) == 0:
         raise ValueError(f"Warm-start dataset at {config.data.path} is empty.")
 
+    # Save AFTER EACH EPOCH (overwriting step_0), not just at the end: over 12k+ samples
+    # this can exceed the walltime, and an end-only save is all-or-nothing (a kill loses
+    # everything). Per-epoch save keeps the latest trained net; watch the l_v/l_q plateau
+    # and scancel when converged. Create the ckpt manager up front.
+    ckpt_manager = AdvantageCheckpointManager(config.output_dir, CheckpointConfig(skip_optimizer=True))
     backbone.train()
     step = 0
     for epoch in range(config.max_epochs):
@@ -87,17 +92,14 @@ def train(config: WarmStartTrainConfig) -> None:
             epoch_l_q += b_l_q
             n_batches += 1
             step += 1
-        logger.info(
+        # Seed V_target = V exactly and save the weights-only value_state.pt at step 0
+        # (overwrites each epoch; the RL run resumes from *its* step 0).
+        backbone.polyak_update_v_target(tau=1.0)
+        ckpt_manager.save(step=0, backbone=backbone, optimizer=optimizer)
+        logger.success(
             f"epoch={epoch} l_v={epoch_l_v / n_batches:.5f} "
-            f"l_q={epoch_l_q / n_batches:.5f} steps={n_batches}"
+            f"l_q={epoch_l_q / n_batches:.5f} steps={n_batches} -> saved value_state.pt"
         )
-
-    # Seed V_target = V exactly, then save the weights-only value_state.pt at step 0
-    # (the RL run resumes from *its* step 0; skip_optimizer keeps it weights-only).
-    backbone.polyak_update_v_target(tau=1.0)
-    ckpt_manager = AdvantageCheckpointManager(config.output_dir, CheckpointConfig(skip_optimizer=True))
-    ckpt_manager.save(step=0, backbone=backbone, optimizer=optimizer)
-    logger.success(f"Warm-start done. value_state.pt at {ckpt_manager.get_ckpt_path(0)}")
 
 
 def main() -> None:

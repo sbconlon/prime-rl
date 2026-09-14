@@ -52,6 +52,32 @@ class CollectConfig(BaseConfig):
         int,
         Field(ge=1, description="Env-server workers."),
     ] = 8
+    max_concurrent: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Max rollouts in flight at once (mirrors the RL orchestrator's "
+                "max_inflight_rollouts). The old evaluate()/gather path fanned out ALL "
+                "rollouts uncapped, swamping the env's single _TW_PARSE_LOCK and making "
+                "the per-rollout timeout meaningless (it timed dispatch-queue wait, not "
+                "work). Bounding concurrency keeps the lock uncontended and the timeout real."
+            ),
+        ),
+    ] = 16
+    rollout_timeout_s: Annotated[
+        float,
+        Field(
+            gt=0.0,
+            description=(
+                "Per-rollout wall-clock timeout, measured from when the rollout ACQUIRES a "
+                "concurrency slot (real work time, since concurrency is capped). A rollout "
+                "that exceeds it -- e.g. wedged behind a held _TW_PARSE_LOCK -- is dropped "
+                "and its slot reclaimed, so the collect proceeds instead of hanging. Set "
+                "well above a healthy multi-turn episode."
+            ),
+        ),
+    ] = 600.0
     max_retries: Annotated[
         int,
         Field(ge=0, description="Per-rollout retries."),

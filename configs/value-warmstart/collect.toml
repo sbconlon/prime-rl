@@ -5,16 +5,43 @@
 # args.tokenizer_path, and the [client] base_url format (list vs str).
 
 model_name = "/home/3312841/sft/checkpoint/step_40"
-output_path = "/home/3312841/warmstart/ctx2048/warmstart.msgpack"
-rollouts_per_example = 16
-num_workers = 8
+output_path = "/home/3312841/warmstart/pps/warmstart_pps.msgpack"
+# Volume. rpe=4 (matches the RL run). num_examples CAPS the game count. NOTE: the draw is a
+# DETERMINISTIC SORTED PREFIX, not a shuffle -- collect drives env._get_eval_inputs ->
+# get_eval_dataset(seed=None) -> dataset.select(range(n)) over the lexicographically-sorted,
+# task_types-filtered game list. So it is the SAME first-500 pick_and_place_simple games every
+# run (the earlier "seed=0-shuffled, task-balanced" note was WRONG: that shuffle lands only on
+# a throwaway EnvGroup used for len()). 500 games x 4 = 2000 rollouts. The FULL dataset is 3553
+# games -> 14212 rollouts >> walltime, so cap it. Records are now written INCREMENTALLY as
+# rollouts complete, so a walltime kill keeps partial data (no longer all-or-nothing).
+rollouts_per_example = 4
+num_examples = 500
+# num_workers: env-server worker PROCESSES, each with its own _TW_PARSE_LOCK. 8 hung at INIT
+# under the OLD uncapped fan-out; the bounded driver (max_concurrent below) removes that
+# startup contention. 2 gives per-worker lock isolation so a reset wedge on one worker does not
+# block the other. Bump if env_worker_*.log [lock] lines show wedges holding on BOTH workers.
+num_workers = 2
+# Bounded, fill-as-completed driver (mirrors the RL Scheduler; replaces the old evaluate()/
+# gather). max_concurrent caps in-flight rollouts so the single per-worker parse lock is never
+# swamped (root cause of the GPU-starved hang). rollout_timeout_s drops a rollout wedged behind
+# a held lock and reclaims its slot; the timer starts AFTER a slot is acquired, so it measures
+# real work, not dispatch-queue wait (the flaw in the earlier per-group timeout).
+max_concurrent = 16
+rollout_timeout_s = 600.0
 
 [env]
-id = "alfworld"
+# FIX: verifiers registers the env as "alfworld-env" (pyproject name), and the RL run
+# uses exactly that. "alfworld" fails vf.load_environment.
+id = "alfworld-env"
 
 [env.args]
 data_path = "/home/3312841/.cache/alfworld/json_2.1.1"
 split = "train"
+# PATH C: warm-start on ONLY pick_and_place_simple (curriculum stage 0). Matches the
+# stage-0 training distribution exactly, and it's the easier type (higher solve rate,
+# shorter trajectories) -> cleaner, faster warm-start. Requires the alfworld_env
+# task_types filter (build_dataset). num_examples caps the pps game count.
+task_types = ["pick_and_place_simple"]
 max_context_tokens = 2048
 max_turns = 15
 num_reasoning_blocks = 1
@@ -24,4 +51,9 @@ tokenizer_path = "/home/3312841/sft/checkpoint/step_40"
 base_url = ["http://127.0.0.1:8000/v1"]
 
 [sampling]
-temperature = 1.0
+# Match the RL rollout sampling (combined config [orchestrator.sampling]): the value
+# nets must estimate returns under the policy RL actually rolls out (T=0.8 + min_p=0.1),
+# not a broader T=1.0 policy. T=1.0 would also depress the G1 positive-label fraction.
+temperature = 0.8
+min_p = 0.1
+max_tokens = 512
