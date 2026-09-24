@@ -1,0 +1,224 @@
+# GRPO 1.5B SHORT-CONTEXT — ALFWorld on RunPod 2× A100 80GB SXM
+# Run lineage: grpo-1.5b-sft-shortctx-run-001
+#
+# Pair to grpo-1.5b-sft-run-001 (long-context, ctx=16384). This run measures
+# the same SFT-checkpoint warmstart trained at ctx=2048 — the heavy-truncation
+# regime under which Phase 5 Run B showed SFT pass@8 collapses from 92.9% to
+# 55.0% on full valid_seen. The thesis matrix question:
+#
+#   Does GRPO at ctx=2048 lift the multi-stage place_in_recep types
+#   (where SFT collapsed) more than GRPO at ctx=16384 lifts the same types?
+#
+# Per-type prediction from [[20260429-sft-execution]] §9f: the 4 multi-stage
+# place_in_recep types (which lose 50-72 pp under SFT-with-truncation) should
+# benefit most from GRPO under truncation. The 2-stage types (pick_and_place,
+# look_at_obj) should be roughly unchanged.
+#
+# Submit on pod (after bootstrap_grpo_sft.sh + scp patched alfworld_env.py):
+#   cd /workspace/prime-rl
+#   export WANDB_API_KEY=$(cat /workspace/wandb-key.txt | tr -d '\n')
+#   export HF_HOME=/workspace/hf-cache ALFWORLD_DATA=/workspace/alfworld
+#   export TMPDIR=/workspace/tmp
+#   mkdir -p /workspace/runs/grpo-1.5b-sft-shortctx-run-001/logs
+#   /workspace/prime-rl/.venv/bin/rl @ /workspace/grpo_1.5b_sft_ctx2048_curriculum.toml \
+#     2>&1 | tee /workspace/runs/grpo-1.5b-sft-shortctx-run-001/logs/training.log
+#
+# To RESUME from latest checkpoint after a crash/pause/resume:
+#   /workspace/prime-rl/.venv/bin/rl @ /workspace/grpo_1.5b_sft_ctx2048_curriculum.toml \
+#     --ckpt.resume-step -1 \
+#     2>&1 | tee -a /workspace/runs/grpo-1.5b-sft-shortctx-run-001/logs/training.log
+#   (Note: --ckpt.resume-step -1 = "latest". prime-rl refuses to start fresh
+#    when output_dir contains checkpoints, to prevent accidental data loss.
+#    Use `tee -a` to append rather than clobber the prior training log.)
+#
+# DELTAS FROM grpo_1.5b_sft_ctx16384_curriculum.toml (the long-ctx pair):
+#
+#   1. output_dir, [wandb] name, [orchestrator.model.lora] name → grpo-1.5b-sft-shortctx-run-001
+#      → fresh lineage; pair-relationship documented in this header
+#
+#   2. [[orchestrator.env]] args.max_context_tokens = 2048 (was 16384)
+#      [[orchestrator.eval.env]] args.max_context_tokens = 2048 (was 16384)
+#      → core experimental delta. Train AND eval at the heavy-truncation regime.
+#
+#   3. [inference.model] max_model_len = 3072 (was 17408)
+#      → vLLM's max generation context. With ctx=2048 prompt + max_tokens=512
+#        completion + ~512 token slack for chat template, 3072 is sufficient.
+#        Smaller max_model_len → smaller per-request KV cache → higher
+#        concurrency budget on the 80 GB A100.
+#
+#   4. [orchestrator] max_inflight_rollouts = 24 (was 16)
+#      → A100 SXM has more compute than A40, AND smaller max_model_len means
+#        each request takes less KV cache. Conservative bump from 16 to 24
+#        (50% more concurrency). Beyond ~32 we'd risk MooseFS FUSE saturation,
+#        which historically capped throughput on the long-ctx run.
+#
+#   5. [ckpt] keep_last = 15 (was 3)
+#      → Methodology fix from [[20260505-runpod-operational-lessons]] §6.12:
+#        long-ctx run lost step_300/400 to keep_last=3 rotation, hampering
+#        thesis comparison. 15 checkpoints × ~7 GB = ~105 GB; fits the 200 GB
+#        volume comfortably. Plus periodic scp-to-laptop every 100 steps.
+#
+# UNCHANGED from long-ctx (intentional, for paired comparison):
+#   - max_steps = 500
+#   - seq_len = 17408 (throughput optimization — see analysis 2026-05-06:
+#     larger seq_len = denser bin-packing in trainer micro-batches.
+#     Per-sample cap is enforced by max_context_tokens, not seq_len.)
+#   - SFT checkpoint as starting model (clean baseline, paired)
+#   - LoRA rank=64, alpha=128, target_modules covering attention+MLP
+#   - T=0.8, min_p=0.1 (Phase 0 mitigations from divergence investigation)
+#   - eval block (T=0.0 greedy, every 100 steps, N=50) — biased toward easier
+#     types; full per-type eval at run end via Phase 3b-2
+#   - filters: gibberish + repetition with enforce=true
+#   - curriculum [100, 100, 100] — same staged rollout
+#
+# Watch for (per [[project_grpo_run_plan]] §1c kill criteria, evaluated steps 1-5):
+#   - gibberish_filter_rate < 15%  (more risk at ctx=2048 since SFT collapses
+#     more on hard types under truncation; expect higher floor)
+#   - admissible_action_rate > 60%  (lowered from 70% threshold — SFT baseline
+#     at ctx=2048 was lower than at ctx=16384)
+#   - format_compliance_rate > 90%
+#   - alfworld_reward > 15% by step 5  (lowered from 30% — SFT baseline at
+#     ctx=2048 was 26.3% pass@1)
+#   - Reward not crashing across multiple steps
+#
+# Wall time estimate: long-ctx took 100h on 2× A40. Short-ctx is ~1.3-1.5×
+# more compute (more interleave_rollout splits at each context eviction) but
+# A100 SXM is ~2-2.5× faster than A40. Net estimate: 60-75h, ~3 days, ~$220
+# at $2.98/hr. Plus operational overhead (~30%): ~95h, ~$280.
+
+max_steps = 500
+seq_len = 17408
+output_dir = "/workspace/runs/grpo-1.5b-sft-shortctx-run-001"
+
+[wandb]
+project = "grpo-1.5b-alfworld"
+name = "grpo-1.5b-sft-shortctx-run-001"
+
+[model]
+# SFT checkpoint (clean baseline — paired with long-ctx run's starting point).
+# transformers.AutoModelForCausalLM.from_pretrained() resolves the path the
+# same way as it resolves an HF Hub model name.
+name = "/workspace/sft-checkpoint"
+
+[trainer.model]
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+fused_lm_head_token_chunk_size = 1024
+
+# Activation checkpointing: still useful even on A100 80GB. Memory headroom is
+# huge but AC reduces backward-pass memory peak which improves multi-GPU
+# scheduling reliability. Keeps trainer at ~8 GiB peak (vs ~24 GiB without AC
+# at seq_len=17408 with samples that get bin-packed into the sequence).
+[trainer.model.ac]
+mode = "full"
+freq = 1
+
+[ckpt]
+interval = 10
+# keep_last = 10 fits in a 100 GB volume: each checkpoint cycle is ~7 GB
+# (4 GB trainer DCP + 3 GB weights), and ~25 GB is consumed by venv, tarballs,
+# and other non-checkpoint artifacts. 10 × 7 = 70 GB checkpoints + 25 GB other
+# = 95 GB / 100 GB. (Originally tried keep_last=15 — disk filled at step 140.
+# See [[20260505-runpod-operational-lessons]] §6.12 update.)
+keep_last = 10
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 1
+
+[trainer.optim]
+lr = 1e-5
+
+[trainer.model.lora]
+rank = 64
+alpha = 128.0
+dropout = 0.0
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+
+[orchestrator]
+batch_size = 64
+max_inflight_rollouts = 24          # Bumped from 16: A100 SXM + smaller KV per request
+rollouts_per_example = 8
+use_token_client = false
+filters = [
+  { type = "gibberish", enforce = true, token_id_threshold = 100000, logprob_offset = 2.0 },
+  { type = "repetition", enforce = true, window = 3000, prob_threshold = 0.99 },
+]
+
+[orchestrator.rollout_transport]
+type = "zmq"
+
+[trainer.rollout_transport]
+type = "zmq"
+
+[orchestrator.buffer]
+# Curriculum: 3 stages × 100 steps each, then post-curriculum (uniform +
+# online_difficulty_filtering auto-enabled). Same as long-ctx for paired
+# comparison.
+curriculum = [100, 100, 100]
+adaptive_advance_threshold = 0.30
+adaptive_window_size = 20
+online_difficulty_filtering = false  # auto-enabled by Buffer.maybe_advance_stage post-curriculum
+
+[orchestrator.sampling]
+max_tokens = 512
+temperature = 0.8
+
+[orchestrator.sampling.extra_body]
+min_p = 0.1
+
+[orchestrator.model.lora]
+name = "grpo-1.5b-sft-shortctx-run-001"
+
+[[orchestrator.env]]
+id = "alfworld-env"
+name = "alfworld-train"
+num_workers = 1
+args.data_path = "/workspace/alfworld/json_2.1.1"
+args.split = "train"
+args.max_context_tokens = 2048             # SHORT-CONTEXT delta — was 16384
+args.tokenizer_path = "/workspace/sft-checkpoint"
+
+# Per-stage task type weights — IDENTICAL to long-ctx for paired comparison.
+args.curriculum = [
+  # Stage 0 (steps 0-99): warm up on pick_and_place_simple ONLY.
+  { pick_and_place_simple = 1.0, default = 0.0 },
+
+  # Stage 1 (steps 100-199): add the 4 middle-tier place_in_recep types uniformly.
+  { pick_and_place_simple = 0.2, pick_two_obj_and_place = 0.2, pick_clean_then_place_in_recep = 0.2, pick_cool_then_place_in_recep = 0.2, pick_heat_then_place_in_recep = 0.2, default = 0.0 },
+
+  # Stage 2 (steps 200-299): introduce look_at_obj_in_light, full uniform across all 6.
+  { default = 1.0 },
+]
+
+[orchestrator.eval]
+interval = 100
+num_examples = 50
+rollouts_per_example = 1
+
+[orchestrator.eval.sampling]
+max_tokens = 512
+temperature = 0.0
+
+[[orchestrator.eval.env]]
+id = "alfworld-env"
+name = "alfworld-valid-seen"
+num_workers = 1
+args.data_path = "/workspace/alfworld/json_2.1.1"
+args.split = "valid_seen"
+args.max_context_tokens = 2048             # SHORT-CONTEXT delta — eval at training conditions
+args.tokenizer_path = "/workspace/sft-checkpoint"
+
+[inference]
+enable_lora = true
+enable_prefix_caching = true
+gpu_memory_utilization = 0.85
+
+[inference.model]
+max_model_len = 3072                       # SHORT-CONTEXT delta — was 17408. 2048+512+slack.
+
+[inference.parallel]
+tp = 1

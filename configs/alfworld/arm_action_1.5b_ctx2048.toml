@@ -1,0 +1,246 @@
+# ACTION-LEVEL ARM 1.5B — ALFWorld on Bocconi cluster (gnode02/04)
+# Run lineage: arm-action-1.5b-sft-ctx2048-run-001
+# Branch: feature/action-level-arm (prime-rl 8d4e5d35+, verifiers cb403c7+)
+#
+# Adapted from the token-level arm_1.5b_sft_ctx2048_curriculum.toml that ran
+# cleanly for 20 steps. This is the first action-level e2e (Phase 9), truncated
+# context (max_context_tokens=2048 -> sliding-window POMDP, the headline test).
+#
+# DELTAS from the token-level config (see the response that produced this file):
+#   1. num_reasoning_blocks = 4 on the TRAIN env -> enables action-level ARM
+#      (m=4 RBMC reasoning blocks per decision point, D-5). Eval stays at the
+#      default 1 (greedy single rollout, no pi_hat).
+#   2. REMOVED return_top_k_token_ids / top_k_action_set_size -- obsoleted by the
+#      admissible-action set; leaving return_top_k_token_ids=true would waste work
+#      populating unused completion_top_k_token_ids.
+#   3. REMOVED advantage_server_max_async_level -- that field is NOT on the
+#      action-level branch (the relaxed-barrier commit lives on feature/arm-ppo);
+#      leaving it in errors with extra_forbidden. Strict lockstep is the branch
+#      default; port the relaxed barrier later only if orchestrator idle shows.
+#   4. advantage_trainer.output_dir set UNDER the run dir (in a subdir to avoid the
+#      step_N/trainer/ collision with the LLM trainer) -- otherwise AdvTrainer
+#      ckpts orphan in prime-rl/outputs/advantage_trainer/.
+#   5. keep_last 1 -> 2 on both ckpt blocks (a fallback if a save crashes
+#      mid-write; ~+6.5 GB disk, within the ~20 GB headroom after cleanup).
+#
+# LAUNCH ENV (in .alfworld_env / sbatch, NOT this TOML):
+#   export UV_NO_CACHE=1          # stop the 16 GB uv-cache regrowth
+#   PRIME_RL_ADV_PROF=1           # AdvServer throughput (§5)
+#   PRIME_RL_ADVTRAINER_PROF=1    # AdvTrainer throughput
+#   (PRIME_RL_ADV_Q_PLUS_MODE unset -> auto -> kernel on the A100)
+
+max_steps = 500
+seq_len = 17408
+output_dir = "/home/3312841/runs/arm-action-1.5b-sft-ctx2048-run-001"
+
+# W&B disabled for the first run — setup_monitor builds no WandbMonitor when the
+# [wandb] block is absent, so there is no wandb.init() to hang. The wandb config's
+# shared mode (default shared=true) forces mode="shared" (a network mode that
+# ignores `offline`), which times out on the internet-less compute node after 90s.
+# To restore wandb as OFFLINE for the long run, uncomment below AND set both
+# `offline = true` and `shared = false` (shared mode overrides offline otherwise),
+# then `wandb sync <run>/wandb/offline-run-*` from slnode01. The headline
+# Q+-discrimination diagnostic is in advantage_server.stdout (ARM_DISCRIM_DIAG)
+# regardless, so no thesis-figure data is lost by running without wandb.
+# [wandb]
+# project = "arm-1.5b-alfworld"
+# name = "arm-action-1.5b-sft-ctx2048-run-001"
+# offline = true
+# shared = false
+
+[model]
+name = "/home/3312841/sft/checkpoint/step_40"
+
+[trainer.model]
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+fused_lm_head_token_chunk_size = 1024
+
+[trainer.model.ac]
+mode = "full"
+freq = 1
+
+[ckpt]
+interval = 5
+keep_last = 2
+resume_step = -1
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 1
+
+[trainer.optim]
+lr = 1e-5
+
+[trainer.model.lora]
+rank = 64
+alpha = 128.0
+dropout = 0.0
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[trainer.ckpt]
+# REVERTED to false (2026-06-11). Setting this true was the ONLY change from the
+# healthy 0-29 run, and the resume that introduced it hung hard in the post-gen
+# weight-broadcast window -- consistent with a collective-op deadlock (some ranks
+# gather master weights, some skip). The real disk fix was UV_NO_CACHE=1 (the uv
+# cache regrowth was the OOM straw), not killing the 9G weights/. So: restore the
+# known-good broadcast, keep weights bounded via keep_last=2 + UV_NO_CACHE + the GC
+# loop. Bonus: weights/ HF export resumes, so checkpoints are eval-loadable again.
+# (If disk gets tight on a long run, the lever is UV_NO_CACHE / GC, not this.)
+skip_gather_master_weights = false
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+
+[orchestrator]
+# batch_size 32->16 + rollouts_per_example 8->4: keeps 4 examples/step (diversity)
+# at half the rollouts. ARM advantage is per-decision-point, so unlike GRPO it
+# doesn't need a large within-example group -> rpe=4 is free.
+batch_size = 16
+max_inflight_rollouts = 16
+rollouts_per_example = 4
+algorithm = "arm"
+# REQUIRED for action-level: π̂ scoring uses client.token_client.post("/v1/completions",
+# prompt_logprobs=...) (alfworld_env._score_token_prompts), and that attribute exists
+# only on OpenAIChatCompletionsTokenClient (built when use_token_client=true). The
+# token-level run set this false; action-level needs the branch default (true).
+use_token_client = true
+filters = [
+  { type = "gibberish", enforce = true, token_id_threshold = 100000, logprob_offset = 2.0 },
+  { type = "repetition", enforce = true, window = 3000, prob_threshold = 0.99 },
+]
+
+[orchestrator.advantage_server]
+base_url = "http://127.0.0.1:8200"
+
+[orchestrator.buffer]
+curriculum = [100, 100, 100]
+adaptive_advance_threshold = 0.30
+adaptive_window_size = 20
+online_difficulty_filtering = false
+
+[orchestrator.sampling]
+max_tokens = 512
+temperature = 0.8
+
+[orchestrator.sampling.extra_body]
+min_p = 0.1
+
+[orchestrator.model.lora]
+name = "arm-action-1.5b-sft-ctx2048-run-001"
+
+[[orchestrator.env]]
+id = "alfworld-env"
+name = "alfworld-train"
+num_workers = 1
+args.data_path = "/home/3312841/.cache/alfworld/json_2.1.1"
+args.split = "train"
+args.max_context_tokens = 2048
+args.tokenizer_path = "/home/3312841/sft/checkpoint/step_40"
+args.max_turns = 15
+# m=2: /v1/score route (prime-rl 0bbb4caa) + m=2 stacked for the overnight run.
+# Route collapses the π̂ scoring payload/compute; m=2 halves the block count on top.
+# π̂ LOO uses m-1=1 block (noisier; D-5 anticipated). Bump back to 4 if overnight
+# throughput is comfortable.
+args.num_reasoning_blocks = 2
+# Pre-warm OFF: with the /v1/score route, generation already caches [o,R_j], so the
+# pre-warm forwards are redundant prefill (impl-agent note). Prefill is what's
+# starving generation (16k prompt-tput, 10-40 tok/s gen) — drop the redundant load.
+args.prewarm_pi_hat_prefixes = false
+
+# Per-stage task type weights — IDENTICAL to the token-level run for lineage.
+args.curriculum = [
+  { pick_and_place_simple = 1.0, default = 0.0 },
+  { pick_and_place_simple = 0.2, pick_two_obj_and_place = 0.2, pick_clean_then_place_in_recep = 0.2, pick_cool_then_place_in_recep = 0.2, pick_heat_then_place_in_recep = 0.2, default = 0.0 },
+  { default = 1.0 },
+]
+
+[orchestrator.eval]
+interval = 10
+num_examples = 50
+rollouts_per_example = 1
+
+[orchestrator.eval.sampling]
+max_tokens = 512
+temperature = 0.0
+
+[[orchestrator.eval.env]]
+id = "alfworld-env"
+name = "alfworld-valid-seen"
+num_workers = 1
+args.data_path = "/home/3312841/.cache/alfworld/json_2.1.1"
+args.split = "valid_seen"
+args.max_context_tokens = 2048
+args.tokenizer_path = "/home/3312841/sft/checkpoint/step_40"
+args.max_turns = 15
+
+[inference]
+enable_lora = true
+enable_prefix_caching = true
+# 0.85 -> 0.70: run-001 resume OOM'd the vLLM EngineCore (EngineDeadError, 14:45) in
+# the π̂ scoring path -- _get_prompt_logprobs_dict -> compute_logprobs ->
+# logits.log_softmax(float32) tried 1.71 GiB with only 1.55 GiB free (process already
+# at 37.55/39.25 GiB). prompt_logprobs materializes a FULL-vocab (151936) float32
+# log_softmax for every scored prompt position; that transient is ON TOP of the
+# weights+KV budget. Drop the budget to leave ~10 GiB of headroom for the spike. KV
+# at 1.5B / 3072 ctx is tiny, so 0.70 doesn't starve the cache.
+gpu_memory_utilization = 0.70
+
+[inference.vllm_extra]
+max_logprobs = 8
+# 16384 -> 8192. Two opposing pressures on this knob:
+#   * HIGHER fixes scheduler starvation (the m*|A| scoring-prefill flood: at the
+#     default budget vLLM ran 2-3 / waited ~300 / KV 0.4%; 16384 gave Running 14-54).
+#   * LOWER bounds the prompt_logprobs transient: a single prefill forward can batch
+#     up to max_num_batched_tokens positions, EACH doing a full-vocab float32
+#     log_softmax. At 16384 that worst case is ~10 GiB (151936*4B*16384) -> the OOM.
+# 8192 halves the worst-case transient to ~5 GiB while still admitting ~7-27 running
+# (well clear of the 2-3 starvation floor). Nudge back toward 12288 only if starvation
+# returns AND the OOM stays clear.
+max_num_batched_tokens = 8192
+
+[inference.model]
+max_model_len = 3072
+
+[inference.parallel]
+tp = 1
+
+[advantage_server]
+model_name = "/home/3312841/sft/checkpoint/step_40"
+host = "127.0.0.1"
+port = 8200
+gamma = 1.0
+# CFR+ regret decay. Run-001 collapsed at step ~12: q_tgt_abs ran away
+# 0.30->0.93->1.15->1.37 (unbounded action-level regret at gamma=1.0, no decay),
+# spiking advantages to ~8 and cratering Q+ discrimination. arm_phi_decay<1 bounds
+# the accumulation at a steady state. REQUIRES the action-level wiring fix (the
+# decay was only threaded into the dead token-level path). Drop to 0.8 if it creeps.
+arm_phi_decay = 0.9
+
+[advantage_server.lora]
+rank = 16
+alpha = 32.0
+dropout = 0.0
+
+[advantage_trainer]
+algorithm = "arm"
+max_steps = 500
+learning_rate = 5e-4
+n_epochs = 1
+minibatch_size = 32
+inner_batch_size = 2
+output_dir = "/home/3312841/runs/arm-action-1.5b-sft-ctx2048-run-001/advantage_trainer"
+
+[advantage_trainer.model]
+base_model_name = "/home/3312841/sft/checkpoint/step_40"
+polyak_tau = 0.005
+
+[advantage_trainer.model.lora]
+rank = 16
+alpha = 32.0
+dropout = 0.0
+
+[advantage_trainer.ckpt]
+interval = 5
+keep_last = 2
+resume_step = -1

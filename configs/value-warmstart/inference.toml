@@ -1,0 +1,41 @@
+# Standalone SFT serve for warmstart-collect (frozen policy on :8000).
+# = the run-001 resolved inference config (known-good). collect connects to
+# http://127.0.0.1:8000/v1 and requests the base SFT model (no adapter). The
+# filesystem weight_broadcast receiver just idles (nothing broadcasts) and does not
+# block serving -- if the inference server ever errors on startup about the broadcast
+# dir, delete the [weight_broadcast] block.
+enable_lora = true
+max_loras = 8
+max_cpu_loras = 100
+max_lora_rank = 64
+enable_prefix_caching = true
+gpu_memory_utilization = 0.7
+api_server_count = 1
+data_parallel_rpc_port = 13345
+seed = 0
+enable_expert_parallel = false
+all2all_backend = "allgather_reducescatter"
+enable_eplb = false
+use_deep_gemm = false
+enable_return_routed_experts = false
+
+[server]
+port = 8000
+
+[model]
+name = "/home/3312841/sft/checkpoint/step_40"
+trust_remote_code = false
+dtype = "auto"
+max_model_len = 3072
+enforce_eager = false
+
+[parallel]
+tp = 1
+dp = 1
+
+[weight_broadcast]
+type = "filesystem"
+
+[vllm_extra]
+max_logprobs = 8
+max_num_batched_tokens = 8192

@@ -1,0 +1,215 @@
+# GRPO 1.5B from SFT checkpoint — ALFWorld on RunPod 2× A40 80GB PCIe
+# Run lineage: grpo-1.5b-sft-run-001
+#
+# This is the FIRST GRPO run from the SFT-trained 1.5B checkpoint produced
+# in [[20260429-sft-execution]] Phase 3. Builds on the divergence-investigation
+# Phase 0 mitigations and the SFT pipeline's headline finding (pass@8=100% on
+# 3 task types, format-decay eliminated post-SFT).
+#
+# Submit on pod (after bootstrap_grpo_sft.sh + patch_orchestrator_dump.py):
+#   cd /workspace/prime-rl
+#   export WANDB_API_KEY=$(cat /workspace/wandb-key.txt | tr -d '\n')
+#   export HF_HOME=/workspace/hf-cache ALFWORLD_DATA=/workspace/alfworld
+#   mkdir -p /workspace/runs/grpo-1.5b-sft-run-001/logs
+#   uv run rl @ /workspace/grpo_1.5b_sft_ctx16384_curriculum.toml \
+#     2>&1 | tee /workspace/runs/grpo-1.5b-sft-run-001/logs/training.log
+#
+# DELTAS FROM grpo_1.5b_ctx16384_curriculum.toml (the pre-SFT baseline):
+#
+#   1. [model] name = "/workspace/sft-checkpoint" (was "Qwen/Qwen2.5-1.5B-Instruct")
+#      → uses SFT checkpoint instead of base 1.5B
+#
+#   2. [orchestrator.sampling] temperature = 0.8 (was 0.8 — UNCHANGED, but explicit)
+#      [orchestrator.sampling.extra_body] min_p = 0.1 (NEW)
+#      → divergence-investigation Phase 0 mitigation: filter tail tokens at long
+#        context to prevent autoregressive gibberish cascade.
+#
+#   3. [orchestrator] max_inflight_rollouts = 16 (NEW; default would be batch_size=64)
+#      → divergence-investigation Phase 0 mitigation: lower concurrency suppresses
+#        the small-prompt gibberish phenomenon observed at max_inflight=64.
+#
+#   4. [[orchestrator.env]] args.curriculum revised — Option A (conservative 3-stage):
+#      Stage 0: pick_and_place_simple ONLY (warm-up on strongest signal)
+#      Stage 1: + 4 middle-tier place_in_recep types
+#      Stage 2: + look_at_obj_in_light, full uniform
+#      → reflects empirical task difficulty from 7B teacher in [[20260429-sft-execution]] §5b:
+#        look_at_obj_in_light is HARDEST (23.7% 7B solve), not easiest as previously assumed.
+#
+#   5. output_dir, [wandb] name, [orchestrator.model.lora] name → grpo-1.5b-sft-run-001
+#      → fresh lineage; do not collide with pre-SFT runs.
+#
+# UNCHANGED from baseline (intentional):
+#   - max_steps = 500 (3 stages × 100 + 200 post-curriculum uniform)
+#   - seq_len = 17408
+#   - batch_size = 64, rollouts_per_example = 8
+#   - max_context_tokens = 16384 (no truncation needed at SFT-clean rollouts)
+#   - LoRA rank=64, alpha=128, target_modules covers all attention + MLP linear layers
+#   - ckpt.interval = 10 (frequent checkpoints for learning-curve plots in Phase 3)
+#   - eval block (T=0.0 greedy, every 100 steps, N=50)
+#   - filters: gibberish + repetition with enforce=true (zero out degenerate rollouts)
+#
+# Watch for (per [[project_grpo_run_plan]] §1c kill criteria, evaluated steps 1-5):
+#   - gibberish_filter_rate < 15%
+#   - admissible_action_rate > 70%
+#   - format_compliance_rate > 90% (NEW metric; requires sbconlon/verifiers post-format-metric commit)
+#   - alfworld_reward > 30% by step 5
+#   - Reward not crashing across multiple steps
+
+max_steps = 500
+seq_len = 17408
+output_dir = "/workspace/runs/grpo-1.5b-sft-run-001"
+
+[wandb]
+project = "grpo-1.5b-alfworld"
+name = "grpo-1.5b-sft-run-001"
+
+[model]
+# Path to the SFT checkpoint on the pod (set up by bootstrap_grpo_sft.sh).
+# transformers.AutoModelForCausalLM.from_pretrained() resolves the path the
+# same way as it resolves an HF Hub model name.
+name = "/workspace/sft-checkpoint"
+
+[trainer.model]
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+fused_lm_head_token_chunk_size = 1024
+
+# Activation checkpointing: required for 1.5B + LoRA + seq_len=17408 on A40 (48GB).
+# Without this, the LoRA-wrapped MLP gate_proj activation [batch=1, seq=17381, ffn=8960]
+# at bf16 = ~311 MB per layer × 28 layers = ~8.7 GB just for FFN intermediate activations,
+# pushing peak memory past A40's ~44 GB usable. Pod #1 baseline (Apr 2026) used
+# mode="full", freq=1 successfully on a 40 GB MIG slice; same setting works here.
+# Costs ~30% recompute on backward pass.
+[trainer.model.ac]
+mode = "full"
+freq = 1
+
+[ckpt]
+interval = 10
+keep_last = 3
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 1
+
+[trainer.optim]
+lr = 1e-5
+
+[trainer.model.lora]
+rank = 64
+alpha = 128.0
+dropout = 0.0
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+
+[orchestrator]
+batch_size = 64
+max_inflight_rollouts = 16          # NEW: divergence-investigation Phase 0 mitigation
+rollouts_per_example = 8
+use_token_client = false
+filters = [
+  { type = "gibberish", enforce = true, token_id_threshold = 100000, logprob_offset = 2.0 },
+  { type = "repetition", enforce = true, window = 3000, prob_threshold = 0.99 },
+]
+
+[orchestrator.rollout_transport]
+type = "zmq"
+
+[trainer.rollout_transport]
+type = "zmq"
+
+[orchestrator.buffer]
+# Curriculum: 3 stages × 100 steps each, then post-curriculum (uniform +
+# online_difficulty_filtering auto-enabled).
+curriculum = [100, 100, 100]
+adaptive_advance_threshold = 0.30
+adaptive_window_size = 20
+online_difficulty_filtering = false  # auto-enabled by Buffer.maybe_advance_stage post-curriculum
+
+[orchestrator.sampling]
+max_tokens = 512
+temperature = 0.8
+
+[orchestrator.sampling.extra_body]
+# Divergence-investigation Phase 0 mitigation: prevent tail-token sampling at
+# long context. Without min_p=0.1, the model occasionally samples low-prob
+# tokens (CJK / special-char) at >10k token contexts, biasing subsequent
+# tokens into autoregressive gibberish cascade. See
+# [[20260427-eval-training-divergence-investigation]] §4 for the empirical
+# gradient (0.4% gibberish at <1k tokens → 50% at >10k tokens).
+min_p = 0.1
+
+[orchestrator.model.lora]
+name = "grpo-1.5b-sft-run-001"
+
+[[orchestrator.env]]
+id = "alfworld-env"
+name = "alfworld-train"
+num_workers = 1
+args.data_path = "/workspace/alfworld/json_2.1.1"
+args.split = "train"
+args.max_context_tokens = 16384
+# REQUIRED for LoRA + resume: state["model"] is the LoRA adapter name post-resume
+# (vLLM advertises the adapter NAME, not a path). Override with the base model
+# path explicitly. Tokenization is LoRA-invariant. See verifiers fork
+# alfworld_env.py:_count_tokens docstring.
+args.tokenizer_path = "/workspace/sft-checkpoint"
+
+# Per-stage task type weights (REVISED from [[20260424-curriculum-design]]).
+# Empirical task difficulty (per 7B teacher solve rates in [[20260429-sft-execution]] §5b):
+#   pick_and_place_simple        78.7% (easiest)
+#   pick_two_obj_and_place       32.3%
+#   pick_clean_then_place_in_recep 31.5%
+#   pick_cool_then_place_in_recep  32.3%
+#   pick_heat_then_place_in_recep  33.6%
+#   look_at_obj_in_light         23.7% (HARDEST — was wrongly placed in stage 0 in the original design)
+args.curriculum = [
+  # Stage 0 (steps 0-99): warm up on pick_and_place_simple ONLY.
+  # SFT model is over-trained on this type (~46% of SFT data, 87.5% pass@1 in Phase 4 Run A).
+  # Confirms GRPO can build on the strongest signal before adding harder types.
+  { pick_and_place_simple = 1.0, default = 0.0 },
+
+  # Stage 1 (steps 100-199): add the 4 middle-tier place_in_recep types uniformly.
+  # All have 31-34% 7B solve rate and moderate SFT exposure (~10-17% of data each).
+  # look_at_obj_in_light is held back to stage 2 (hardest + under-represented in SFT).
+  { pick_and_place_simple = 0.2, pick_two_obj_and_place = 0.2, pick_clean_then_place_in_recep = 0.2, pick_cool_then_place_in_recep = 0.2, pick_heat_then_place_in_recep = 0.2, default = 0.0 },
+
+  # Stage 2 (steps 200-299): introduce look_at_obj_in_light, full uniform across all 6.
+  { default = 1.0 },
+]
+
+[orchestrator.eval]
+interval = 100
+num_examples = 50
+rollouts_per_example = 1
+
+[orchestrator.eval.sampling]
+# Eval at T=0.0 greedy (deterministic, fast). The SFT model is task-engaged at
+# this regime (Phase 4 Run A: pass@1=79.2%, format compliance 100%).
+max_tokens = 512
+temperature = 0.0
+
+[[orchestrator.eval.env]]
+id = "alfworld-env"
+name = "alfworld-valid-seen"
+num_workers = 1
+args.data_path = "/workspace/alfworld/json_2.1.1"
+args.split = "valid_seen"
+args.max_context_tokens = 16384
+# Same tokenizer_path override as the train env above. Required for LoRA + resume.
+args.tokenizer_path = "/workspace/sft-checkpoint"
+# No args.curriculum on eval — eval samples uniformly across the valid_seen
+# split for benchmark validity (not curriculum-filtered).
+
+[inference]
+enable_lora = true
+enable_prefix_caching = true
+gpu_memory_utilization = 0.85
+
+[inference.model]
+max_model_len = 17408
+
+[inference.parallel]
+tp = 1
