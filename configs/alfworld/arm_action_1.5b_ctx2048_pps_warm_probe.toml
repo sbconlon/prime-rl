@@ -16,6 +16,11 @@
 # the action string under each sampled block (mean over blocks), so A(a*) carries the extra term
 # -log(admissible mass). The probe records exp(Z) per block, and the round metric
 # probe/admissible_mass_mean reports it, so the size of the dropped normalizer is measured directly.
+# NOTE (2026-11-07, two-slice layout): the stud QOS now grants gres/gpu=2 per user (was 4), so the
+# sbatch requests 2 MIG slices and sets PRIME_RL_PHYSICAL_GPU_IDS=0,1,0,1: inference + Advantage
+# Server share slice 0, trainer + Advantage Trainer share slice 1. vLLM's gpu_memory_utilization
+# is lowered to 0.45 (warm-002 used 0.70 = 28 GB of a 40 GB slice, 22.7 GB of KV cache for 851k
+# tokens it never needed) to leave the Advantage Server's backbone + Q+ forwards room on slice 0.
 
 max_steps = 500
 seq_len = 17408
@@ -147,7 +152,8 @@ args.pi_hat_renorm = false
 [inference]
 enable_lora = true
 enable_prefix_caching = true
-gpu_memory_utilization = 0.70
+# 0.70 on a dedicated slice (warm-002); 0.45 when sharing the slice with the Advantage Server.
+gpu_memory_utilization = 0.45
 
 [inference.vllm_extra]
 max_logprobs = 8

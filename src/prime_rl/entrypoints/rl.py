@@ -33,7 +33,27 @@ ADVANTAGE_TRAINER_TOML = "advantage_trainer.toml"
 
 
 def get_physical_gpu_ids() -> list[int]:
-    """Return physical GPU IDs visible to the launcher."""
+    """Return physical GPU IDs visible to the launcher.
+
+    ``PRIME_RL_PHYSICAL_GPU_IDS`` (comma-separated, duplicates allowed) overrides
+    discovery and lets several subprocesses share one physical GPU / MIG slice:
+    e.g. ``0,1,0,1`` puts inference + Advantage Server on slice 0 and the trainer
+    + Advantage Trainer on slice 1 when the QOS grants only two slices (Bocconi
+    stud QOS, 2026-11-07). Local ids are assigned in launcher order (inference,
+    trainer, teacher, Advantage Server, Advantage Trainer). CUDA_VISIBLE_DEVICES
+    itself is left untouched for the processes that inherit it. Without the
+    override: CUDA_VISIBLE_DEVICES, else every NVML device.
+    """
+    override = os.environ.get("PRIME_RL_PHYSICAL_GPU_IDS")
+    if override is not None and override.strip():
+        ids = [int(token.strip()) for token in override.split(",") if token.strip()]
+        if len(set(ids)) < len(ids):
+            print(
+                f"PRIME_RL_PHYSICAL_GPU_IDS={override!r}: subprocesses will share GPU(s) "
+                f"{sorted(i for i in set(ids) if ids.count(i) > 1)}; make sure their memory fits.",
+                flush=True,
+            )
+        return ids
     raw_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if raw_visible is None:
         pynvml.nvmlInit()
