@@ -438,6 +438,92 @@ class EvalConfig(BaseConfig):
             raise ValueError(f"Duplicate eval environment names: {set(duplicates)}. Each env must have a unique name.")
         return self
 
+class ProbeSamplingConfig(EvalSamplingConfig):
+    """Sampling for the probe's *executed* response (training-probe plan, D-4).
+
+    Defaults to greedy (temperature 0.0) so a probe game's trajectory is
+    deterministic and comparable across probe rounds, mirroring the eval setup.
+    The m sampled reasoning blocks used for the pi_hat estimate are configured
+    on the probe env itself (args.probe_block_temperature / probe_block_min_p),
+    not here.
+    """
+
+    temperature: Annotated[
+        float | None,
+        Field(
+            ge=0,
+            description="Temperature for the executed response. Default 0.0 (greedy).",
+        ),
+    ] = 0.0
+
+
+class ProbeEnvConfig(EnvConfig):
+    """The probe environment (training-probe plan, Phase 0).
+
+    Same shape as a training/eval env. The game list is fixed by
+    `args.probe_set` (a frozen, versioned set shipped with the ALFWorld env
+    package), so there is no num_examples. The env is loaded in-process by the
+    orchestrator (no env server); `num_workers` / `address` are ignored.
+    """
+
+
+class ProbeConfig(BaseConfig):
+    """Configures the training-time probe (training-probe plan).
+
+    A third sibling of `eval` / `val`: every `interval` policy checkpoint steps
+    the orchestrator replays the probe set against the live policy, calls the
+    Advantage Server with diagnostics, and writes one JSON record per rollout
+    under `<output_dir>/<output_subdir>/ckpt_<step>/`. For ALFWorld the probe
+    replaces the online eval (D-2); it emits the same `eval/<env_name>/...`
+    metrics when `emit_eval_metrics` is set.
+    """
+
+    env: ProbeEnvConfig = Field(description="The probe environment; args.probe_set selects the game list.")
+    sampling: ProbeSamplingConfig = Field(
+        default_factory=ProbeSamplingConfig,
+        description="Sampling for the executed response (default greedy).",
+    )
+
+    interval: Annotated[
+        int,
+        Field(ge=1, description="Interval, in policy checkpoint steps, at which to run a probe round."),
+    ] = 10
+
+    probe_base_model: Annotated[
+        bool,
+        Field(description="Whether to run a probe round at checkpoint step 0 (the base/SFT policy)."),
+    ] = True
+
+    skip_probe_on_resume: Annotated[
+        bool,
+        Field(
+            description=(
+                "If True and resuming the orchestrator from a checkpoint, skip the (potentially redundant) "
+                "probe round that would otherwise run immediately at the resumed checkpoint step."
+            )
+        ),
+    ] = True
+
+    output_subdir: Annotated[
+        str,
+        Field(description="Subdirectory of the run's output_dir that receives probe records."),
+    ] = "probes"
+
+    max_retries: Annotated[
+        int,
+        Field(ge=0, description="Number of times to retry a failed probe rollout."),
+    ] = 0
+
+    emit_eval_metrics: Annotated[
+        bool,
+        Field(
+            description=(
+                "Emit eval/<env_name>/... metrics (avg@1 overall and by split / task type / role) from each "
+                "probe round. The probe replaces the online eval for ALFWorld (training-probe D-2)."
+            )
+        ),
+    ] = True
+
 
 class CheckpointConfig(BaseConfig):
     """Configures checkpointing the orchestrator."""
@@ -817,6 +903,10 @@ class OrchestratorConfig(BaseConfig):
     # The evaluation configuration
     eval: EvalConfig | None = None
 
+    # The training-time probe configuration (training-probe plan). A third
+    # sibling of eval/val; None (default) disables the probe block entirely.
+    probe: ProbeConfig | None = None
+
     # Data buffer configuration
     buffer: BufferConfig = BufferConfig()
 
@@ -1122,13 +1212,41 @@ class OrchestratorConfig(BaseConfig):
             self.max_steps = 4  # Run for 1 warmup step + 3 evaluation steps
             self.max_async_level = int(1e9)  # Never wait for RL weight checkpoints
 
-            # Disable evaluation
+            # Disable evaluation and the probe
             self.eval = None
+            self.probe = None
             if self.wandb:
                 self.wandb.log_extras = None
             if self.prime_monitor:
                 self.prime_monitor.log_extras = None
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_probe_config(self):
+        """training-probe Phase 0: a configured probe must be able to capture.
+
+        The probe env must run m >= 2 reasoning blocks (the pi_hat matrix needs
+        them) and must be constructed in capture mode, or every record would be
+        empty. Its name must not collide with an eval env (metric namespace).
+        """
+        if self.probe is None:
+            return self
+        args = self.probe.env.args
+        m = args.get("num_reasoning_blocks", 1)
+        if not isinstance(m, int) or isinstance(m, bool) or m < 2:
+            raise ValueError(
+                f"probe.env.args.num_reasoning_blocks must be an int >= 2 for the probe (got {m!r})"
+            )
+        if args.get("probe_capture") is not True:
+            raise ValueError("probe.env.args.probe_capture must be true for the probe env")
+        if self.eval is not None:
+            eval_names = {env.resolved_name for env in self.eval.env}
+            if self.probe.env.resolved_name in eval_names:
+                raise ValueError(
+                    f"Probe env name {self.probe.env.resolved_name!r} collides with an eval env name; "
+                    "give the probe env a distinct name."
+                )
         return self
 
     @model_validator(mode="after")

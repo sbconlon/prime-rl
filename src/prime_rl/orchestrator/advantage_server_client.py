@@ -39,6 +39,13 @@ class ComputeAdvantagesRequest(msgspec.Struct, array_like=True, gc=False, omit_d
     episodic_reward: float
     is_terminal: bool
     algorithm: Literal["ppo", "arm"]
+    # training-probe (Phase 0, D-8): when True the server additionally returns
+    # per-decision-point value diagnostics (see DecisionPointDiagnostics) and
+    # its current weight_step. Trailing defaulted field: pre-probe 4-element
+    # request arrays still decode (the flag defaults False); the training path
+    # now encodes the same array plus one trailing False. Client and server
+    # ship from the same checkout, so no mixed-version pairing occurs.
+    return_diagnostics: bool = False
 
 
 class PairedSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
@@ -49,11 +56,38 @@ class PairedSample(msgspec.Struct, array_like=True, gc=False, omit_defaults=True
     advantage_sample: AdvantageTrainingSample
 
 
+class DecisionPointDiagnostics(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
+    """Value-side vectors for one decision point (training-probe, D-8).
+
+    Returned only when ComputeAdvantagesRequest.return_diagnostics is True, in
+    decision-point order across the request's samples (the same order the
+    server's per-decision-point records use). Vectors are indexed by the owning
+    DecisionPoint.admissible_actions. The server knows only pi_hat(a*), so the
+    per-action advantage over the admissible set is assembled on the
+    orchestrator side from `pi_rm` and the env's pi_hat marginal; `adv_star` is
+    the server's own A(a*) for cross-checking.
+    """
+
+    sample_idx: int
+    response_start: int
+    q_plus: list[float]
+    v: float
+    v_target: float
+    pi_rm: list[float]
+    adv_star: float
+    g_k: float
+    q_plus_target_star: float
+
+
 class ComputeAdvantagesResponse(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
     """Response body. `paired_samples` is in matching order with the request's
     `samples`; one entry per input sample."""
 
     paired_samples: list[PairedSample]
+    # training-probe (Phase 0, D-8): populated only when the request set
+    # return_diagnostics. None otherwise, and omitted from the wire.
+    diagnostics: list[DecisionPointDiagnostics] | None = None
+    weight_step: int | None = None
 
 
 # ---------------------------------------------------------------------------
