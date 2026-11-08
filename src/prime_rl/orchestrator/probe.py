@@ -236,6 +236,9 @@ def assemble_probe_rollout(
                 "observation": observation,
                 "window": dict(probe.get("window") or {"labels": [], "token_count": None, "evictions_so_far": 0}),
                 "admissible": admissible,
+                # raw admissible count from the env (None for records written before it existed);
+                # admissible[n_admissible:] is the appended, inadmissible executed action
+                "n_admissible": (int(probe["n_admissible"]) if probe.get("n_admissible") is not None else None),
                 "executed": {
                     "text": admissible[e],
                     "idx": e,
