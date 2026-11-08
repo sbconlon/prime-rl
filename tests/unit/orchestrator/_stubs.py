@@ -9,6 +9,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from prime_rl.advantage_server.action_advantage import action_advantage
+from prime_rl.orchestrator.advantage_server_client import (
+    DecisionPointDiagnostics,
+    DiagnosticsResult,
+)
 from prime_rl.transport.types import AdvantageTrainingSample, TrainingSample
 
 
@@ -114,8 +119,12 @@ class FakeAdvantageServer:
             Any | None
         ) = None,  # callable: (samples, ep_reward, is_terminal, algorithm) -> list[(TrainingSample, AdvantageTrainingSample)]
         initial_weight_step: int = 0,
+        diagnostics_factory: (
+            Any | None
+        ) = None,  # callable: (samples, ep_reward, is_terminal, algorithm) -> list[DecisionPointDiagnostics]
     ):
         self._output_factory = output_factory
+        self._diagnostics_factory = diagnostics_factory
         self.calls: list[dict[str, Any]] = []
         # AdvTrainer broadcast counter. Tests advance this manually to
         # simulate AdvTrainer broadcasts; the orchestrator's
@@ -155,6 +164,30 @@ class FakeAdvantageServer:
         # Default: zeros at every position; mirrors the iteration-0 regime
         # produced by ValueNetworkBackbone with zero-init adapters/heads.
         return [_zero_paired_for_sample(s, algorithm) for s in samples]
+
+    async def compute_with_diagnostics(
+        self,
+        samples: list[TrainingSample],
+        episodic_reward: float,
+        is_terminal: bool,
+        algorithm: Literal["ppo", "arm"],
+    ) -> DiagnosticsResult:
+        """training-probe (Phase 2): paired outputs as compute_advantages_and_targets
+        plus iteration-0 diagnostics -- one record per DecisionPoint across the
+        samples (zero Q+/V/targets, uniform pi_RM, adv_star = log(1/|A|) - log pi_hat
+        with the 1e-6 floor, 0.0 when pi_hat is None) -- and the fake's current
+        weight_step. Records the call with ``return_diagnostics=True``."""
+        paired = await self.compute_advantages_and_targets(
+            samples, episodic_reward, is_terminal, algorithm
+        )
+        self.calls[-1]["return_diagnostics"] = True
+        if self._diagnostics_factory is not None:
+            diagnostics = self._diagnostics_factory(samples, episodic_reward, is_terminal, algorithm)
+        else:
+            diagnostics = _zero_diagnostics_for_samples(samples) if algorithm == "arm" else []
+        return DiagnosticsResult(
+            paired=paired, diagnostics=diagnostics, weight_step=self.weight_step
+        )
 
     async def aclose(self) -> None:
         pass
@@ -224,3 +257,32 @@ def _zero_paired_for_sample(
         q_plus_targets=list(zero_per_token) if algorithm == "arm" else None,
     )
     return new_llm_sample, adv_sample
+
+
+def _zero_diagnostics_for_samples(samples: list[TrainingSample]) -> list[DecisionPointDiagnostics]:
+    """Iteration-0 diagnostics for every DecisionPoint across ``samples``, in order
+    (the same order the real server's records use). Q+ = 0 and V = 0 give uniform
+    pi_RM; targets are 0 like the fake's zero v_targets; adv_star follows the
+    server's formula with its 1e-6 floor and is 0.0 for a missing pi_hat."""
+    out: list[DecisionPointDiagnostics] = []
+    for s_idx, sample in enumerate(samples):
+        for dp in sample.decision_points or []:
+            n = len(dp.admissible_actions)
+            uniform = [1.0 / n] * n if n else []
+            adv_star = 0.0
+            if dp.pi_hat is not None and n:
+                adv_star = action_advantage(uniform[dp.executed_action_idx], dp.pi_hat)
+            out.append(
+                DecisionPointDiagnostics(
+                    sample_idx=s_idx,
+                    response_start=dp.response_start,
+                    q_plus=[0.0] * n,
+                    v=0.0,
+                    v_target=0.0,
+                    pi_rm=uniform,
+                    adv_star=adv_star,
+                    g_k=0.0,
+                    q_plus_target_star=0.0,
+                )
+            )
+    return out

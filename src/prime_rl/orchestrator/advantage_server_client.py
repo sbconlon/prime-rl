@@ -14,6 +14,7 @@ order.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal, Protocol
 
 import httpx
@@ -90,6 +91,21 @@ class ComputeAdvantagesResponse(msgspec.Struct, array_like=True, gc=False, omit_
     weight_step: int | None = None
 
 
+@dataclass
+class DiagnosticsResult:
+    """Return value of compute_with_diagnostics (training-probe, Phase 2).
+
+    paired: the same paired outputs compute_advantages_and_targets returns.
+    diagnostics: one DecisionPointDiagnostics per decision point, in order across
+        the request's samples (empty for PPO / no decision points).
+    weight_step: the server's value-net version that served this call.
+    """
+
+    paired: list[tuple[TrainingSample, AdvantageTrainingSample]]
+    diagnostics: list[DecisionPointDiagnostics]
+    weight_step: int
+
+
 # ---------------------------------------------------------------------------
 # Protocol (typing) -- both AdvantageServerClient and FakeAdvantageServer
 # implement this so the orchestrator can be parameterized over either.
@@ -104,6 +120,15 @@ class AdvantageServerClientProtocol(Protocol):
         is_terminal: bool,
         algorithm: Literal["ppo", "arm"],
     ) -> list[tuple[TrainingSample, AdvantageTrainingSample]]:
+        ...
+
+    async def compute_with_diagnostics(
+        self,
+        samples: list[TrainingSample],
+        episodic_reward: float,
+        is_terminal: bool,
+        algorithm: Literal["ppo", "arm"],
+    ) -> DiagnosticsResult:
         ...
 
     async def aclose(self) -> None:
@@ -159,6 +184,42 @@ class AdvantageServerClient:
             is_terminal=is_terminal,
             algorithm=algorithm,
         )
+        decoded = await self._post(request)
+        return [(p.llm_sample, p.advantage_sample) for p in decoded.paired_samples]
+
+    async def compute_with_diagnostics(
+        self,
+        samples: list[TrainingSample],
+        episodic_reward: float,
+        is_terminal: bool,
+        algorithm: Literal["ppo", "arm"],
+    ) -> DiagnosticsResult:
+        """training-probe (Phase 2, D-8): the same POST with return_diagnostics=True.
+
+        Returns the paired outputs plus the per-decision-point value diagnostics and
+        the server's weight_step for the call. Used by the orchestrator's probe
+        hook only; the training path keeps calling compute_advantages_and_targets.
+        """
+        request = ComputeAdvantagesRequest(
+            samples=samples,
+            episodic_reward=episodic_reward,
+            is_terminal=is_terminal,
+            algorithm=algorithm,
+            return_diagnostics=True,
+        )
+        decoded = await self._post(request)
+        if decoded.diagnostics is None or decoded.weight_step is None:
+            raise ValueError(
+                "Advantage Server returned no diagnostics / weight_step for a "
+                "return_diagnostics request; is it running the training-probe server code?"
+            )
+        return DiagnosticsResult(
+            paired=[(p.llm_sample, p.advantage_sample) for p in decoded.paired_samples],
+            diagnostics=list(decoded.diagnostics),
+            weight_step=int(decoded.weight_step),
+        )
+
+    async def _post(self, request: ComputeAdvantagesRequest) -> ComputeAdvantagesResponse:
         body = msgspec.msgpack.encode(request)
         response = await self._client.post(
             _ENDPOINT_PATH,
@@ -166,8 +227,7 @@ class AdvantageServerClient:
             headers={"Content-Type": "application/x-msgpack"},
         )
         response.raise_for_status()
-        decoded = msgspec.msgpack.decode(response.content, type=ComputeAdvantagesResponse)
-        return [(p.llm_sample, p.advantage_sample) for p in decoded.paired_samples]
+        return msgspec.msgpack.decode(response.content, type=ComputeAdvantagesResponse)
 
     async def aclose(self) -> None:
         await self._client.aclose()

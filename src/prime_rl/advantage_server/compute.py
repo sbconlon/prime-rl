@@ -44,6 +44,7 @@ from prime_rl.advantage_server.action_advantage import (
     tokenize_action,
 )
 from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
+from prime_rl.orchestrator.advantage_server_client import DecisionPointDiagnostics
 from prime_rl.advantage_server._prof import prof
 from prime_rl.transport.types import (
     AdvantageTrainingSample,
@@ -270,7 +271,11 @@ def compute_advantages_and_targets_arm_action(
     gamma: float = 1.0,
     n_step: int = 1,
     arm_phi_decay: float = 1.0,
-) -> list[tuple[TrainingSample, AdvantageTrainingSample]]:
+    return_diagnostics: bool = False,
+) -> (
+    list[tuple[TrainingSample, AdvantageTrainingSample]]
+    | tuple[list[tuple[TrainingSample, AdvantageTrainingSample]], list[DecisionPointDiagnostics]]
+):
     """Action-level ARM: A(a*) = log pi_RM(a*|o) - log pi_hat(a*|o) per decision
     point, plus the action-level V/Q+ regression targets. Same four-step skeleton
     as the token-level path, regrained from per-token to per-decision-point.
@@ -282,6 +287,12 @@ def compute_advantages_and_targets_arm_action(
     response span (per-token), while the V/Q+ regression targets are per-decision-
     point (DecisionPointTarget) -- the AdvTrainer regresses at the o-boundary and
     the action terminal, not per token.
+
+    return_diagnostics (training-probe, D-8): when True, return
+    ``(paired, diagnostics)`` where diagnostics is one DecisionPointDiagnostics per
+    record (decision-point order) -- a view over ``records`` and ``out``, no extra
+    forward. When False (the training path) the return value is exactly the
+    paired list as before.
     """
     records = _build_per_decision_point_value_tensors(samples, backbone, tokenizer)
     K = len(records)
@@ -289,7 +300,7 @@ def compute_advantages_and_targets_arm_action(
     if K == 0:
         # No decision points (e.g. GRPO sample mistakenly routed here): emit
         # zero advantages and no targets, preserving the paired-output shape.
-        return [
+        paired_empty = [
             (
                 __import__("msgspec").structs.replace(s, advantages=[0.0] * len(s.completion_ids)),
                 AdvantageTrainingSample(
@@ -301,6 +312,7 @@ def compute_advantages_and_targets_arm_action(
             )
             for s in samples
         ]
+        return (paired_empty, []) if return_diagnostics else paired_empty
 
     rewards = [0.0] * K
     if is_terminal:
@@ -329,7 +341,47 @@ def compute_advantages_and_targets_arm_action(
             out.advantage[k] = 0.0
     _log_advantage_magnitudes_action(out)
 
-    return _build_paired_outputs_action(samples, records, out)
+    paired = _build_paired_outputs_action(samples, records, out)
+    if return_diagnostics:
+        return paired, _build_diagnostics_action(records, out)
+    return paired
+
+
+def _build_diagnostics_action(records: list[dict], out) -> list[DecisionPointDiagnostics]:
+    """training-probe (Phase 2, D-8): one DecisionPointDiagnostics per record, in
+    ``records`` order (decision-point order across the rollout's samples, the same
+    order _build_paired_outputs_action relies on). Pure view over the values the
+    action path already computed: no forward, no mutation. ``adv_star`` is
+    ``out.advantage[k]`` after the missing-pi_hat zeroing, so a None pi_hat yields a
+    record with adv_star == 0.0, as on the training path.
+    """
+    if out.pi_rm is None or out.g is None:
+        raise ValueError("action_advantage_fn outputs lack pi_rm / g (needed for diagnostics)")
+    if not (len(records) == len(out.advantage) == len(out.pi_rm) == len(out.g)):
+        raise ValueError(
+            f"diagnostics length mismatch: records={len(records)} advantage={len(out.advantage)} "
+            f"pi_rm={len(out.pi_rm)} g={len(out.g)}"
+        )
+    diagnostics: list[DecisionPointDiagnostics] = []
+    for k, r in enumerate(records):
+        if len(out.pi_rm[k]) != len(r["q_plus"]):
+            raise ValueError(
+                f"decision point {k}: |pi_rm|={len(out.pi_rm[k])} != |q_plus|={len(r['q_plus'])}"
+            )
+        diagnostics.append(
+            DecisionPointDiagnostics(
+                sample_idx=int(r["sample_idx"]),
+                response_start=int(r["response_start"]),
+                q_plus=[float(x) for x in r["q_plus"]],
+                v=float(r["v"]),
+                v_target=float(r["v_target"]),
+                pi_rm=[float(x) for x in out.pi_rm[k]],
+                adv_star=float(out.advantage[k]),
+                g_k=float(out.g[k]),
+                q_plus_target_star=float(out.q_plus_target_out[k]),
+            )
+        )
+    return diagnostics
 
 
 def _build_paired_outputs_action(
@@ -526,23 +578,32 @@ def compute_advantages_and_targets(
     algorithm: Literal["ppo", "arm"],
     backbone: ValueNetworkBackbone,
     tokenizer=None,
+    return_diagnostics: bool = False,
     **kwargs: float | int | str,
-) -> list[tuple[TrainingSample, AdvantageTrainingSample]]:
+) -> (
+    list[tuple[TrainingSample, AdvantageTrainingSample]]
+    | tuple[list[tuple[TrainingSample, AdvantageTrainingSample]], list[DecisionPointDiagnostics]]
+):
     """Dispatch to the per-algorithm compute path.
 
     On this (action-level) branch "arm" routes to the *action-level* path
     (compute_advantages_and_targets_arm_action), which needs `tokenizer` to
     tokenize admissible actions for Q+. The token-level compute_advantages_and_targets_arm
     stays as tested dead code, callable directly but no longer on the dispatch path.
+
+    return_diagnostics (training-probe, D-8) threads to the action path; with it
+    the return is ``(paired, diagnostics)``. PPO has no decision points, so it
+    returns ``(paired, [])`` under the flag.
     """
     if algorithm == "ppo":
-        return compute_advantages_and_targets_ppo(
+        paired = compute_advantages_and_targets_ppo(
             samples=samples,
             episodic_reward=episodic_reward,
             is_terminal=is_terminal,
             backbone=backbone,
             **kwargs,
         )
+        return (paired, []) if return_diagnostics else paired
     if algorithm == "arm":
         if tokenizer is None:
             raise ValueError(
@@ -554,6 +615,7 @@ def compute_advantages_and_targets(
             is_terminal=is_terminal,
             backbone=backbone,
             tokenizer=tokenizer,
+            return_diagnostics=return_diagnostics,
             **kwargs,
         )
     raise ValueError(f"Unsupported algorithm: {algorithm!r}")

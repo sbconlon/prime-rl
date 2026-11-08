@@ -175,23 +175,39 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
                 else:
                     kwargs["n_step"] = app.state.n_step
                     kwargs["arm_phi_decay"] = app.state.arm_phi_decay
-                return compute_advantages_and_targets(
+                # training-probe (Phase 2, D-8): the value-net version that serves
+                # THIS call, read in the compute thread right before the forwards.
+                weight_step = int(app.state.weight_step)
+                result = compute_advantages_and_targets(
                     samples=decoded.samples,
                     episodic_reward=decoded.episodic_reward,
                     is_terminal=decoded.is_terminal,
                     algorithm=decoded.algorithm,
                     backbone=backbone,
                     tokenizer=app.state.tokenizer,
+                    return_diagnostics=decoded.return_diagnostics,
                     **kwargs,
                 )
+                return result, weight_step
 
             with prof("endpoint.run_in_executor", sync_cuda=True):
-                paired = await loop.run_in_executor(None, _do_compute)
+                result, weight_step = await loop.run_in_executor(None, _do_compute)
             with prof("endpoint.build_response"):
+                if decoded.return_diagnostics:
+                    paired, diagnostics = result
+                else:
+                    paired, diagnostics = result, None
                 paired_samples = [
                     PairedSample(llm_sample=llm, advantage_sample=adv) for llm, adv in paired
                 ]
-                response = ComputeAdvantagesResponse(paired_samples=paired_samples)
+                # Without the flag both trailing fields stay None (the pre-probe
+                # response plus two trailing nils on the wire; Phase 0 pins the
+                # decode compatibility in both directions).
+                response = ComputeAdvantagesResponse(
+                    paired_samples=paired_samples,
+                    diagnostics=diagnostics,
+                    weight_step=weight_step if decoded.return_diagnostics else None,
+                )
             with prof("endpoint.encode_response"):
                 encoded = msgspec.msgpack.encode(response)
             return Response(content=encoded, media_type="application/x-msgpack")

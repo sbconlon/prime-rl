@@ -170,6 +170,10 @@ class ActionAdvantageOutputs:
     advantage: list[float]  # A(a*_k) -- Phase 6 broadcasts across the response span
     v_target_out: list[float]  # V regression target per decision point (= g_k)
     q_plus_target_out: list[float]  # Q+ regression target per decision point
+    # training-probe (Phase 2, D-8): intermediates the loop already computes,
+    # kept for the diagnostics view. Additive; existing callers ignore them.
+    pi_rm: list[list[float]] | None = None  # pi_rm[k][a] = π_RM(a | o_k) over A(o_k)
+    g: list[float] | None = None  # g[k] = n-step return at decision point k
 
 
 def action_advantage_fn(inputs: ActionAdvantageInputs) -> ActionAdvantageOutputs:
@@ -184,9 +188,11 @@ def action_advantage_fn(inputs: ActionAdvantageInputs) -> ActionAdvantageOutputs
     advantage: list[float] = []
     v_target_out: list[float] = []
     q_plus_target_out: list[float] = []
+    pi_rm_rows: list[list[float]] = []
     for k in range(len(inputs.v)):
         e = inputs.executed_idx[k]
         rm = pi_rm(inputs.q_plus[k], inputs.v[k])
+        pi_rm_rows.append(rm)
         advantage.append(action_advantage(rm[e], inputs.pi_hat_star[k]))
         v_target_out.append(v_target_from_return(g[k]))
         q_plus_target_out.append(
@@ -196,6 +202,8 @@ def action_advantage_fn(inputs: ActionAdvantageInputs) -> ActionAdvantageOutputs
         advantage=advantage,
         v_target_out=v_target_out,
         q_plus_target_out=q_plus_target_out,
+        pi_rm=pi_rm_rows,
+        g=list(g),
     )
 
 
