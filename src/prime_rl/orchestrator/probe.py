@@ -248,6 +248,9 @@ def assemble_probe_rollout(
                 "pi_hat_star": pi_hat_star,
                 "Z": Z,
                 "raw_logps": probe.get("raw_logps"),
+                # D-13: which pi_hat convention the env used for this turn (True =
+                # softmax over the admissible union, False = raw sequence probabilities).
+                "pi_hat_renorm": bool(probe.get("pi_hat_renorm", True)),
                 "values": {
                     "v": float(d.v),
                     "v_target": float(d.v_target),
@@ -353,6 +356,18 @@ def probe_metrics(
     m["probe/pi_rm_entropy_mean"] = _mean(
         -sum(p * math.log(p) for p in t["values"]["pi_rm"] if p > 0.0) for t in turns
     )
+    # D-13: the admissible mass exp(Z_j) per scored block -- the normalizer pi_hat
+    # drops when pi_hat_renorm is False; its size is the open question the probe
+    # is meant to answer, so it is a round metric either way.
+    masses = [
+        math.exp(float(z)) for t in turns if t.get("pi_hat") is not None for z in (t.get("Z") or [])
+    ]
+    if masses:
+        m["probe/admissible_mass_mean"] = _mean(masses)
+        m["probe/admissible_mass_min"] = float(min(masses))
+        m["probe/admissible_mass_frac_below_half"] = _mean(float(x < 0.5) for x in masses)
+    flags = {bool(t.get("pi_hat_renorm", True)) for t in turns}
+    m["probe/pi_hat_renorm"] = 1.0 if flags == {True} else 0.0 if flags == {False} else 0.5
     valid = [t["values"]["adv_star"] for t in turns if t["values"]["adv_star_valid"]]
     m["probe/pi_hat_missing_frac"] = 1.0 - len(valid) / len(turns)
     if valid:

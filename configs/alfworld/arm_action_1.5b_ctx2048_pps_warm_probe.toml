@@ -7,9 +7,15 @@
 #   * [orchestrator.eval*] removed, [orchestrator.probe*] added (training-probe D-2: the probe
 #     replaces the online eval; it emits eval/alfworld-probe/avg@1 and friends).
 #   * new output_dir / LoRA name / advantage_trainer.output_dir (fresh run dir).
+#   * args.pi_hat_renorm = false on the train AND probe envs (D-13; see the NOTE below).
 # NOTE: this is the first RL run after the min_p fix (prime-rl d9a72abb): [orchestrator.sampling.extra_body]
 # min_p = 0.1 now reaches vLLM, so training rollouts sample at T=0.8 / min_p=0.1 for the first time
 # (every earlier run sampled at min_p=0). The probe's m sampled blocks use the same regime.
+# NOTE (2026-11-07, training-probe D-13): pi_hat is NOT renormalized over the admissible set in
+# this run (args.pi_hat_renorm = false on both envs). pi_hat(a*) is the raw probability of emitting
+# the action string under each sampled block (mean over blocks), so A(a*) carries the extra term
+# -log(admissible mass). The probe records exp(Z) per block, and the round metric
+# probe/admissible_mass_mean reports it, so the size of the dropped normalizer is measured directly.
 
 max_steps = 500
 seq_len = 17408
@@ -96,6 +102,7 @@ args.tokenizer_path = "/home/3312841/sft/checkpoint/step_40"
 args.max_turns = 15
 args.num_reasoning_blocks = 2
 args.prewarm_pi_hat_prefixes = false
+args.pi_hat_renorm = false
 args.curriculum = [
   { pick_and_place_simple = 1.0, default = 0.0 },
   { pick_and_place_simple = 0.2, pick_two_obj_and_place = 0.2, pick_clean_then_place_in_recep = 0.2, pick_cool_then_place_in_recep = 0.2, pick_heat_then_place_in_recep = 0.2, default = 0.0 },
@@ -135,6 +142,7 @@ args.max_context_tokens = 2048
 args.tokenizer_path = "/home/3312841/sft/checkpoint/step_40"
 args.max_turns = 15
 args.prewarm_pi_hat_prefixes = false
+args.pi_hat_renorm = false
 
 [inference]
 enable_lora = true

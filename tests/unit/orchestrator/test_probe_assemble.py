@@ -37,7 +37,7 @@ TOP_KEYS = {
 }
 TURN_KEYS = {
     "turn", "observation", "window", "admissible", "executed", "blocks", "pi_hat", "pi_hat_star", "Z",
-    "raw_logps", "values", "oracle", "env_response",
+    "raw_logps", "pi_hat_renorm", "values", "oracle", "env_response",
 }
 VALUES_KEYS = {"v", "v_target", "q_plus", "pi_rm", "adv", "adv_star", "adv_star_valid", "g_k", "q_plus_target_star"}
 
