@@ -84,3 +84,46 @@ def test_simulate_full_run():
         prev_ckpt_step = ckpt_step
 
     assert eval_triggered_at == [0, 25, 50, 75]
+
+
+# ---------------------------------------------------------------------------
+# training-probe (Phase 3): the probe block reuses compute_eval_ckpt_step with its
+# own bookkeeping (last_probe_step, probe_base_model, skip_probe_on_resume).
+# ---------------------------------------------------------------------------
+
+
+def _simulate_probe(ckpt_steps, *, interval, probe_base_model=True, resume_skip_at=None):
+    last_probe_step = -1
+    prev_ckpt_step = -1
+    if resume_skip_at is not None:
+        # orchestrator resume branch with skip_probe_on_resume=True and no eval configured:
+        # prev_ckpt_step one behind (eval's else branch), last_probe_step pinned at the resume step
+        prev_ckpt_step = resume_skip_at - 1
+        last_probe_step = resume_skip_at
+    fired = []
+    for ckpt_step in ckpt_steps:
+        result = compute_eval_ckpt_step(
+            ckpt_step=ckpt_step,
+            prev_ckpt_step=prev_ckpt_step,
+            last_eval_step=last_probe_step,
+            interval=interval,
+            eval_base_model=probe_base_model,
+        )
+        if result is not None:
+            last_probe_step = ckpt_step
+            fired.append((ckpt_step, result))
+        prev_ckpt_step = ckpt_step
+    return fired
+
+
+def test_probe_gating_mirrors_eval():
+    # base model at 0, then every 10, jumping over a boundary (18 -> 23 probes "20" at 23),
+    # never twice for one ckpt_step
+    steps = [0, 0, 3, 7, 10, 10, 14, 18, 23, 30, 31]
+    assert _simulate_probe(steps, interval=10) == [(0, 0), (10, 10), (23, 20), (30, 30)]
+    # probe_base_model=False drops the ckpt-0 round only
+    assert _simulate_probe(steps, interval=10, probe_base_model=False) == [(10, 10), (23, 20), (30, 30)]
+    # resume at 20 with skip_probe_on_resume: the redundant round at 20 is skipped, 30 still fires
+    assert _simulate_probe([20, 20, 25, 30], interval=10, resume_skip_at=20) == [(30, 30)]
+    # resume at 20 without skip: prev one behind lets the resumed step probe once
+    assert _simulate_probe([20, 20, 25, 30], interval=10)[:1] == [(20, 20)]

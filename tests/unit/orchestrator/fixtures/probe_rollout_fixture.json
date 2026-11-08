@@ -1,0 +1,131 @@
+{
+  "example_id": 0,
+  "task": "alfworld-probe",
+  "prompt": [
+    {"role": "system", "content": "You are an agent in a text household."},
+    {"role": "user", "content": "-= Welcome to TextWorld, ALFRED! =-\n\nYou are in the middle of a room. Looking quickly around you, you see a desk 1, a drawer 1, a shelf 1.\n\nYour task is to: look at box under the desklamp."}
+  ],
+  "completion": [
+    {"role": "assistant", "content": "<think>The box should be on the desk.</think>\n<action>go to desk 1</action>"},
+    {"role": "user", "content": "You arrive at desk 1. On the desk 1, you see a box 1."},
+    {"role": "assistant", "content": "<think>Take the box.</think>\n<action>take box 1 from desk 1</action>"}
+  ],
+  "reward": 1.0,
+  "timing": {},
+  "is_completed": true,
+  "is_truncated": false,
+  "metrics": {"alfworld_reward": 1.0, "context_evictions": 0.0},
+  "info": {
+    "game_file": "/data/json_2.1.1/valid_seen/look_at_obj_in_light-Box-None-DeskLamp-205/trial_T20190907_074425_330493/game.tw-pddl",
+    "game_id": "valid_seen/look_at_obj_in_light-Box-None-DeskLamp-205/trial_T20190907_074425_330493",
+    "probe_id": "seen-look-bite",
+    "split": "valid_seen",
+    "task_type": "look_at_obj_in_light",
+    "role": "bite"
+  },
+  "error": null,
+  "stop_condition": null,
+  "sampling_args": {"temperature": 0.0, "max_tokens": 512},
+  "final_env_response": [{"role": "user", "content": "You pick up the box 1 from the desk 1."}],
+  "context_evictions": 0,
+  "trajectory": [
+    {
+      "prompt": [
+        {"role": "system", "content": "You are an agent in a text household."},
+        {"role": "user", "content": "-= Welcome to TextWorld, ALFRED! =-\n\nYou are in the middle of a room. Looking quickly around you, you see a desk 1, a drawer 1, a shelf 1.\n\nYour task is to: look at box under the desklamp."}
+      ],
+      "completion": [
+        {"role": "assistant", "content": "<think>The box should be on the desk.</think>\n<action>go to desk 1</action>"}
+      ],
+      "response": null,
+      "tokens": {
+        "prompt_ids": [1, 2, 3],
+        "prompt_mask": [0, 0, 0],
+        "completion_ids": [10, 11],
+        "completion_mask": [1, 1],
+        "completion_logprobs": [-0.1, -0.2],
+        "overlong_prompt": false,
+        "is_truncated": false
+      },
+      "reward": null,
+      "advantage": null,
+      "is_truncated": false,
+      "trajectory_id": "probe-0",
+      "extras": {
+        "admissible_actions": ["go to desk 1", "look", "inventory"],
+        "executed_action": "go to desk 1",
+        "pi_hat": 0.4,
+        "probe": {
+          "schema": 1,
+          "admissible_union": ["go to desk 1", "look", "inventory"],
+          "executed_idx": 0,
+          "parsed_ok": true,
+          "exec_block": {
+            "reasoning": "<think>The box should be on the desk.</think>\n",
+            "action": "go to desk 1",
+            "completion": "<think>The box should be on the desk.</think>\n<action>go to desk 1</action>"
+          },
+          "blocks": [
+            {"reasoning": "<think>Check the desk first.</think>\n", "action": "go to desk 1", "cond": [0.6, 0.3, 0.1]},
+            {"reasoning": "<think>Look around.</think>\n", "action": "look", "cond": [0.2, 0.5, 0.3]}
+          ],
+          "pi_hat_marginal": [0.4, 0.4, 0.2],
+          "Z": [-3.0, -4.0],
+          "raw_logps": null,
+          "window": {"labels": ["system", "task", "obs0"], "token_count": 300, "evictions_so_far": 0},
+          "oracle": {"action": "go to desk 1", "status": "expert", "plan": null, "steps_left": null}
+        }
+      }
+    },
+    {
+      "prompt": [
+        {"role": "system", "content": "You are an agent in a text household."},
+        {"role": "user", "content": "-= Welcome to TextWorld, ALFRED! =-\n\nYou are in the middle of a room. Looking quickly around you, you see a desk 1, a drawer 1, a shelf 1.\n\nYour task is to: look at box under the desklamp."},
+        {"role": "assistant", "content": "<think>The box should be on the desk.</think>\n<action>go to desk 1</action>"},
+        {"role": "user", "content": "You arrive at desk 1. On the desk 1, you see a box 1."}
+      ],
+      "completion": [
+        {"role": "assistant", "content": "<think>Take the box.</think>\n<action>take box 1 from desk 1</action>"}
+      ],
+      "response": null,
+      "tokens": {
+        "prompt_ids": [1, 2, 3, 10, 11, 4, 5],
+        "prompt_mask": [0, 0, 0, 0, 0, 0, 0],
+        "completion_ids": [12, 13],
+        "completion_mask": [1, 1],
+        "completion_logprobs": [-0.3, -0.4],
+        "overlong_prompt": false,
+        "is_truncated": false
+      },
+      "reward": null,
+      "advantage": null,
+      "is_truncated": false,
+      "trajectory_id": "probe-0",
+      "extras": {
+        "admissible_actions": ["look", "take box 1 from desk 1"],
+        "executed_action": "take box 1 from desk 1",
+        "pi_hat": 0.8,
+        "probe": {
+          "schema": 1,
+          "admissible_union": ["look", "take box 1 from desk 1"],
+          "executed_idx": 1,
+          "parsed_ok": true,
+          "exec_block": {
+            "reasoning": "<think>Take the box.</think>\n",
+            "action": "take box 1 from desk 1",
+            "completion": "<think>Take the box.</think>\n<action>take box 1 from desk 1</action>"
+          },
+          "blocks": [
+            {"reasoning": "<think>Pick it up.</think>\n", "action": "take box 1 from desk 1", "cond": [0.3, 0.7]},
+            {"reasoning": "<think>Grab the box.</think>\n", "action": "take box 1 from desk 1", "cond": [0.1, 0.9]}
+          ],
+          "pi_hat_marginal": [0.2, 0.8],
+          "Z": [-2.5, -3.5],
+          "raw_logps": null,
+          "window": {"labels": ["system", "task", "obs0", "act0", "obs1"], "token_count": 360, "evictions_so_far": 0},
+          "oracle": {"action": "take box 1 from desk 1", "status": "expert", "plan": null, "steps_left": null}
+        }
+      }
+    }
+  ]
+}

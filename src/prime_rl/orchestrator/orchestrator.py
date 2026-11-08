@@ -4,6 +4,7 @@ import gc
 import multiprocessing as mp
 import random
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import tomli_w
@@ -42,6 +43,7 @@ from prime_rl.configs.orchestrator import BufferConfig, OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
 from prime_rl.orchestrator.ckpt import Progress, setup_ckpt_manager
 from prime_rl.orchestrator.eval_utils import evaluate_env
+from prime_rl.orchestrator.probe import ProbeRunner
 from prime_rl.orchestrator.filters import apply_filters, setup_filters
 from prime_rl.orchestrator.scheduler import Scheduler
 from prime_rl.orchestrator.utils import (
@@ -111,6 +113,8 @@ async def orchestrate(config: OrchestratorConfig):
     env_ids_to_install.update(get_env_ids_to_install(config.env))
     if config.eval is not None:
         env_ids_to_install.update(get_env_ids_to_install(config.eval.env))
+    if config.probe is not None:
+        env_ids_to_install.update(get_env_ids_to_install([config.probe.env]))
 
     for env_id in env_ids_to_install:
         install_env(env_id)
@@ -310,6 +314,15 @@ async def orchestrate(config: OrchestratorConfig):
         eval_env_names: list[str] = []
         eval_sampling_args = {}
 
+    # training-probe (Phase 3, D-7): the probe env runs in-process (no env server), so the
+    # capture dict never crosses the env-server JSON boundary. Loaded next to the eval
+    # envs; the runner is built once the Advantage Server client exists.
+    probe_env = None
+    if config.probe:
+        probe_env_id = strip_env_version(config.probe.env.id)
+        probe_env = vf.load_environment(probe_env_id, **config.probe.env.args)
+        logger.info(f"Loaded probe environment {config.probe.env.resolved_name} in-process ({probe_env_id})")
+
     # Setup buffer
     logger.info(f"Setting up buffer ({config.buffer})")
     train_dataset = train_env_group.get_dataset(seed=config.buffer.seed)
@@ -380,6 +393,28 @@ async def orchestrate(config: OrchestratorConfig):
         await advantage_server_client.wait_for_ready()
         logger.success("Advantage Server ready")
 
+    # training-probe (Phase 3): one runner for the whole run; rounds are gated in the loop.
+    probe_runner = None
+    if config.probe:
+        if advantage_server_client is None:
+            raise ValueError("orchestrator.probe requires algorithm 'arm' (or 'ppo') with an Advantage Server")
+        probe_runner = ProbeRunner(
+            config=config.probe,
+            env=probe_env,
+            model_name=lambda: scheduler.model_name,
+            get_client=inference_pool.get_next_client,
+            adv_client=advantage_server_client,
+            output_dir=config.output_dir,
+            run_name=config.output_dir.name,
+            tokenizer=tokenizer,
+            monitor=monitor,
+            processor=processor,
+        )
+        logger.info(
+            f"Probe configured: every {config.probe.interval} checkpoint step(s), "
+            f"records under {config.output_dir / config.probe.output_subdir}"
+        )
+
     # Set up weight broadcast backend
     if enable_policy_updates:
         logger.info(f"Initializing weight broadcast ({config.weight_broadcast})")
@@ -427,6 +462,8 @@ async def orchestrate(config: OrchestratorConfig):
 
     # Track last online eval checkpoint step for this process
     last_eval_step = -1
+    # training-probe (Phase 3): the probe block keeps the same bookkeeping
+    last_probe_step = -1
     # Track previous ckpt_step to detect when ckpt_step jumps over eval interval boundaries
     prev_ckpt_step = -1
 
@@ -444,6 +481,9 @@ async def orchestrate(config: OrchestratorConfig):
         else:
             # Allow eval at resumed step by setting prev_ckpt_step one behind
             prev_ckpt_step = scheduler.ckpt_step - 1
+        if config.probe and config.probe.skip_probe_on_resume:
+            last_probe_step = scheduler.ckpt_step
+            logger.info(f"Skipping probe round on resume (ckpt_step={scheduler.ckpt_step})")
 
         if enable_policy_updates:
             # In NCCL mode, skip existence check - weights are broadcasted, not stored on disk
@@ -550,6 +590,32 @@ async def orchestrate(config: OrchestratorConfig):
 
             # Resume weight updates
             scheduler.checkpoint_ready.set()
+
+        # training-probe (Phase 3, D-1 / D-11): the probe block, a sibling of eval, gated with
+        # eval's helper and run inside its own checkpoint_ready pause window. A failing round
+        # is logged, never fatal: the probe is diagnostics; the training block is unchanged.
+        probe_ckpt_step = None
+        if probe_runner is not None and config.probe:
+            probe_ckpt_step = compute_eval_ckpt_step(
+                ckpt_step=ckpt_step,
+                prev_ckpt_step=prev_ckpt_step,
+                last_eval_step=last_probe_step,
+                interval=config.probe.interval,
+                eval_base_model=config.probe.probe_base_model,
+            )
+
+        if probe_ckpt_step is not None:
+            last_probe_step = ckpt_step
+            logger.info(f"Running probe round for checkpoint step {probe_ckpt_step} (current ckpt_step={ckpt_step})")
+            scheduler.checkpoint_ready.clear()
+            try:
+                await probe_runner.run_round(ckpt_step=probe_ckpt_step, orchestrator_step=progress.step)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    f"Probe round for checkpoint step {probe_ckpt_step} failed: {exc!r}\n{traceback.format_exc()}"
+                )
+            finally:
+                scheduler.checkpoint_ready.set()
 
         # Update prev_ckpt_step for next iteration
         prev_ckpt_step = ckpt_step
@@ -1002,6 +1068,15 @@ async def orchestrate(config: OrchestratorConfig):
                 for eval_env, eval_env_name, eval_env_config in zip(eval_envs, eval_env_names, config.eval.env)
             ]
         )
+
+    # training-probe (Phase 3): a final round on the last policy version, mirroring the
+    # final eval, unless the loop already probed this exact ckpt_step.
+    if probe_runner is not None and last_probe_step != ckpt_step:
+        logger.info(f"Running final probe round for checkpoint step {ckpt_step}")
+        try:
+            await probe_runner.run_round(ckpt_step=ckpt_step, orchestrator_step=progress.step)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Final probe round failed: {exc!r}\n{traceback.format_exc()}")
 
     # Log final (immutable) samples and distributions to monitor(s)
     monitor.log_final_samples()
