@@ -32,7 +32,26 @@ ADVANTAGE_SERVER_TOML = "advantage_server.toml"
 ADVANTAGE_TRAINER_TOML = "advantage_trainer.toml"
 
 
-def get_physical_gpu_ids() -> list[int]:
+def _parse_device_tokens(raw: str) -> list[int | str]:
+    """Split a CUDA_VISIBLE_DEVICES-style list. Integer tokens become ints; MIG
+    UUIDs (``MIG-...``, what SLURM exports for MIG slices) and GPU UUIDs pass
+    through unchanged -- the subprocesses receive them verbatim in their own
+    CUDA_VISIBLE_DEVICES, which is the documented way to select a MIG device."""
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    out: list[int | str] = []
+    for token in tokens:
+        if token.lstrip("-").isdigit():
+            out.append(int(token))
+        elif token.startswith(("MIG-", "GPU-")):
+            out.append(token)
+        else:
+            raise ValueError(
+                f"Unrecognised device token {token!r} (expected an integer index, a MIG-... or a GPU-... UUID)"
+            )
+    return out
+
+
+def get_physical_gpu_ids() -> list[int | str]:
     """Return physical GPU IDs visible to the launcher.
 
     ``PRIME_RL_PHYSICAL_GPU_IDS`` (comma-separated, duplicates allowed) overrides
@@ -46,7 +65,7 @@ def get_physical_gpu_ids() -> list[int]:
     """
     override = os.environ.get("PRIME_RL_PHYSICAL_GPU_IDS")
     if override is not None and override.strip():
-        ids = [int(token.strip()) for token in override.split(",") if token.strip()]
+        ids = _parse_device_tokens(override)
         if len(set(ids)) < len(ids):
             print(
                 f"PRIME_RL_PHYSICAL_GPU_IDS={override!r}: subprocesses will share GPU(s) "
@@ -58,7 +77,7 @@ def get_physical_gpu_ids() -> list[int]:
     if raw_visible is None:
         pynvml.nvmlInit()
         return list(range(pynvml.nvmlDeviceGetCount()))
-    return [int(token.strip()) for token in raw_visible.split(",") if token.strip()]
+    return _parse_device_tokens(raw_visible)
 
 
 def write_config(config: RLConfig, output_dir: Path, exclude: set[str] | None = None) -> None:
