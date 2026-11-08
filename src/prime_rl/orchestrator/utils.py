@@ -55,8 +55,10 @@ def get_sampling_args(sampling_config: SamplingConfig, temperature: float, is_vl
         extra_body["repetition_penalty"] = repetition_penalty
 
     if is_vllm:
-        extra_body["top_k"] = -1
-        extra_body["min_p"] = 0.0
+        # vLLM neutral defaults (no top-k / min-p truncation) unless the run config
+        # set them via extra_body; return_token_ids is required by the orchestrator.
+        extra_body.setdefault("top_k", -1)
+        extra_body.setdefault("min_p", 0.0)
         extra_body["return_token_ids"] = True
 
     # Phase 5: pop the prime-rl-internal toggle fields BEFORE reading them so
