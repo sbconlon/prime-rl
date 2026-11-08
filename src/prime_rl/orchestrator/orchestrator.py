@@ -405,7 +405,8 @@ async def orchestrate(config: OrchestratorConfig):
             get_client=inference_pool.get_next_client,
             adv_client=advantage_server_client,
             output_dir=config.output_dir,
-            run_name=config.output_dir.name,
+            # the launcher nests the orchestrator under <run>/run_default; name the records after the run
+            run_name=(config.output_dir.parent.name if config.output_dir.name == "run_default" else config.output_dir.name),
             tokenizer=tokenizer,
             monitor=monitor,
             processor=processor,
