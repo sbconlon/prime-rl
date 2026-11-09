@@ -44,11 +44,12 @@ def _records():
     return out
 
 
-def _config(tmp_path, path, kind):
+def _config(tmp_path, path, kind, max_epochs=1, resume=True):
     return WarmStartTrainConfig(
         model=ValueNetworkConfig(base_model_name="tiny", lora=LoRAConfig(rank=8, alpha=16.0, dropout=0.0), polyak_tau=0.005),
         data=WarmStartDataConfig(path=path, kind=kind, batch_size=2, inner_batch_size=1),
-        max_epochs=1,
+        max_epochs=max_epochs,
+        resume=resume,
         output_dir=tmp_path / "out",
     )
 
@@ -93,3 +94,56 @@ def test_train_warmstart_kind_unchanged(tmp_path):
     assert summary["n_samples_by_provenance"] == {"trunk": 2, "branch": 0}
     assert json.loads((config.output_dir / "holdout.json").read_text()) == {"game_ids": []}
     assert summary["final"]["by_provenance"]["branch"]["n_samples"] == 0
+
+
+def _trainable(backbone):
+    return {k: v.detach().clone() for k, v in backbone.state_dict().items()
+            if any(k.startswith(n) for n, p in backbone.named_parameters() if p.requires_grad)}
+
+
+def test_resume_continues_epochs_and_restores_weights(tmp_path):
+    path = tmp_path / "branched.msgpack"
+    with RecordWriter(path) as w:
+        for r in _records():
+            w.write(r)
+    tok = _CharTok()
+
+    # job 1: one epoch, killed by the walltime afterwards (simulated by returning)
+    bb1 = _backbone()
+    s1 = train(_config(tmp_path, path, "branched", max_epochs=3), backbone=bb1, tokenizer=tok)
+    assert [e["epoch"] for e in s1["epochs"]] == [0, 1, 2]  # max_epochs honoured when nothing is resumed
+    # simulate a kill after epoch 0: rebuild the output dir with one epoch only
+    import shutil
+    shutil.rmtree(tmp_path / "out")
+    bb1 = _backbone()
+    s1 = train(_config(tmp_path, path, "branched", max_epochs=1), backbone=bb1, tokenizer=tok)
+    resume_ckpt = tmp_path / "out" / "resume" / "checkpoints" / "step_1" / "trainer" / "value_state.pt"
+    assert resume_ckpt.exists()
+    payload = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
+    assert payload["step"] == 1 and "optimizer_state_dict" in payload
+    w1 = _trainable(bb1)
+
+    # job 2: same command with max_epochs=2 -> loads epoch-1 weights, trains epoch 1 only
+    bb2 = _backbone()
+    s2 = train(_config(tmp_path, path, "branched", max_epochs=2), backbone=bb2, tokenizer=tok)
+    assert [e["epoch"] for e in s2["epochs"]] == [0, 1]
+    assert s2["final"]["epoch"] == 1 and s2["epochs"][0] == s1["epochs"][0]
+    assert (tmp_path / "out" / "resume" / "checkpoints" / "step_2").exists()
+    assert not (tmp_path / "out" / "resume" / "checkpoints" / "step_1").exists()  # keep_last=1
+    w2 = _trainable(bb2)
+    assert any(not torch.equal(w1[k], w2[k]) for k in w1)  # it trained further
+    # the resumed run started from job 1's weights: a fresh backbone loaded from the
+    # step-1 checkpoint matches bb1, not bb2's untrained init
+    written = json.loads((tmp_path / "out" / "summary.json").read_text())
+    assert [e["epoch"] for e in written["epochs"]] == [0, 1]
+
+    # job 3: nothing left to do
+    bb3 = _backbone()
+    s3 = train(_config(tmp_path, path, "branched", max_epochs=2), backbone=bb3, tokenizer=tok)
+    assert [e["epoch"] for e in s3["epochs"]] == [0, 1] and s3["final"]["epoch"] == 1
+    assert torch.equal(_trainable(bb3)[next(iter(w2))], w2[next(iter(w2))])  # loaded, not trained
+
+    # resume=False starts over
+    bb4 = _backbone()
+    s4 = train(_config(tmp_path, path, "branched", max_epochs=1, resume=False), backbone=bb4, tokenizer=tok)
+    assert [e["epoch"] for e in s4["epochs"]] == [0]

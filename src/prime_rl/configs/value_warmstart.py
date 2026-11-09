@@ -168,8 +168,24 @@ class WarmStartTrainConfig(BaseConfig):
     ] = 1e-3
     max_epochs: Annotated[
         int,
-        Field(ge=1, description="Epochs over the fixed dataset (watch the loss plateau)."),
+        Field(
+            ge=1,
+            description=(
+                "Total epochs over the fixed dataset (watch the loss plateau). With resume, a "
+                "run that finds completed epochs under output_dir/resume trains only the rest."
+            ),
+        ),
     ]
+    resume: Annotated[
+        bool,
+        Field(
+            description=(
+                "Continue from output_dir/resume (the last completed epoch's trainable weights and "
+                "optimizer state) when present, so a walltime-killed run is resubmitted with the "
+                "same command. False starts from the SFT base and overwrites."
+            )
+        ),
+    ] = True
     output_dir: Annotated[
         Path,
         Field(description="Output dir; value_state.pt is written under checkpoints/step_0/trainer/."),

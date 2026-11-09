@@ -10,6 +10,13 @@ BranchRecords through BranchedDataset (pre-root prefix unlabelled, forced root
 labels Q+ only), excludes held-out games, logs the losses split by provenance
 (trunk vs branch episodes), and writes holdout.json + summary.json next to the
 checkpoint.
+
+Resume: after every epoch a full checkpoint (trainable weights + optimizer
+state, step = number of completed epochs) is written under output_dir/resume,
+keeping only the latest. With config.resume (default) a run that finds one
+continues from it and trains the remaining epochs up to max_epochs, so a
+walltime-killed job is simply resubmitted. The weights-only value_state.pt at
+checkpoints/step_0 (what the RL run and the gate read) is unchanged.
 """
 
 from __future__ import annotations
@@ -136,8 +143,21 @@ def train(
     # everything). Per-epoch save keeps the latest trained net; watch the l_v/l_q plateau
     # and scancel when converged. Create the ckpt manager up front.
     ckpt_manager = AdvantageCheckpointManager(config.output_dir, CheckpointConfig(skip_optimizer=True))
+    # Resume checkpoints: weights + optimizer, step = epochs completed, latest only.
+    resume_manager = AdvantageCheckpointManager(
+        Path(config.output_dir) / "resume", CheckpointConfig(skip_optimizer=False, keep_last=1)
+    )
+    start_epoch = 0
+    if config.resume and resume_manager.ckpt_steps:
+        last = resume_manager.ckpt_steps[-1]
+        start_epoch = resume_manager.load(last, backbone, optimizer)
+        logger.info(
+            f"Resuming: {start_epoch} of {config.max_epochs} epochs already completed "
+            f"({resume_manager.get_ckpt_path(last)})"
+        )
     backbone.train()
-    step = 0
+    n_batches_per_epoch = -(-len(dataset) // config.data.batch_size)
+    step = start_epoch * n_batches_per_epoch
     summary: dict = {
         "dataset_kind": config.data.kind,
         "dataset_path": str(config.data.path),
@@ -149,7 +169,19 @@ def train(
     if config.data.kind == "branched":
         summary["n_root_targets"] = dataset.n_root_targets
         summary["n_dropped_empty_samples"] = dataset.n_dropped_empty
-    for epoch in range(config.max_epochs):
+    summary_path = Path(config.output_dir) / "summary.json"
+    if start_epoch > 0 and summary_path.exists():
+        # keep the completed epochs' records so summary.json stays cumulative
+        with open(summary_path) as f:
+            previous = json.load(f)
+        summary["epochs"] = list(previous.get("epochs", []))[:start_epoch]
+        if summary["epochs"]:
+            summary["final"] = summary["epochs"][-1]
+    if start_epoch >= config.max_epochs:
+        logger.info(f"Nothing to do: {start_epoch} epochs completed, max_epochs={config.max_epochs}")
+        _write_json(summary_path, summary)
+        return summary
+    for epoch in range(start_epoch, config.max_epochs):
         epoch_l_v = epoch_l_q = 0.0
         by_prov = {p: {"l_v": 0.0, "l_q": 0.0, "n_samples": 0} for p in PROVENANCES}
         n_batches = 0
@@ -184,6 +216,8 @@ def train(
         # (overwrites each epoch; the RL run resumes from *its* step 0).
         backbone.polyak_update_v_target(tau=1.0)
         ckpt_manager.save(step=0, backbone=backbone, optimizer=optimizer)
+        resume_manager.save(step=epoch + 1, backbone=backbone, optimizer=optimizer)
+        resume_manager.maybe_clean()
         epoch_summary = {
             "epoch": epoch,
             "steps": n_batches,
@@ -201,7 +235,7 @@ def train(
         }
         summary["epochs"].append(epoch_summary)
         summary["final"] = epoch_summary
-        _write_json(Path(config.output_dir) / "summary.json", summary)
+        _write_json(summary_path, summary)
         split = " ".join(
             f"warmstart/l_v/{p}={epoch_summary['by_provenance'][p]['l_v']:.5f} "
             f"warmstart/l_q/{p}={epoch_summary['by_provenance'][p]['l_q']:.5f} "
@@ -212,7 +246,7 @@ def train(
         logger.success(
             f"epoch={epoch} l_v={epoch_summary['l_v']:.5f} "
             f"l_q={epoch_summary['l_q']:.5f} steps={n_batches} | {split} "
-            f"-> saved value_state.pt"
+            f"-> saved value_state.pt (+ resume step {epoch + 1}/{config.max_epochs})"
         )
     return summary
 
