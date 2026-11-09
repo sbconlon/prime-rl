@@ -54,3 +54,13 @@ def test_node_blocks_at_least_two():
 def test_tau_open_interval():
     with pytest.raises(ValueError):
         _cfg(tau=1.0)
+
+
+def test_theta_defaults_to_none_and_is_bounded_by_tau():
+    assert _cfg().theta is None
+    assert _cfg(theta=0.0).theta == 0.0
+    assert _cfg(theta=0.5).theta == 0.5
+    with pytest.raises(ValueError):
+        _cfg(theta=0.6)  # above tau (0.5)
+    with pytest.raises(ValueError):
+        _cfg(theta=-0.1)

@@ -64,6 +64,7 @@ def _load_dataset(config: WarmStartTrainConfig):
             config.data.path,
             holdout_ids=_load_holdout_ids(config.data.holdout_ids_path),
             include_holdout=config.data.include_holdout,
+            min_p_accept=config.data.min_p_accept,
         )
         return ds, list(ds.provenance), sorted(ds.holdout_game_ids)
     ds = WarmStartDataset(config.data.path)

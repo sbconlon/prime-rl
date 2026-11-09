@@ -113,3 +113,18 @@ def test_q_fn_called_once_per_root_action():
 
     score_pairs(pairs, q)
     assert sorted(calls) == ["go to desk 1", "go to dresser 1", "open drawer 1"]
+
+
+def test_min_p_accept_filter_and_p_band_split():
+    weak = _branch(2, 0.0, "b2", block="elicited", src="tail")  # go to dresser -> 0
+    weak.p_accept = 0.03
+    recs = [_trunk(reward=0.0), _branch(1, 1.0, "b1"), weak]  # trunk desk 0, drawer 1 (p 0.7)
+    pairs = contrast_pairs(recs)
+    # (desk, drawer) and (dresser, drawer); desk vs dresser tie on return
+    assert len(pairs) == 2
+    out = score_pairs(pairs, lambda o_ids, a: 1.0 if a == "open drawer 1" else 0.0)
+    assert out["by_p_band"]["p>=0.5"] == {"n": 2, "accuracy": 1.0}
+    assert out["by_p_band"]["0.01<=p<0.1"] == {"n": 1, "accuracy": 1.0}
+    kept = contrast_pairs(recs, min_p_accept=0.1)
+    assert len(kept) == 1
+    assert {kept[0].a_i, kept[0].a_j} == {"go to desk 1", "open drawer 1"}

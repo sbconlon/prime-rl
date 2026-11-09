@@ -48,6 +48,10 @@ class ContrastEvalConfig(BaseConfig):
         Field(description="JSON list of game ids treated as held out (in addition to the flag)."),
     ] = None
     out: Annotated[Path, Field(description="Output JSON path.")] = Path("gate/contrast.json")
+    min_p_accept: Annotated[
+        float | None,
+        Field(ge=0.0, le=1.0, description="Ignore branches accepted below this p (BranchRecord.p_accept; D-17)."),
+    ] = None
     max_pairs: Annotated[
         int | None,
         Field(description="Score at most this many pairs (deterministic order; None = all)."),
@@ -66,6 +70,7 @@ class RootMember:
     block_source: str | None = None
     action_source: str | None = None
     branch_id: str | None = None
+    p_accept: float | None = None
 
 
 @dataclass
@@ -113,7 +118,19 @@ def _member_at(record: BranchRecord, joint_idx: int, provenance: str) -> RootMem
         block_source=record.block_source,
         action_source=record.action_source,
         branch_id=record.branch_id,
+        p_accept=record.p_accept if provenance == "branch" else None,
     )
+
+
+P_BANDS = ((0.5, "p>=0.5"), (0.1, "0.1<=p<0.5"), (0.01, "0.01<=p<0.1"))
+
+
+def p_band(p: float) -> str:
+    """Acceptance band of a forced root (BranchRecord.p_accept; D-17)."""
+    for lo, name in P_BANDS:
+        if p >= lo:
+            return name
+    return "p<0.01"
 
 
 def _meta(members: list[RootMember]) -> dict:
@@ -122,6 +139,7 @@ def _meta(members: list[RootMember]) -> dict:
         "provenance": sorted({m.provenance for m in members}),
         "block_source": sorted({m.block_source for m in members if m.block_source}),
         "action_source": sorted({m.action_source for m in members if m.action_source}),
+        "p_band": sorted({p_band(m.p_accept) for m in members if m.p_accept is not None}),
         "n_episodes": len(members),
     }
 
@@ -131,6 +149,7 @@ def contrast_pairs(
     *,
     holdout_only: bool = True,
     holdout_ids: set[str] | None = None,
+    min_p_accept: float | None = None,
 ) -> list[Pair]:
     """Enumerate root pairs: for each (trunk_id, root_turn) with at least one
     branch, group members by action (trunk's own action included), average g per
@@ -148,6 +167,8 @@ def contrast_pairs(
             trunks[r.trunk_id] = r
             continue
         if r.root_dp is None or r.root_turn is None:
+            continue
+        if min_p_accept is not None and r.p_accept is not None and r.p_accept < min_p_accept:
             continue
         m = _member_at(r, r.root_dp, "branch")
         if m is None:
@@ -225,6 +246,7 @@ def score_pairs(
         "provenance": defaultdict(list),
         "block_source": defaultdict(list),
         "action_source": defaultdict(list),
+        "p_band": defaultdict(list),
     }
     kinds: dict[str, list[bool]] = defaultdict(list)
     for p in pairs:
@@ -270,6 +292,7 @@ def score_pairs(
         "by_provenance": {k: agg(v) for k, v in sorted(splits["provenance"].items())},
         "by_block_source": {k: agg(v) for k, v in sorted(splits["block_source"].items())},
         "by_action_source": {k: agg(v) for k, v in sorted(splits["action_source"].items())},
+        "by_p_band": {k: agg(v) for k, v in sorted(splits["p_band"].items())},
         "pairs": rows,
     }
 
@@ -314,6 +337,7 @@ def contrast_eval(config: ContrastEvalConfig) -> dict:
         read_branch_records(config.dataset),
         holdout_only=config.holdout_only,
         holdout_ids=_load_holdout_ids(config.holdout_ids_path),
+        min_p_accept=config.min_p_accept,
     )
     if not pairs:
         raise ValueError(

@@ -242,6 +242,7 @@ class CollectStats:
     accept_by_block_source: dict[str, int] = field(default_factory=dict)
     attempts_by_action_source: dict[str, int] = field(default_factory=dict)
     accept_by_action_source: dict[str, int] = field(default_factory=dict)
+    accept_weak_by_action_source: dict[str, int] = field(default_factory=dict)
     root_labels_by_verb_class: dict[str, int] = field(default_factory=dict)
     reject_reasons: dict[str, int] = field(default_factory=dict)
     admissible_mass_at_roots_sum: float = 0.0

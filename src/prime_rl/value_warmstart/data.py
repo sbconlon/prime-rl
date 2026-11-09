@@ -65,6 +65,7 @@ class BranchedDataset:
         n_step: int | None = None,
         holdout_ids: set[str] | None = None,
         include_holdout: bool = False,
+        min_p_accept: float | None = None,
     ):
         holdout_ids = set(holdout_ids or ())
         self._samples: list[AdvantageTrainingSample] = []
@@ -74,6 +75,8 @@ class BranchedDataset:
         self.n_holdout_records = 0
         self.n_root_targets = 0
         self.n_dropped_empty = 0
+        # branch records dropped by min_p_accept (weakly accepted forced roots, D-17)
+        self.n_dropped_low_p = 0
         for record in read_branch_records(path):
             self.n_records += 1
             is_holdout = bool(record.holdout) or record.game_id in holdout_ids
@@ -82,6 +85,14 @@ class BranchedDataset:
                 self.holdout_game_ids.add(record.game_id)
                 if not include_holdout:
                     continue
+            if (
+                min_p_accept is not None
+                and record.root_forced
+                and record.p_accept is not None
+                and record.p_accept < min_p_accept
+            ):
+                self.n_dropped_low_p += 1
+                continue
             samples = build_warmstart_samples(
                 record.samples,
                 episodic_reward=record.reward,

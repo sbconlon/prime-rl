@@ -133,6 +133,17 @@ class WarmStartDataConfig(BaseConfig):
         bool,
         Field(description="Train on held-out records too (debug only; defeats the gate's G-A)."),
     ] = False
+    min_p_accept: Annotated[
+        float | None,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Branched only: drop branch records whose forced root was accepted with "
+                "p(action | o, reasoning) below this (BranchRecord.p_accept; D-17). None keeps all."
+            ),
+        ),
+    ] = None
 
 
 class WarmStartTrainConfig(BaseConfig):
@@ -234,6 +245,19 @@ class BranchCollectConfig(CollectConfig):
         float,
         Field(gt=0.0, lt=1.0, description="Acceptance threshold on the normalized row value at the action."),
     ] = 0.5
+    theta: Annotated[
+        float | None,
+        Field(
+            ge=0.0,
+            lt=1.0,
+            description=(
+                "Weak acceptance (D-17): when no candidate reaches tau, the best of the sampled blocks "
+                "and the elicited attempts is taken if its row value at the action is >= theta. "
+                "None = tau (strong acceptance only). The value lands in BranchRecord.p_accept, so "
+                "data.min_p_accept can tighten it at train time without recollecting."
+            ),
+        ),
+    ] = None
     n_elicit: Annotated[
         int,
         Field(ge=0, description="Elicitation attempts per action without a congruent sampled block."),
@@ -274,4 +298,6 @@ class BranchCollectConfig(CollectConfig):
             raise ValueError("n_uniform must be <= branches_per_root")
         if self.stage2_roots > self.stage1_roots:
             raise ValueError("stage2_roots must be <= stage1_roots")
+        if self.theta is not None and self.theta > self.tau:
+            raise ValueError("theta must be <= tau")
         return self

@@ -465,3 +465,51 @@ def test_pick_actions_resolves_real_module():
     assert picks[0] == ("b", "own")
     assert {src for _, src in picks} == {"own", "tail"}
     assert all(a != "a" for a, _ in picks)
+
+
+# ---------------------------------------------------------------------------
+# Weak acceptance (D-17): theta reaches the env, weak blocks are recorded
+# ---------------------------------------------------------------------------
+
+
+class _WeakNodeEnv(_FakeNodeEnv):
+    """Own actions are strong (the base stub); tail actions come back weakly
+    accepted with an attempt log, as synthesize_block does under theta < tau."""
+
+    async def synthesize_block(self, client, model, prompt, admissible, action, node, block_args):
+        if action in node.own:
+            return await super().synthesize_block(client, model, prompt, admissible, action, node, block_args)
+        syn = _Syn("why", "elicited", 0.05, 3, ["argmax", "argmax", "argmax"], None,
+                   f"<think>why</think><action>{action}</action>")
+        syn.attempt_log = [
+            {"stage": "sampled", "block_idx": 0, "p": 0.001, "rank": 3, "argmax": node.own[0]},
+            {"stage": "elicited", "reasoning": "why", "p": 0.05, "rank": 2, "argmax": node.own[0],
+             "reason": "argmax", "accepted": "weak"},
+        ]
+        return syn
+
+
+def test_weak_acceptance_is_recorded(tmp_path, monkeypatch):
+    _install_fakes(monkeypatch, {"open drawer 1": 1.0, "look": 0.0})
+    cfg = _cfg(tmp_path, theta=0.01)
+    node_env = _WeakNodeEnv(own=["go to desk 1", "open drawer 1"])
+    ctx = _make_ctx(tmp_path, cfg, node_env)
+    example = {"prompt": [], "info": {"game_file": "/d/train/pps-x/trial_1/game.tw-pddl"}, "example_id": 0, "task": "t"}
+    asyncio.run(bc.collect_game(ctx, 0, example))
+
+    s = ctx.stats
+    assert s.accept_by_action_source == {"own": 2, "tail": 2}
+    assert s.accept_weak_by_action_source == {"tail": 2}
+    tail = [r for r in ctx.writer.records if r.root_forced and r.action_source == "tail"]
+    assert len(tail) == 2 and all(r.p_accept == 0.05 for r in tail)
+    node = json.loads(sorted((tmp_path / "nodes").rglob("t*.json"))[0].read_text())
+    by_src = {c["source"]: c for c in node["chosen"]}
+    assert by_src["tail"]["strong"] is False and by_src["own"]["strong"] is True
+    assert [e["stage"] for e in by_src["tail"]["attempt_log"]] == ["sampled", "elicited"]
+    assert by_src["tail"]["attempt_log"][1]["accepted"] == "weak"
+    assert by_src["own"]["attempt_log"] == []
+
+
+def test_branch_env_args_passes_theta(tmp_path):
+    assert bc._branch_env_args(_cfg(tmp_path))["theta"] is None
+    assert bc._branch_env_args(_cfg(tmp_path, theta=0.02))["theta"] == 0.02

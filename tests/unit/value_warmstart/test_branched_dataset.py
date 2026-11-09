@@ -106,3 +106,16 @@ def test_holdout_excluded_by_flag_and_ids(tmp_path):
     ds_all = BranchedDataset(path, holdout_ids={"g3"}, include_holdout=True)
     assert len(ds_all) == 6
     assert ds_all.holdout_game_ids == {"g2", "g3"}
+
+
+def test_min_p_accept_drops_weakly_accepted_branches(tmp_path):
+    path = tmp_path / "p.msgpack"
+    weak = _branch("g1", 1, 1.0, bid="weak")
+    weak.p_accept = 0.02
+    _write(path, [_trunk("g1"), _branch("g1", 2, 0.0, bid="strong"), weak])
+    full = BranchedDataset(path)
+    assert len(full) == 3 and full.n_dropped_low_p == 0 and full.n_root_targets == 2
+    ds = BranchedDataset(path, min_p_accept=0.1)
+    assert ds.n_dropped_low_p == 1
+    assert ds.provenance == ["trunk", "branch"]
+    assert ds.n_root_targets == 1

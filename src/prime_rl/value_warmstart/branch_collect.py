@@ -300,6 +300,7 @@ async def _process_root(
                 {"action": a, "source": src, "block_source": "none", "block_idx": None, "reasoning": None,
                  "p_accept": None, "attempts": getattr(syn, "attempts", cfg.n_elicit) if syn else cfg.n_elicit,
                  "reject_reasons": list(getattr(syn, "reject_reasons", []) or []) if syn else ["exhausted"],
+                 "attempt_log": list(getattr(syn, "attempt_log", None) or []) if syn else [],
                  "branch_id": None, "g": None}
             )
             continue
@@ -307,6 +308,8 @@ async def _process_root(
         def _upd_acc(s: CollectStats, src=src, syn=syn) -> None:
             CollectStats._bump(s.accept_by_action_source, src)
             CollectStats._bump(s.accept_by_block_source, syn.source)
+            if syn.p_accept < cfg.tau:  # weak acceptance (D-17)
+                CollectStats._bump(s.accept_weak_by_action_source, src)
             s.generations_est += int(getattr(syn, "attempts", 0) or 0)
 
         await ctx.bump(_upd_acc)
@@ -317,6 +320,8 @@ async def _process_root(
             "block_idx": getattr(syn, "block_idx", None), "reasoning": syn.reasoning,
             "p_accept": syn.p_accept, "attempts": getattr(syn, "attempts", 0),
             "reject_reasons": list(getattr(syn, "reject_reasons", []) or []),
+            "attempt_log": list(getattr(syn, "attempt_log", None) or []),
+            "strong": bool(syn.p_accept >= cfg.tau),
             "branch_id": branch_id, "g": None,
         }
         chosen_rows.append(row)
@@ -452,6 +457,7 @@ def _branch_env_args(config: BranchCollectConfig) -> dict:
     args.update(
         branch_mode=True,
         tau=config.tau,
+        theta=config.theta,
         n_elicit=config.n_elicit,
         elicit_prompt=config.elicit_prompt,
         leak_patterns=list(config.leak_patterns),
@@ -468,7 +474,7 @@ async def branch_collect(config: BranchCollectConfig) -> None:
     logger.info(
         f"Branch collect: env={config.env.id} split={env_args.get('split')} allocation={config.allocation} "
         f"B={config.roots_per_trunk} K={config.branches_per_root} n_unif={config.n_uniform} m={config.node_blocks} "
-        f"tau={config.tau} n_elicit={config.n_elicit} -> {out_dir}"
+        f"tau={config.tau} theta={config.theta} n_elicit={config.n_elicit} -> {out_dir}"
     )
 
     env = vf.load_environment(config.env.id, **env_args)
