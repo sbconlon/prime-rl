@@ -266,6 +266,24 @@ class BranchCollectConfig(CollectConfig):
         str,
         Field(description="Instruction appended as a user message; {action} is substituted. Never stored."),
     ] = ELICIT_DEFAULT
+    elicit_variants: Annotated[
+        list[str],
+        Field(
+            description=(
+                "Extra elicitation templates cycled after elicit_prompt: attempt k uses template "
+                "k mod (1 + len(elicit_variants)). The attempt log records the template index."
+            )
+        ),
+    ] = []
+    elicit_exhaustive: Annotated[
+        bool,
+        Field(
+            description=(
+                "Run all n_elicit attempts even after a strong one (the best strong attempt is used), "
+                "so elicitation templates can be compared on the same (o, action). Pilot use."
+            )
+        ),
+    ] = False
     leak_patterns: Annotated[
         list[str],
         Field(description="Case-insensitive regexes; a block matching any is rejected as a leak."),

@@ -513,3 +513,11 @@ def test_weak_acceptance_is_recorded(tmp_path, monkeypatch):
 def test_branch_env_args_passes_theta(tmp_path):
     assert bc._branch_env_args(_cfg(tmp_path))["theta"] is None
     assert bc._branch_env_args(_cfg(tmp_path, theta=0.02))["theta"] == 0.02
+
+
+def test_branch_env_args_passes_elicit_variants(tmp_path):
+    args = bc._branch_env_args(_cfg(tmp_path))
+    assert args["elicit_variants"] == [] and args["elicit_exhaustive"] is False
+    args = bc._branch_env_args(_cfg(tmp_path, elicit_variants=["ALT {action}"], elicit_exhaustive=True, n_elicit=4))
+    assert args["elicit_variants"] == ["ALT {action}"] and args["elicit_exhaustive"] is True
+    assert args["n_elicit"] == 4

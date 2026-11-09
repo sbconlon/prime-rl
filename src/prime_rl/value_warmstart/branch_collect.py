@@ -460,6 +460,8 @@ def _branch_env_args(config: BranchCollectConfig) -> dict:
         theta=config.theta,
         n_elicit=config.n_elicit,
         elicit_prompt=config.elicit_prompt,
+        elicit_variants=list(config.elicit_variants),
+        elicit_exhaustive=config.elicit_exhaustive,
         leak_patterns=list(config.leak_patterns),
     )
     args.setdefault("num_reasoning_blocks", 1)
