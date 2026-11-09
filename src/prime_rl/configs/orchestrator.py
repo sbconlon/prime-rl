@@ -524,6 +524,18 @@ class ProbeConfig(BaseConfig):
         ),
     ] = True
 
+    only: Annotated[
+        bool,
+        Field(
+            description=(
+                "Gate mode (branched-dataset Phase 4): run ONE probe round at checkpoint step 0 against the "
+                "value networks the Advantage Server loaded, write probe_only_metrics.json next to the records, "
+                "and exit the orchestrator before any training step. The launcher skips the trainer and the "
+                "Advantage Trainer processes in this mode."
+            )
+        ),
+    ] = False
+
 
 class CheckpointConfig(BaseConfig):
     """Configures checkpointing the orchestrator."""

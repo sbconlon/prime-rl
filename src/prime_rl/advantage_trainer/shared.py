@@ -41,7 +41,9 @@ def value_regression_backward(
     with prof("advtrainer.forward.v_action", sync_cuda=True):
         v_all, _ = backbone.forward_v_all_positions(prep.trajectory_input_ids)
     v_pred = v_all[prep.dp_sample_idx, prep.dp_v_pos]
-    l_v = (prep.weights * (v_pred - prep.v_targets) ** 2).sum()
+    # Per-leg weights (branched dataset D-10): equal to prep.weights unless a
+    # target masks a leg (v_weight / q_weight = 0).
+    l_v = (prep.v_weights * (v_pred - prep.v_targets) ** 2).sum()
     with prof("advtrainer.backward.v_action", sync_cuda=True):
         (l_v * chunk_scale).backward()
     l_v_contrib = float(l_v.detach().item()) * chunk_scale
@@ -54,7 +56,7 @@ def value_regression_backward(
         o_ids = torch.tensor([prep.q_plus_obs_ids[d]], dtype=torch.long, device=device)
         a_ids = torch.tensor([prep.q_plus_action_ids[d]], dtype=torch.long, device=device)
         q_pred = backbone.forward_q_plus_action(o_ids, a_ids)[0]
-        w = float(prep.weights[d].item())
+        w = float(prep.q_weights[d].item())
         sq = (q_pred - prep.q_plus_targets[d]) ** 2
         (sq * (w * chunk_scale)).backward()
         l_q_contrib += float(sq.detach().item()) * w * chunk_scale

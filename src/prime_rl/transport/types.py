@@ -93,6 +93,11 @@ class DecisionPointTarget(msgspec.Struct, array_like=True, gc=False, omit_defaul
     executed_action: str  # a* text; tokenized at point-of-use
     v_target: float  # = g_k (n-step return)
     q_plus_target: float  # = max(0, Q+(o,a*) - V(o)) + g_k
+    # Branched dataset (plan branched-dataset D-10): per-leg weights. 0.0 masks
+    # the leg at this decision point (a branch root labels Q+ but not V). The
+    # online path never sets them, so its losses are unchanged.
+    v_weight: float = 1.0
+    q_weight: float = 1.0
 
 
 # Phase 6: Advantage Server -> Orchestrator -> Advantage Trainer.

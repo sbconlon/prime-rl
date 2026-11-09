@@ -1,0 +1,64 @@
+# Branched (Job-B) warm-start data generation (plan branched-dataset, Phase 2/5).
+# Serve the frozen SFT policy first (the warm-start inference config on :8000), then:
+#   uv run python -m prime_rl.value_warmstart.branch_collect @ configs/value-warmstart/branch-collect.toml
+# Override per run from the sbatch: --games, --allocation, --output_dir.
+#
+# Trunks and continuations sample exactly as the RL run rolls out (T=0.8, min_p=0.1,
+# ctx 2048, max_turns 15, pick_and_place_simple), so the value nets train on-distribution.
+
+model_name = "/home/3312841/sft/checkpoint/step_40"
+# records.msgpack, nodes/, done/, collect_stats.json, env_worker_*.log live under output_dir;
+# output_path is the parent CollectConfig's required field and is kept equal to the records file.
+output_dir = "/home/3312841/branched/pps/full"
+output_path = "/home/3312841/branched/pps/full/records.msgpack"
+
+# --- size (pilot: 10 games; full: set from the pilot's budget read-out) ---
+games = 10
+holdout_games = 0
+
+# --- roots (D-9) ---
+allocation = "stratified"      # or "two_stage"
+roots_per_trunk = 6
+early_tilt = 0.5
+stage1_roots = 10
+stage2_roots = 4
+
+# --- actions at a root (D-7, D-8) ---
+branches_per_root = 4
+n_uniform = 2
+node_blocks = 8
+
+# --- synthesis (D-4) ---
+tau = 0.5
+n_elicit = 3
+
+# --- budget guards / driver ---
+max_branches_per_game = 32
+resume = true
+seed = 0
+num_workers = 2
+max_concurrent = 16
+rollout_timeout_s = 600.0
+max_retries = 1
+rollouts_per_example = 1
+
+[env]
+id = "alfworld-env"
+
+[env.args]
+data_path = "/home/3312841/.cache/alfworld/json_2.1.1"
+split = "train"
+task_types = ["pick_and_place_simple"]
+max_context_tokens = 2048
+max_turns = 15
+num_reasoning_blocks = 1
+pi_hat_renorm = false
+tokenizer_path = "/home/3312841/sft/checkpoint/step_40"
+
+[client]
+base_url = ["http://127.0.0.1:8000/v1"]
+
+[sampling]
+temperature = 0.8
+min_p = 0.1
+max_tokens = 512

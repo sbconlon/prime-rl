@@ -1,0 +1,191 @@
+# ACTION-LEVEL ARM 1.5B — ALFWorld on Bocconi cluster (gnode02).
+# BRANCHED-DATASET GATE (branched-dataset plan, Phase 4 / Phase 5 step 5): probe.only.
+# Branch: feature/action-level-arm.
+#
+# Identical to arm_action_1.5b_ctx2048_pps_warm_probe.toml (the warm-003-pps-probe config) except:
+#   * [orchestrator.probe] only = true: the orchestrator runs ONE probe round at checkpoint step 0
+#     against the value networks the Advantage Server loads from warm_start_path, writes
+#     <output_dir>/probes/ckpt_0/ + probes/probe_only_metrics.json, and exits. The launcher does not
+#     start the trainer or the Advantage Trainer (the [trainer] / [advantage_trainer] blocks below are
+#     kept so the config validates and the subconfigs render; they are never run).
+#   * warm_start_path on BOTH value processes -> the BRANCHED warm-start's value_state.pt (Phase 5
+#     step 4 output). PLACEHOLDER path: set it to the real run dir before launching.
+#   * fresh output_dir / LoRA name; max_steps = 1 (unused: the loop is never entered).
+# Read the gate with:
+#   python -I gate_check.py --branched --probes <output_dir>/probes --contrast <train>/gate/contrast.json \
+#       --stats <collect>/collect_stats.json --train-summary <train>/summary.json
+# Two-slice layout as the probed run (PRIME_RL_PHYSICAL_GPU_IDS=0,1,0,1): inference + Advantage Server
+# on slice 0; the (unstarted) trainer slots map to slice 1.
+
+max_steps = 1
+seq_len = 17408
+output_dir = "/home/3312841/runs/arm-action-1.5b-sft-ctx2048-warm-004-branched-gate"
+
+[model]
+name = "/home/3312841/sft/checkpoint/step_40"
+
+[trainer.model]
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+fused_lm_head_token_chunk_size = 1024
+
+[trainer.model.ac]
+mode = "full"
+freq = 1
+
+[ckpt]
+interval = 5
+keep_last = 1
+
+[deployment]
+num_train_gpus = 1
+num_infer_gpus = 1
+
+[trainer.optim]
+lr = 1e-5
+
+[trainer.model.lora]
+rank = 64
+alpha = 128.0
+dropout = 0.0
+target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+[trainer.ckpt]
+skip_gather_master_weights = false
+
+[trainer.ckpt.weights]
+save_adapter_separately = true
+
+[orchestrator]
+batch_size = 16
+max_inflight_rollouts = 16
+rollouts_per_example = 4
+algorithm = "arm"
+use_token_client = true
+filters = [
+  { type = "gibberish", enforce = true, token_id_threshold = 100000, logprob_offset = 2.0 },
+  { type = "repetition", enforce = true, window = 3000, prob_threshold = 0.99 },
+]
+
+[orchestrator.advantage_server]
+base_url = "http://127.0.0.1:8200"
+
+[orchestrator.buffer]
+curriculum = [100, 100, 100]
+adaptive_advance_threshold = 0.30
+adaptive_window_size = 20
+online_difficulty_filtering = false
+
+[orchestrator.sampling]
+max_tokens = 512
+temperature = 0.8
+
+[orchestrator.sampling.extra_body]
+min_p = 0.1
+
+[orchestrator.model.lora]
+name = "arm-action-1.5b-sft-ctx2048-warm-004-branched-gate"
+
+[[orchestrator.env]]
+id = "alfworld-env"
+name = "alfworld-train"
+num_workers = 1
+args.data_path = "/home/3312841/.cache/alfworld/json_2.1.1"
+args.split = "train"
+args.max_context_tokens = 2048
+args.tokenizer_path = "/home/3312841/sft/checkpoint/step_40"
+args.max_turns = 15
+args.num_reasoning_blocks = 2
+args.prewarm_pi_hat_prefixes = false
+args.pi_hat_renorm = false
+args.curriculum = [
+  { pick_and_place_simple = 1.0, default = 0.0 },
+  { pick_and_place_simple = 0.2, pick_two_obj_and_place = 0.2, pick_clean_then_place_in_recep = 0.2, pick_cool_then_place_in_recep = 0.2, pick_heat_then_place_in_recep = 0.2, default = 0.0 },
+  { default = 1.0 },
+]
+
+# ---------------------------------------------------------------------------
+# The gate: one probe round at ckpt 0 (probe.only), then exit. Same probe set, sampling,
+# oracle and pi_hat convention as the probed run so the records are comparable turn by turn.
+# ---------------------------------------------------------------------------
+[orchestrator.probe]
+only = true
+interval = 10
+probe_base_model = true
+skip_probe_on_resume = false
+output_subdir = "probes"
+max_retries = 0
+emit_eval_metrics = true
+
+[orchestrator.probe.sampling]
+max_tokens = 512
+temperature = 0.0
+
+[orchestrator.probe.env]
+id = "alfworld-env"
+name = "alfworld-probe"
+args.data_path = "/home/3312841/.cache/alfworld/json_2.1.1"
+args.probe_set = "alfworld-24-v1"
+args.probe_capture = true
+args.num_reasoning_blocks = 2
+args.probe_block_temperature = 0.8
+args.probe_block_min_p = 0.1
+args.oracle = "handcoded"
+args.max_context_tokens = 2048
+args.tokenizer_path = "/home/3312841/sft/checkpoint/step_40"
+args.max_turns = 15
+args.prewarm_pi_hat_prefixes = false
+args.pi_hat_renorm = false
+
+[inference]
+enable_lora = true
+enable_prefix_caching = true
+gpu_memory_utilization = 0.45
+
+[inference.vllm_extra]
+max_logprobs = 8
+max_num_batched_tokens = 8192
+
+[inference.model]
+max_model_len = 3072
+
+[inference.parallel]
+tp = 1
+
+[advantage_server]
+model_name = "/home/3312841/sft/checkpoint/step_40"
+host = "127.0.0.1"
+port = 8200
+gamma = 1.0
+arm_phi_decay = 0.9
+# BRANCHED warm-start (Phase 5 step 4). PLACEHOLDER: point at the real value_state.pt before launching.
+warm_start_path = "/home/3312841/branched/pps/value_nets_branched/checkpoints/step_0/trainer/value_state.pt"
+
+[advantage_server.lora]
+rank = 16
+alpha = 32.0
+dropout = 0.0
+
+[advantage_trainer]
+algorithm = "arm"
+max_steps = 1
+learning_rate = 5e-4
+n_epochs = 1
+minibatch_size = 32
+inner_batch_size = 2
+output_dir = "/home/3312841/runs/arm-action-1.5b-sft-ctx2048-warm-004-branched-gate/advantage_trainer"
+# Kept byte-identical to advantage_server.warm_start_path (both-warm invariant); not started in probe.only.
+warm_start_path = "/home/3312841/branched/pps/value_nets_branched/checkpoints/step_0/trainer/value_state.pt"
+
+[advantage_trainer.model]
+base_model_name = "/home/3312841/sft/checkpoint/step_40"
+polyak_tau = 0.005
+
+[advantage_trainer.model.lora]
+rank = 16
+alpha = 32.0
+dropout = 0.0
+
+[advantage_trainer.ckpt]
+interval = 5
+keep_last = 1

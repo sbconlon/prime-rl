@@ -14,7 +14,8 @@ from prime_rl.configs.rl import RLConfig
 from prime_rl.configs.sft import SFTConfig
 from prime_rl.configs.trainer import ModelConfig as TrainerModelConfig
 from prime_rl.configs.trainer import TrainerConfig
-from prime_rl.configs.value_warmstart import CollectConfig, WarmStartTrainConfig
+from prime_rl.configs.value_warmstart import BranchCollectConfig, CollectConfig, WarmStartTrainConfig
+from prime_rl.value_warmstart.contrast_eval import ContrastEvalConfig
 from prime_rl.utils.config import BaseConfig, cli
 
 # All config config classes. The two Advantage* entries (Phase 6/7) cover
@@ -32,6 +33,8 @@ CONFIG_CLASSES = [
     AdvantageTrainerConfig,
     CollectConfig,
     WarmStartTrainConfig,
+    BranchCollectConfig,
+    ContrastEvalConfig,
 ]
 
 

@@ -44,6 +44,7 @@ from prime_rl.orchestrator.eval_utils import get_eval_sampling_args
 from prime_rl.orchestrator.trajectories import interleave_rollout, pretokenize_rollout_trajectory
 from prime_rl.orchestrator.vf_utils import generate, get_completion_len
 from prime_rl.transport.types import DecisionPoint, TrainingSample
+from prime_rl.utils.alfworld_actions import verb_class
 from prime_rl.utils.logger import get_logger
 
 PROBE_SCHEMA_VERSION = 1
@@ -302,6 +303,74 @@ def assemble_probe_rollout(
     }
 
 
+
+# ---------------------------------------------------------------------------
+# Gate metrics (branched-dataset Phase 4, master doc section 8)
+# ---------------------------------------------------------------------------
+
+# Oracle statuses that count as a usable expert answer for G-C.
+ORACLE_GATE_STATUSES = ("expert", "look_fallback")
+
+
+def _pstd(xs: list[float]) -> float:
+    n = len(xs)
+    if n == 0:
+        return 0.0
+    mu = sum(xs) / n
+    return math.sqrt(sum((x - mu) ** 2 for x in xs) / n)
+
+
+def _median(xs: list[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return float(s[mid]) if n % 2 else float((s[mid - 1] + s[mid]) / 2.0)
+
+
+def gate_metrics(turns: list[dict[str, Any]]) -> dict[str, float]:
+    """Per-round gate metrics over the assembled turns (pure).
+
+    ``probe/q_plus_std_median``: median over turns of the population std of Q+
+    across the admissible set (G-B: discrimination). ``probe/argmax_q_is_exec_rate``:
+    how often argmax Q+ is the executed action. ``probe/argmax_q_is_oracle_rate``
+    (G-C) and its ``/<verb_class>`` split: over turns whose oracle status is
+    expert / look_fallback and whose oracle action is admissible, how often
+    argmax Q+ is the oracle's action. The oracle is read, never trained on (D-6).
+    """
+    m: dict[str, float] = {}
+    stds: list[float] = []
+    exec_hits: list[float] = []
+    oracle_hits: list[float] = []
+    by_class: dict[str, list[float]] = defaultdict(list)
+    for t in turns:
+        q = [float(x) for x in ((t.get("values") or {}).get("q_plus") or [])]
+        if not q:
+            continue
+        stds.append(_pstd(q))
+        am = max(range(len(q)), key=lambda i: q[i])
+        idx = (t.get("executed") or {}).get("idx")
+        if idx is not None:
+            exec_hits.append(float(am == int(idx)))
+        oracle = t.get("oracle") or {}
+        adm = [str(a) for a in (t.get("admissible") or [])]
+        action = oracle.get("action")
+        if oracle.get("status") in ORACLE_GATE_STATUSES and action in adm and am < len(adm):
+            hit = float(adm[am] == action)
+            oracle_hits.append(hit)
+            by_class[verb_class(action)].append(hit)
+    if stds:
+        m["probe/q_plus_std_median"] = _median(stds)
+    if exec_hits:
+        m["probe/argmax_q_is_exec_rate"] = float(sum(exec_hits) / len(exec_hits))
+    if oracle_hits:
+        m["probe/argmax_q_is_oracle_rate"] = float(sum(oracle_hits) / len(oracle_hits))
+        for cls, hits in sorted(by_class.items()):
+            m[f"probe/argmax_q_is_oracle_rate/{cls}"] = float(sum(hits) / len(hits))
+    return m
+
+
 def probe_metrics(
     records: list[dict[str, Any]],
     completion_lens: list[int],
@@ -356,6 +425,9 @@ def probe_metrics(
             float(t["executed"]["text"] == (t["oracle"] or {}).get("action")) for t in expert
         )
     m["probe/q_plus_spread_mean"] = _mean(max(t["values"]["q_plus"]) - min(t["values"]["q_plus"]) for t in turns)
+    # Gate metrics (branched-dataset Phase 4): Q+ discrimination over the admissible
+    # set and whether its argmax is the oracle's / the executed action.
+    m.update(gate_metrics(turns))
     m["probe/pi_rm_entropy_mean"] = _mean(
         -sum(p * math.log(p) for p in t["values"]["pi_rm"] if p > 0.0) for t in turns
     )
@@ -544,3 +616,27 @@ class ProbeRunner:
             + (f", Avg@1={avg:.4f}" if avg is not None else "")
         )
         return metrics
+
+
+async def run_probe_only(
+    runner: "ProbeRunner",
+    *,
+    output_dir: Path,
+    ckpt_step: int = 0,
+    orchestrator_step: int = 0,
+) -> dict[str, float]:
+    """``probe.only`` (branched-dataset Phase 4): one probe round against the value
+    networks the Advantage Server loaded (its ``warm_start_path``), its metrics
+    saved next to the records as ``<output_subdir>/probe_only_metrics.json``, then
+    return so the orchestrator can exit. No trainer is involved and nothing is sent
+    anywhere; the caller tears the processes down.
+    """
+    logger = get_logger()
+    logger.info(f"probe.only: one probe round at checkpoint step {ckpt_step}, then exit")
+    metrics = await runner.run_round(ckpt_step=ckpt_step, orchestrator_step=orchestrator_step)
+    out_dir = Path(output_dir) / runner.config.output_subdir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "probe_only_metrics.json"
+    path.write_text(json.dumps(metrics, indent=2, sort_keys=True), encoding="utf-8")
+    logger.success(f"probe.only: round done, metrics at {path}")
+    return metrics

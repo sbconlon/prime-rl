@@ -4,9 +4,9 @@ generation) and `warmstart-train` (offline value regression)."""
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from prime_rl.configs.orchestrator import EnvConfig, EvalSamplingConfig
 from prime_rl.configs.shared import ClientConfig, LogConfig
@@ -111,6 +111,28 @@ class WarmStartDataConfig(BaseConfig):
         int,
         Field(ge=1, description="Activation-memory chunk size inside one batch (grad accumulates)."),
     ] = 8
+    kind: Annotated[
+        Literal["warmstart", "branched"],
+        Field(
+            description=(
+                "Dataset kind: 'warmstart' = single-action WarmStartRecords (warmstart-collect); "
+                "'branched' = BranchRecords (branch-collect; plan branched-dataset Phase 3)."
+            )
+        ),
+    ] = "warmstart"
+    holdout_ids_path: Annotated[
+        Path | None,
+        Field(
+            description=(
+                "JSON list of game ids to hold out (branched only), in addition to records "
+                "flagged holdout by the collect. Excluded ids are written to output_dir/holdout.json."
+            )
+        ),
+    ] = None
+    include_holdout: Annotated[
+        bool,
+        Field(description="Train on held-out records too (debug only; defeats the gate's G-A)."),
+    ] = False
 
 
 class WarmStartTrainConfig(BaseConfig):
@@ -149,3 +171,107 @@ class WarmStartTrainConfig(BaseConfig):
         LogConfig,
         Field(description="Logging configuration."),
     ] = LogConfig()
+
+
+ELICIT_DEFAULT = (
+    "Your next action has been decided: {action}. Write your reasoning for this "
+    "step in your usual format and end with exactly that action."
+)
+
+LEAK_DEFAULT = [
+    r"\bdecided\b",
+    r"\btold\b",
+    r"\binstruct",
+    r"\bgiven action\b",
+    r"\basked to\b",
+    r"\bchosen for me\b",
+    r"\bmust take\b",
+    r"\bhas been decided\b",
+]
+
+
+class BranchCollectConfig(CollectConfig):
+    """Generate the branched (Job-B) warm-start dataset: trunks from the frozen SFT
+    policy, branches at selected roots with a forced, congruent action, labels for
+    every (o, a) leg. See plan/branched-dataset (master doc §2, D-4, D-8, D-9)."""
+
+    # --- roots (D-9) ---
+    roots_per_trunk: Annotated[
+        int,
+        Field(ge=1, description="B: roots per trunk under the stratified allocation."),
+    ] = 6
+    allocation: Annotated[
+        Literal["stratified", "two_stage"],
+        Field(description="Root allocation: stratified with early tilt, or two-stage hindsight."),
+    ] = "stratified"
+    early_tilt: Annotated[
+        float,
+        Field(ge=0.0, le=1.0, description="Share of roots placed in the first third of the trunk."),
+    ] = 0.5
+    stage1_roots: Annotated[
+        int,
+        Field(ge=1, description="B1: candidate roots probed with one branch (two_stage)."),
+    ] = 10
+    stage2_roots: Annotated[
+        int,
+        Field(ge=0, description="B2: pivotal roots that receive the full fan (two_stage)."),
+    ] = 4
+    # --- actions at a root (D-7, D-8) ---
+    branches_per_root: Annotated[
+        int,
+        Field(ge=1, description="K: actions branched per root."),
+    ] = 4
+    n_uniform: Annotated[
+        int,
+        Field(ge=0, description="n_unif: uniform draws over the admissible tail per root."),
+    ] = 2
+    node_blocks: Annotated[
+        int,
+        Field(ge=2, description="m: sampled reasoning blocks at a root (plus one greedy)."),
+    ] = 8
+    # --- synthesis (D-4) ---
+    tau: Annotated[
+        float,
+        Field(gt=0.0, lt=1.0, description="Acceptance threshold on the normalized row value at the action."),
+    ] = 0.5
+    n_elicit: Annotated[
+        int,
+        Field(ge=0, description="Elicitation attempts per action without a congruent sampled block."),
+    ] = 3
+    elicit_prompt: Annotated[
+        str,
+        Field(description="Instruction appended as a user message; {action} is substituted. Never stored."),
+    ] = ELICIT_DEFAULT
+    leak_patterns: Annotated[
+        list[str],
+        Field(description="Case-insensitive regexes; a block matching any is rejected as a leak."),
+    ] = LEAK_DEFAULT
+    # --- budget guards / IO ---
+    max_branches_per_game: Annotated[
+        int,
+        Field(ge=1, description="Hard cap on branch episodes per game."),
+    ] = 32
+    games: Annotated[
+        int | None,
+        Field(description="Number of train games to process (None = env dataset size)."),
+    ] = None
+    holdout_games: Annotated[
+        int,
+        Field(ge=0, description="Last N games are tagged held-out (for the gate's G-A)."),
+    ] = 50
+    output_dir: Annotated[
+        Path,
+        Field(description="Run directory: records.msgpack, nodes/, done/, collect_stats.json."),
+    ] = Path("outputs/branch_collect")
+    resume: Annotated[
+        bool,
+        Field(description="Skip games with a done marker in output_dir/done/."),
+    ] = True
+
+    @model_validator(mode="after")
+    def _validate_branching(self) -> "BranchCollectConfig":
+        if self.n_uniform > self.branches_per_root:
+            raise ValueError("n_uniform must be <= branches_per_root")
+        if self.stage2_roots > self.stage1_roots:
+            raise ValueError("stage2_roots must be <= stage1_roots")
+        return self

@@ -43,7 +43,7 @@ from prime_rl.configs.orchestrator import BufferConfig, OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
 from prime_rl.orchestrator.ckpt import Progress, setup_ckpt_manager
 from prime_rl.orchestrator.eval_utils import evaluate_env
-from prime_rl.orchestrator.probe import ProbeRunner
+from prime_rl.orchestrator.probe import ProbeRunner, run_probe_only
 from prime_rl.orchestrator.filters import apply_filters, setup_filters
 from prime_rl.orchestrator.scheduler import Scheduler
 from prime_rl.orchestrator.utils import (
@@ -415,6 +415,28 @@ async def orchestrate(config: OrchestratorConfig):
             f"Probe configured: every {config.probe.interval} checkpoint step(s), "
             f"records under {config.output_dir / config.probe.output_subdir}"
         )
+
+    # branched-dataset Phase 4 (probe.only): the gate. One probe round at checkpoint
+    # step 0 against the value networks the Advantage Server loaded, then a clean exit
+    # before the weight broadcast, the senders and the loop. No trainer process is
+    # involved and nothing is sent anywhere.
+    if probe_runner is not None and config.probe and config.probe.only:
+        await run_probe_only(probe_runner, output_dir=config.output_dir)
+        try:
+            monitor.save_final_summary()
+        except Exception as exc:  # noqa: BLE001 -- the summary is best effort here
+            logger.warning(f"probe.only: monitor summary failed: {exc!r}")
+        await scheduler.stop()
+        await inference_pool.stop()
+        if teacher_inference_pool is not None:
+            await teacher_inference_pool.stop()
+        if advantage_server_client is not None:
+            await advantage_server_client.aclose()
+        event_loop_lag_monitor_task.cancel()
+        atexit.unregister(_cleanup_env_processes)
+        _cleanup_env_processes()
+        logger.success("Orchestrator finished (probe.only).")
+        return
 
     # Set up weight broadcast backend
     if enable_policy_updates:

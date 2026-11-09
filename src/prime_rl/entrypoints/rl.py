@@ -80,6 +80,14 @@ def get_physical_gpu_ids() -> list[int | str]:
     return _parse_device_tokens(raw_visible)
 
 
+def is_probe_only(config) -> bool:
+    """branched-dataset Phase 4: ``orchestrator.probe.only``. The launcher then
+    starts inference, the Advantage Server and the orchestrator only; the trainer
+    and the Advantage Trainer are skipped (one probe round at ckpt 0, then exit)."""
+    probe = getattr(getattr(config, "orchestrator", None), "probe", None)
+    return bool(probe is not None and getattr(probe, "only", False))
+
+
 def write_config(config: RLConfig, output_dir: Path, exclude: set[str] | None = None) -> None:
     """Write resolved config to disk, excluding launcher-only fields."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -192,6 +200,12 @@ def rl_local(config: RLConfig):
     if config.dry_run:
         logger.success("Dry run complete. To start an RL run locally, remove --dry-run from your command.")
         return
+
+    # branched-dataset Phase 4: probe.only runs inference + Advantage Server + orchestrator
+    # (one probe round at ckpt 0, then exit); no trainer, no Advantage Trainer.
+    probe_only = is_probe_only(config)
+    if probe_only:
+        logger.info("orchestrator.probe.only: the trainer and the Advantage Trainer will not be started")
 
     # Derive launcher-local GPU IDs from deployment config
     gpu_offset = 0
@@ -412,7 +426,7 @@ def rl_local(config: RLConfig):
         # config.orchestrator.output_dir / "advantage_trainer_transport"
         # and POSTs updated weights to the Advantage Server's
         # /update_weights endpoint after each gradient step.
-        if config.advantage_trainer is not None:
+        if config.advantage_trainer is not None and not probe_only:
             adv_trainer_cmd = [
                 "uv", "run", "advantage-trainer", "@",
                 (config_dir / ADVANTAGE_TRAINER_TOML).as_posix(),
@@ -484,64 +498,69 @@ def rl_local(config: RLConfig):
         monitor_thread.start()
         monitor_threads.append(monitor_thread)
 
-        # Start training process
-        trainer_cmd = [
-            "uv",
-            "run",
-            "env",
-            "PYTHONUNBUFFERED=1",
-            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
-            "torchrun",
-            f"--rdzv-endpoint=localhost:{get_free_port()}",
-            f"--rdzv-id={uuid.uuid4().hex}",
-            # Pipe all logs to file, and only master rank logs to stdout
-            f"--log-dir={config.output_dir / 'torchrun'}",
-            "--local-ranks-filter=0",
-            "--redirect=3",
-            "--tee=3",
-            f"--nproc-per-node={len(trainer_gpu_ids)}",
-            "-m",
-            "prime_rl.trainer.rl.train",
-            "@",
-            (config_dir / TRAINER_TOML).as_posix(),
-        ]
-        logger.info(f"Starting trainer on GPU(s) {' '.join(map(str, trainer_gpu_ids))}")
-        logger.debug(f"Training start command: {' '.join(trainer_cmd)}")
-        with open(log_dir / "trainer.stdout", "w") as log_file:
-            trainer_process = Popen(
-                trainer_cmd,
-                env={
-                    **os.environ,
-                    **wandb_shared_env,
-                    "WANDB_SHARED_LABEL": "trainer",
-                    "CUDA_VISIBLE_DEVICES": ",".join(map(str, trainer_gpu_ids)),
-                    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                    "LOGURU_FORCE_COLORS": "1",
-                    "WANDB_PROGRAM": "uv run rl",
-                    "WANDB_ARGS": json.dumps(start_command),
-                },
-                stdout=log_file,
-                stderr=log_file,
-            )
-        processes.append(trainer_process)
+        if probe_only:
+            logger.info("probe.only: trainer not started")
+        else:
+            # Start training process
+            trainer_cmd = [
+                "uv",
+                "run",
+                "env",
+                "PYTHONUNBUFFERED=1",
+                "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+                "torchrun",
+                f"--rdzv-endpoint=localhost:{get_free_port()}",
+                f"--rdzv-id={uuid.uuid4().hex}",
+                # Pipe all logs to file, and only master rank logs to stdout
+                f"--log-dir={config.output_dir / 'torchrun'}",
+                "--local-ranks-filter=0",
+                "--redirect=3",
+                "--tee=3",
+                f"--nproc-per-node={len(trainer_gpu_ids)}",
+                "-m",
+                "prime_rl.trainer.rl.train",
+                "@",
+                (config_dir / TRAINER_TOML).as_posix(),
+            ]
+            logger.info(f"Starting trainer on GPU(s) {' '.join(map(str, trainer_gpu_ids))}")
+            logger.debug(f"Training start command: {' '.join(trainer_cmd)}")
+            with open(log_dir / "trainer.stdout", "w") as log_file:
+                trainer_process = Popen(
+                    trainer_cmd,
+                    env={
+                        **os.environ,
+                        **wandb_shared_env,
+                        "WANDB_SHARED_LABEL": "trainer",
+                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, trainer_gpu_ids)),
+                        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                        "LOGURU_FORCE_COLORS": "1",
+                        "WANDB_PROGRAM": "uv run rl",
+                        "WANDB_ARGS": json.dumps(start_command),
+                    },
+                    stdout=log_file,
+                    stderr=log_file,
+                )
+            processes.append(trainer_process)
 
-        # Start monitoring thread
-        stop_event = Event()
-        stop_events["trainer"] = stop_event
-        monitor_thread = Thread(
-            target=monitor_process, args=(trainer_process, stop_event, error_queue, "trainer"), daemon=True
-        )
-        monitor_thread.start()
-        monitor_threads.append(monitor_thread)
+            # Start monitoring thread
+            stop_event = Event()
+            stop_events["trainer"] = stop_event
+            monitor_thread = Thread(
+                target=monitor_process, args=(trainer_process, stop_event, error_queue, "trainer"), daemon=True
+            )
+            monitor_thread.start()
+            monitor_threads.append(monitor_thread)
 
         # Monitor all processes for failures
-        logger.success("Startup complete. Showing trainer logs...")
+        tail_name = "orchestrator.stdout" if probe_only else "trainer.stdout"
+        logger.success(f"Startup complete. Showing {tail_name.split('.')[0]} logs...")
 
-        tail_process = Popen(["tail", "-F", log_dir / "trainer.stdout"])
+        tail_process = Popen(["tail", "-F", log_dir / tail_name])
         processes.append(tail_process)
 
         # Check for errors from monitor threads
-        while not (stop_events["orchestrator"].is_set() and stop_events["trainer"].is_set()):
+        awaited = ["orchestrator"] + ([] if probe_only else ["trainer"])
+        while not all(stop_events[name].is_set() for name in awaited):
             if error_queue:
                 error = error_queue[0]
                 logger.error(f"Error: {error}")
@@ -560,7 +579,7 @@ def rl_local(config: RLConfig):
             cleanup_processes(processes)
             sys.exit(1)
 
-        if trainer_process.returncode != 0:
+        if not probe_only and trainer_process.returncode != 0:
             logger.error(f"Trainer failed with exit code {trainer_process.returncode}")
             cleanup_threads(monitor_threads)
             cleanup_processes(processes)

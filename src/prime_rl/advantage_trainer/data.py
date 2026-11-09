@@ -254,6 +254,9 @@ class PreparedActionAdvantageInputs:
         v_targets [D], q_plus_targets [D]
         weights [D]          1/(S * c_s) so per-dp weighted sum == per-sample mean
                              then mean across the S samples that have decision points.
+        v_weights [D]        weights * DecisionPointTarget.v_weight (the V leg's weights;
+                             == weights unless a target masks V, branched dataset D-10).
+        q_weights [D]        weights * DecisionPointTarget.q_weight (the Q+ leg's weights).
         n_samples K
     """
 
@@ -265,6 +268,8 @@ class PreparedActionAdvantageInputs:
     v_targets: Tensor
     q_plus_targets: Tensor
     weights: Tensor
+    v_weights: Tensor
+    q_weights: Tensor
     n_samples: int
 
 
@@ -297,6 +302,8 @@ def prepare_action_advantage_samples(
     q_plus_action_ids: list[list[int]] = []
     v_targets: list[float] = []
     q_plus_targets: list[float] = []
+    v_weight_mult: list[float] = []
+    q_weight_mult: list[float] = []
     per_sample_counts = [0] * K
 
     for k, s in enumerate(samples):
@@ -313,6 +320,8 @@ def prepare_action_advantage_samples(
             q_plus_action_ids.append(tokenize_action(tokenizer, dpt.executed_action))
             v_targets.append(float(dpt.v_target))
             q_plus_targets.append(float(dpt.q_plus_target))
+            v_weight_mult.append(float(getattr(dpt, "v_weight", 1.0)))
+            q_weight_mult.append(float(getattr(dpt, "q_weight", 1.0)))
             per_sample_counts[k] += 1
 
     n_present = sum(1 for c in per_sample_counts if c > 0)
@@ -330,5 +339,11 @@ def prepare_action_advantage_samples(
         v_targets=torch.tensor(v_targets, dtype=torch.float32, device=device),
         q_plus_targets=torch.tensor(q_plus_targets, dtype=torch.float32, device=device),
         weights=torch.tensor(weights, dtype=torch.float32, device=device),
+        v_weights=torch.tensor(
+            [w * m for w, m in zip(weights, v_weight_mult)], dtype=torch.float32, device=device
+        ),
+        q_weights=torch.tensor(
+            [w * m for w, m in zip(weights, q_weight_mult)], dtype=torch.float32, device=device
+        ),
         n_samples=K,
     )
