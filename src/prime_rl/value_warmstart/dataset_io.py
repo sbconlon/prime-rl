@@ -100,6 +100,45 @@ def _frames(path: Path) -> Iterator[bytes]:
             yield f.read(n)
 
 
+def compact_records(path: Path, keep_game) -> dict:
+    """Rewrite a BranchRecord file keeping only the frames whose game_id passes
+    ``keep_game`` (records without a game_id are kept). A truncated final frame
+    (a writer killed mid-write) is dropped. The file is replaced atomically and
+    only when something was dropped. Returns {"kept", "dropped", "truncated",
+    "dropped_games"}."""
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".compact")
+    kept = dropped = 0
+    truncated = False
+    dropped_games: set[str] = set()
+    with open(path, "rb") as src, open(tmp, "wb") as dst:
+        while True:
+            header = src.read(4)
+            if not header:
+                break
+            if len(header) < 4:
+                truncated = True
+                break
+            (n,) = struct.unpack("<I", header)
+            blob = src.read(n)
+            if len(blob) < n:
+                truncated = True
+                break
+            game_id = _BRANCH_DECODER.decode(blob).game_id
+            if game_id and not keep_game(game_id):
+                dropped += 1
+                dropped_games.add(game_id)
+                continue
+            dst.write(header)
+            dst.write(blob)
+            kept += 1
+    if dropped or truncated:
+        tmp.replace(path)
+    else:
+        tmp.unlink()
+    return {"kept": kept, "dropped": dropped, "truncated": truncated, "dropped_games": sorted(dropped_games)}
+
+
 def read_records(path: Path) -> Iterator[WarmStartRecord]:
     """Yield each record as a WarmStartRecord (trailing BranchRecord fields ignored)."""
     for blob in _frames(path):

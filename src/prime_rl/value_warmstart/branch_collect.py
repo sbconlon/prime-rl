@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,7 +58,7 @@ from prime_rl.value_warmstart.branch_records import (
     write_node_json,
 )
 from prime_rl.value_warmstart.collect import keep_output
-from prime_rl.value_warmstart.dataset_io import RecordWriter
+from prime_rl.value_warmstart.dataset_io import RecordWriter, compact_records
 
 
 def _pick_actions(own, admissible, a_taken, k, n_unif, rng):
@@ -354,6 +355,37 @@ async def _process_root(
     return list(results)
 
 
+def drop_unfinished_games(out_dir: Path, logger=None) -> dict:
+    """Resume hygiene: remove everything written for games that have no done marker.
+
+    A game writes its trunk record first, then node files and branch records as it
+    goes, and its done marker last. A run killed mid-game (walltime, a crashing
+    worker) leaves that game's partial output behind, and the resumed run re-plays
+    the game from scratch: without this, the file would hold two trunks under one
+    trunk_id and the first attempt's branches would be paired with the second
+    attempt's trunk. Deleting a done marker by hand therefore discards that game
+    cleanly on the next launch."""
+    out_dir = Path(out_dir)
+    records_path = out_dir / "records.msgpack"
+    done = {m.name[: -len(".json")] for m in (out_dir / "done").glob("*.json")}
+    result = {"kept": 0, "dropped": 0, "truncated": False, "dropped_games": [], "node_dirs_removed": 0}
+    if records_path.exists():
+        result.update(compact_records(records_path, lambda g: g in done))
+    nodes = out_dir / "nodes"
+    if nodes.is_dir():
+        for d in nodes.iterdir():
+            if d.is_dir() and d.name not in done:
+                shutil.rmtree(d, ignore_errors=True)
+                result["node_dirs_removed"] += 1
+    if logger is not None and (result["dropped"] or result["truncated"] or result["node_dirs_removed"]):
+        logger.warning(
+            f"resume: dropped {result['dropped']} record(s) of {len(result['dropped_games'])} unfinished game(s), "
+            f"removed {result['node_dirs_removed']} node dir(s), truncated tail={result['truncated']}; "
+            f"kept {result['kept']} record(s). collect_stats.json counters still include the dropped games."
+        )
+    return result
+
+
 async def collect_game(ctx: _Ctx, idx: int, example: dict) -> None:
     cfg = ctx.config
     game_file = str((example.get("info") or {}).get("game_file", f"game{idx}"))
@@ -509,6 +541,8 @@ async def branch_collect(config: BranchCollectConfig) -> None:
         stats_path = out_dir / "collect_stats.json"
         stats = CollectStats.load(stats_path) if (config.resume and stats_path.exists()) else CollectStats()
         records_path = out_dir / "records.msgpack"
+        if config.resume and records_path.exists():
+            drop_unfinished_games(out_dir, logger)
         with RecordWriter(records_path, append=config.resume and records_path.exists()) as writer:
             ctx = _Ctx(
                 config=config, env=env, node_env=node_env, get_client=inference_pool.get_next_client,

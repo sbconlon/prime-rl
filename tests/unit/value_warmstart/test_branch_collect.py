@@ -521,3 +521,70 @@ def test_branch_env_args_passes_elicit_variants(tmp_path):
     args = bc._branch_env_args(_cfg(tmp_path, elicit_variants=["ALT {action}"], elicit_exhaustive=True, n_elicit=4))
     assert args["elicit_variants"] == ["ALT {action}"] and args["elicit_exhaustive"] is True
     assert args["n_elicit"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Resume hygiene: unfinished games are dropped before appending
+# ---------------------------------------------------------------------------
+
+
+def _rec(game, branch=None):
+    from prime_rl.value_warmstart.dataset_io import BranchRecord
+
+    return BranchRecord(samples=[], reward=0.0, is_truncated=False, game_id=game, trunk_id=f"{game}-trunk",
+                        branch_id=branch, root_forced=branch is not None, root_dp=0 if branch else None,
+                        root_turn=0 if branch else None)
+
+
+def _layout(tmp_path, records, done, nodes):
+    from prime_rl.value_warmstart.dataset_io import RecordWriter
+
+    with RecordWriter(tmp_path / "records.msgpack") as w:
+        for r in records:
+            w.write(r)
+    (tmp_path / "done").mkdir()
+    for g in done:
+        (tmp_path / "done" / f"{g}.json").write_text("{}")
+    for g in nodes:
+        d = tmp_path / "nodes" / g / f"{g}-trunk"
+        d.mkdir(parents=True)
+        (d / "t0.json").write_text("{}")
+
+
+def test_drop_unfinished_games_removes_partial_output(tmp_path):
+    from prime_rl.value_warmstart.dataset_io import read_branch_records
+
+    recs = [_rec("g1"), _rec("g1", "b0"), _rec("g2"), _rec("g2", "b0"), _rec("g1", "b1"), _rec("g3")]
+    _layout(tmp_path, recs, done=["g1"], nodes=["g1", "g2", "g3"])
+    # a writer killed mid-frame leaves a truncated tail
+    with open(tmp_path / "records.msgpack", "ab") as f:
+        f.write(b"\x40\x00\x00\x00partial")
+
+    out = bc.drop_unfinished_games(tmp_path)
+    assert (out["kept"], out["dropped"], out["truncated"]) == (3, 3, True)
+    assert out["dropped_games"] == ["g2", "g3"] and out["node_dirs_removed"] == 2
+    kept = list(read_branch_records(tmp_path / "records.msgpack"))
+    assert [(r.game_id, r.branch_id) for r in kept] == [("g1", None), ("g1", "b0"), ("g1", "b1")]
+    assert sorted(p.name for p in (tmp_path / "nodes").iterdir()) == ["g1"]
+    assert not list(tmp_path.glob("*.compact"))
+
+
+def test_drop_unfinished_games_is_a_noop_when_clean(tmp_path):
+    recs = [_rec("g1"), _rec("g1", "b0"), _rec("g2")]
+    _layout(tmp_path, recs, done=["g1", "g2"], nodes=["g1", "g2"])
+    before = (tmp_path / "records.msgpack").read_bytes()
+    out = bc.drop_unfinished_games(tmp_path)
+    assert (out["kept"], out["dropped"], out["truncated"], out["node_dirs_removed"]) == (3, 0, False, 0)
+    assert (tmp_path / "records.msgpack").read_bytes() == before
+    assert not list(tmp_path.glob("*.compact"))
+
+
+def test_removing_a_done_marker_discards_that_game(tmp_path):
+    from prime_rl.value_warmstart.dataset_io import read_branch_records
+
+    recs = [_rec("g1"), _rec("g2"), _rec("g2", "b0")]
+    _layout(tmp_path, recs, done=["g1", "g2"], nodes=["g1", "g2"])
+    (tmp_path / "done" / "g2.json").unlink()
+    out = bc.drop_unfinished_games(tmp_path)
+    assert out["dropped"] == 2 and out["dropped_games"] == ["g2"]
+    assert [r.game_id for r in read_branch_records(tmp_path / "records.msgpack")] == ["g1"]
