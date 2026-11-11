@@ -152,7 +152,7 @@ def train(
     ckpt_manager = AdvantageCheckpointManager(config.output_dir, CheckpointConfig(skip_optimizer=True))
     resume_dir = Path(config.output_dir) / "resume"
     resume_manager = AdvantageCheckpointManager(
-        resume_dir, CheckpointConfig(skip_optimizer=False, keep_last=1)
+        resume_dir, CheckpointConfig(skip_optimizer=False, keep_last=config.resume_keep_last)
     )
     progress_path = resume_dir / "progress.json"
     n_batches_per_epoch = -(-len(dataset) // config.data.batch_size)
@@ -209,6 +209,25 @@ def train(
     def _zero_prov() -> dict:
         return {p: {"l_v": 0.0, "l_q": 0.0, "n_samples": 0} for p in PROVENANCES}
 
+    # Optimization guards (job 753932: the Q+ loss blew up at steps 500-600 with
+    # no clipping, no warmup and lr 1e-3, and stayed at twice its earlier level).
+    # Group order is fixed by setup_value_optimizer: V, Q+, V_target (lr 0).
+    base_lrs = [config.v_learning_rate, config.q_plus_learning_rate, 0.0]
+    clip = float(config.max_grad_norm) if config.max_grad_norm else float("inf")
+    slot_params = [g["params"] for g in optimizer.param_groups[:2]]
+
+    def _set_lrs(step_now: int) -> None:
+        # Re-applied every step from the config: warmup, and a learning rate changed
+        # between jobs takes effect on resume (the checkpoint would restore the old one).
+        scale = min(1.0, (step_now + 1) / config.warmup_steps) if config.warmup_steps else 1.0
+        for group, base in zip(optimizer.param_groups, base_lrs):
+            group["lr"] = base * scale
+
+    def _zero_window() -> dict:
+        return {"max_l_v": 0.0, "max_l_q": 0.0, "max_gn_v": 0.0, "max_gn_q": 0.0, "clipped": 0}
+
+    window = _zero_window()
+
     def _save(step_now: int, epoch_now: int, batch_in_epoch: int, sums: dict) -> None:
         # Seed V_target = V exactly so the weights-only file is usable at any checkpoint.
         backbone.polyak_update_v_target(tau=1.0)
@@ -240,6 +259,7 @@ def train(
             if b < skip:
                 continue
             set_request_id(str(global_step))
+            _set_lrs(global_step)
             optimizer.zero_grad()
             b_l_v = b_l_q = 0.0
             for chunk_start in range(0, len(batch_idx), config.data.inner_batch_size):
@@ -258,6 +278,14 @@ def train(
                     by_prov[prov]["l_v"] += l_v
                     by_prov[prov]["l_q"] += l_q
                     by_prov[prov]["n_samples"] += len(group)
+            # Per-slot clipping (inf = measure only): one slot's bad batch must not
+            # shrink the other slot's update.
+            gn_v, gn_q = (float(torch.nn.utils.clip_grad_norm_(ps, clip)) for ps in slot_params)
+            window["max_l_v"] = max(window["max_l_v"], b_l_v)
+            window["max_l_q"] = max(window["max_l_q"], b_l_q)
+            window["max_gn_v"] = max(window["max_gn_v"], gn_v)
+            window["max_gn_q"] = max(window["max_gn_q"], gn_q)
+            window["clipped"] += int(gn_v > clip) + int(gn_q > clip)
             optimizer.step()
             epoch_l_v += b_l_v
             epoch_l_q += b_l_q
@@ -275,8 +303,12 @@ def train(
                 logger.info(
                     f"checkpoint: epoch {epoch} batch {b + 1}/{n_batches_per_epoch} "
                     f"(step {global_step}/{total_steps}) running l_v={epoch_l_v / n_batches:.5f} "
-                    f"l_q={epoch_l_q / n_batches:.5f}"
+                    f"l_q={epoch_l_q / n_batches:.5f} | window max batch l_v={window['max_l_v']:.4f} "
+                    f"l_q={window['max_l_q']:.4f} max grad norm V={window['max_gn_v']:.3g} "
+                    f"Q+={window['max_gn_q']:.3g} clipped={window['clipped']} "
+                    f"lr V={optimizer.param_groups[0]['lr']:.2e} Q+={optimizer.param_groups[1]['lr']:.2e}"
                 )
+                window = _zero_window()
         # Epoch end: the next resume point is the start of the following epoch.
         _save(
             global_step, epoch + 1, 0,

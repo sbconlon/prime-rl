@@ -52,14 +52,17 @@ def value_regression_backward(
     # --- Q+ leg: per decision point (right-padded obs would break the
     # append-and-read cat); per-dp backward keeps peak memory to one Q+ graph. ---
     l_q_contrib = 0.0
-    for d in range(D):
-        o_ids = torch.tensor([prep.q_plus_obs_ids[d]], dtype=torch.long, device=device)
-        a_ids = torch.tensor([prep.q_plus_action_ids[d]], dtype=torch.long, device=device)
-        q_pred = backbone.forward_q_plus_action(o_ids, a_ids)[0]
-        w = float(prep.q_weights[d].item())
-        sq = (q_pred - prep.q_plus_targets[d]) ** 2
-        (sq * (w * chunk_scale)).backward()
-        l_q_contrib += float(sq.detach().item()) * w * chunk_scale
+    # One timer for the whole Q+ leg (D forward + backward passes); it was the
+    # unprofiled majority of a chunk's time.
+    with prof("advtrainer.q_plus_action", sync_cuda=True, D=D):
+        for d in range(D):
+            o_ids = torch.tensor([prep.q_plus_obs_ids[d]], dtype=torch.long, device=device)
+            a_ids = torch.tensor([prep.q_plus_action_ids[d]], dtype=torch.long, device=device)
+            q_pred = backbone.forward_q_plus_action(o_ids, a_ids)[0]
+            w = float(prep.q_weights[d].item())
+            sq = (q_pred - prep.q_plus_targets[d]) ** 2
+            (sq * (w * chunk_scale)).backward()
+            l_q_contrib += float(sq.detach().item()) * w * chunk_scale
     return l_v_contrib, l_q_contrib
 
 

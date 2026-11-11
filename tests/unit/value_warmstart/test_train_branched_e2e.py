@@ -44,13 +44,16 @@ def _records():
     return out
 
 
-def _config(tmp_path, path, kind, max_epochs=1, resume=True, batch_size=2, ckpt_every_steps=100):
+def _config(tmp_path, path, kind, max_epochs=1, resume=True, batch_size=2, ckpt_every_steps=100,
+            resume_keep_last=1, **extra):
     return WarmStartTrainConfig(
         model=ValueNetworkConfig(base_model_name="tiny", lora=LoRAConfig(rank=8, alpha=16.0, dropout=0.0), polyak_tau=0.005),
         data=WarmStartDataConfig(path=path, kind=kind, batch_size=batch_size, inner_batch_size=1),
         max_epochs=max_epochs,
         resume=resume,
         ckpt_every_steps=ckpt_every_steps,
+        resume_keep_last=resume_keep_last,
+        **extra,
         output_dir=tmp_path / "out",
     )
 
@@ -219,3 +222,61 @@ def test_resume_inside_an_epoch_replays_and_skips_no_batch(tmp_path, monkeypatch
     with pytest.raises(ValueError):
         train(_config(tmp_path, path, "branched", max_epochs=3, batch_size=2, ckpt_every_steps=1),
               backbone=_backbone(), tokenizer=tok)
+
+
+def test_warmup_clipping_and_learning_rate_on_resume(tmp_path, monkeypatch):
+    import prime_rl.value_warmstart.train as tr
+
+    path = tmp_path / "tagged.msgpack"
+    with RecordWriter(path) as w:
+        for r in _tagged_records():
+            w.write(r)
+    tok = _CharTok()
+
+    captured = {}
+    real_setup = tr.setup_value_optimizer
+
+    def setup_spy(backbone, v_lr, q_lr):
+        captured["opt"] = real_setup(backbone, v_lr, q_lr)
+        return captured["opt"]
+
+    lrs: list[tuple[float, float, float]] = []
+    real_legs = tr.value_regression_backward
+
+    def legs_spy(backbone, group, tokenizer, chunk_scale, device):
+        lrs.append(tuple(g["lr"] for g in captured["opt"].param_groups))
+        return real_legs(backbone, group, tokenizer, chunk_scale, device)
+
+    clips: list[float] = []
+    real_clip = torch.nn.utils.clip_grad_norm_
+
+    def clip_spy(params, max_norm, *a, **kw):
+        clips.append(float(max_norm))
+        return real_clip(params, max_norm, *a, **kw)
+
+    monkeypatch.setattr(tr, "setup_value_optimizer", setup_spy)
+    monkeypatch.setattr(tr, "value_regression_backward", legs_spy)
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", clip_spy)
+
+    # job 1: one epoch of 4 single-sample batches, warmup over 4 steps, clip at 1.0
+    cfg1 = _config(tmp_path, path, "branched", max_epochs=1, batch_size=1, ckpt_every_steps=1,
+                   resume_keep_last=3, warmup_steps=4, max_grad_norm=1.0,
+                   v_learning_rate=4e-4, q_plus_learning_rate=8e-4)
+    train(cfg1, backbone=_backbone(), tokenizer=tok)
+    assert [round(v / 4e-4, 6) for v, _, _ in lrs] == [0.25, 0.5, 0.75, 1.0]
+    assert [round(q / 8e-4, 6) for _, q, _ in lrs] == [0.25, 0.5, 0.75, 1.0]
+    assert all(vt == 0.0 for _, _, vt in lrs)
+    assert clips == [1.0] * 8  # V slot and Q+ slot, once per optimizer step
+    kept = sorted(p.name for p in (tmp_path / "out" / "resume" / "checkpoints").iterdir())
+    assert kept == ["step_2", "step_3", "step_4"]  # resume_keep_last = 3
+
+    # job 2: resumed with a LOWER Q+ learning rate and no clipping -> the config wins
+    lrs.clear()
+    clips.clear()
+    cfg2 = _config(tmp_path, path, "branched", max_epochs=2, batch_size=1, ckpt_every_steps=1,
+                   resume_keep_last=3, warmup_steps=4,
+                   v_learning_rate=4e-4, q_plus_learning_rate=2e-4)
+    train(cfg2, backbone=_backbone(), tokenizer=tok)
+    assert len(lrs) == 4  # epoch 1 only
+    assert all(abs(q - 2e-4) < 1e-12 and abs(v - 4e-4) < 1e-12 for v, q, _ in lrs)
+    assert clips == [float("inf")] * 8  # measured, not clipped

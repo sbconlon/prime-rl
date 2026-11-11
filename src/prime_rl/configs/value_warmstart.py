@@ -198,6 +198,36 @@ class WarmStartTrainConfig(BaseConfig):
             ),
         ),
     ] = 100
+    max_grad_norm: Annotated[
+        float | None,
+        Field(
+            gt=0.0,
+            description=(
+                "Clip the gradient norm of the V slot and of the Q+ slot separately to this value before "
+                "each optimizer step. None = no clipping (norms are still measured and reported)."
+            ),
+        ),
+    ] = None
+    warmup_steps: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Linear learning-rate warmup over the first N optimizer steps. The learning rates are "
+                "re-applied from this config at every step, so changing them takes effect on resume."
+            ),
+        ),
+    ] = 0
+    resume_keep_last: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Resume checkpoints to keep. More than one lets a run be rolled back past a loss spike: "
+                "delete the newer resume/checkpoints/step_* directories and resubmit."
+            ),
+        ),
+    ] = 3
     output_dir: Annotated[
         Path,
         Field(description="Output dir; value_state.pt is written under checkpoints/step_0/trainer/."),
