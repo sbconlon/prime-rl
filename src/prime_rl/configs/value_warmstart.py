@@ -186,6 +186,18 @@ class WarmStartTrainConfig(BaseConfig):
             )
         ),
     ] = True
+    ckpt_every_steps: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Checkpoint (weights-only value_state.pt + the resume state) every this many optimizer "
+                "steps inside an epoch, in addition to every epoch end. An epoch over the full branched "
+                "dataset outlasts a 24 h job, so the resume point must be finer than an epoch. 0 = epoch "
+                "ends only."
+            ),
+        ),
+    ] = 100
     output_dir: Annotated[
         Path,
         Field(description="Output dir; value_state.pt is written under checkpoints/step_0/trainer/."),

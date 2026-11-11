@@ -11,12 +11,14 @@ labels Q+ only), excludes held-out games, logs the losses split by provenance
 (trunk vs branch episodes), and writes holdout.json + summary.json next to the
 checkpoint.
 
-Resume: after every epoch a full checkpoint (trainable weights + optimizer
-state, step = number of completed epochs) is written under output_dir/resume,
-keeping only the latest. With config.resume (default) a run that finds one
-continues from it and trains the remaining epochs up to max_epochs, so a
-walltime-killed job is simply resubmitted. The weights-only value_state.pt at
-checkpoints/step_0 (what the RL run and the gate read) is unchanged.
+Resume: every ckpt_every_steps optimizer steps and at each epoch end a full
+checkpoint (trainable weights + optimizer state, step = global optimizer step)
+is written under output_dir/resume, keeping only the latest, with the running
+epoch's loss sums in resume/progress.json. With config.resume (default) a run
+that finds one continues at the exact batch (the per-epoch shuffle depends only
+on seed + epoch) and trains up to max_epochs in total, so a walltime-killed job
+is simply resubmitted. The weights-only value_state.pt at checkpoints/step_0
+(what the RL run and the gate read) is refreshed at every checkpoint.
 """
 
 from __future__ import annotations
@@ -138,26 +140,48 @@ def train(
         raise ValueError(f"Warm-start dataset at {config.data.path} is empty.")
     _write_json(Path(config.output_dir) / "holdout.json", {"game_ids": holdout_ids})
 
-    # Save AFTER EACH EPOCH (overwriting step_0), not just at the end: over 12k+ samples
-    # this can exceed the walltime, and an end-only save is all-or-nothing (a kill loses
-    # everything). Per-epoch save keeps the latest trained net; watch the l_v/l_q plateau
-    # and scancel when converged. Create the ckpt manager up front.
+    # Checkpointing. Two artifacts, both written at every checkpoint (every
+    # config.ckpt_every_steps optimizer steps and at each epoch end):
+    #   - checkpoints/step_0/trainer/value_state.pt: weights only, V_target = V. This
+    #     is what the RL run, the gate and contrast_eval read. Overwritten each time.
+    #   - resume/checkpoints/step_<global step>/: weights + optimizer, latest only, and
+    #     resume/progress.json with the running epoch's loss sums.
+    # A walltime-killed job resubmitted with the same command continues at the exact
+    # batch: the per-epoch shuffle depends only on (seed, epoch), so skipping the
+    # first k batches of the interrupted epoch reproduces the rest of its order.
     ckpt_manager = AdvantageCheckpointManager(config.output_dir, CheckpointConfig(skip_optimizer=True))
-    # Resume checkpoints: weights + optimizer, step = epochs completed, latest only.
+    resume_dir = Path(config.output_dir) / "resume"
     resume_manager = AdvantageCheckpointManager(
-        Path(config.output_dir) / "resume", CheckpointConfig(skip_optimizer=False, keep_last=1)
+        resume_dir, CheckpointConfig(skip_optimizer=False, keep_last=1)
     )
-    start_epoch = 0
+    progress_path = resume_dir / "progress.json"
+    n_batches_per_epoch = -(-len(dataset) // config.data.batch_size)
+    total_steps = config.max_epochs * n_batches_per_epoch
+    shape = {"n_samples": len(dataset), "batch_size": config.data.batch_size, "seed": config.seed}
+
+    global_step = 0
+    progress: dict = {}
     if config.resume and resume_manager.ckpt_steps:
         last = resume_manager.ckpt_steps[-1]
-        start_epoch = resume_manager.load(last, backbone, optimizer)
+        if progress_path.exists():
+            with open(progress_path) as f:
+                progress = json.load(f)
+        if progress and {k: progress.get(k) for k in shape} != shape:
+            raise ValueError(
+                f"Cannot resume from {resume_dir}: it was written for "
+                f"{ {k: progress.get(k) for k in shape} }, this run has {shape}. Use the same dataset, "
+                "filters, batch size and seed, or pass resume=False (or another output_dir)."
+            )
+        global_step = resume_manager.load(last, backbone, optimizer)
+        if progress.get("global_step") != global_step:
+            progress = {}  # killed between the checkpoint and its sidecar: the epoch's sums restart
         logger.info(
-            f"Resuming: {start_epoch} of {config.max_epochs} epochs already completed "
-            f"({resume_manager.get_ckpt_path(last)})"
+            f"Resuming at optimizer step {global_step}/{total_steps} "
+            f"(epoch {global_step // n_batches_per_epoch}, batch {global_step % n_batches_per_epoch}"
+            f"/{n_batches_per_epoch}) from {resume_manager.get_ckpt_path(last)}"
         )
+    start_epoch, start_batch = divmod(global_step, n_batches_per_epoch)
     backbone.train()
-    n_batches_per_epoch = -(-len(dataset) // config.data.batch_size)
-    step = start_epoch * n_batches_per_epoch
     summary: dict = {
         "dataset_kind": config.data.kind,
         "dataset_path": str(config.data.path),
@@ -177,18 +201,45 @@ def train(
         summary["epochs"] = list(previous.get("epochs", []))[:start_epoch]
         if summary["epochs"]:
             summary["final"] = summary["epochs"][-1]
-    if start_epoch >= config.max_epochs:
-        logger.info(f"Nothing to do: {start_epoch} epochs completed, max_epochs={config.max_epochs}")
+    if global_step >= total_steps:
+        logger.info(f"Nothing to do: {global_step} optimizer steps completed, total {total_steps}")
         _write_json(summary_path, summary)
         return summary
+
+    def _zero_prov() -> dict:
+        return {p: {"l_v": 0.0, "l_q": 0.0, "n_samples": 0} for p in PROVENANCES}
+
+    def _save(step_now: int, epoch_now: int, batch_in_epoch: int, sums: dict) -> None:
+        # Seed V_target = V exactly so the weights-only file is usable at any checkpoint.
+        backbone.polyak_update_v_target(tau=1.0)
+        ckpt_manager.save(step=0, backbone=backbone, optimizer=optimizer)
+        resume_manager.save(step=step_now, backbone=backbone, optimizer=optimizer)
+        resume_manager.maybe_clean()
+        _write_json(
+            progress_path,
+            {**shape, "global_step": step_now, "epoch": epoch_now, "batch_in_epoch": batch_in_epoch, **sums},
+        )
+
     for epoch in range(start_epoch, config.max_epochs):
-        epoch_l_v = epoch_l_q = 0.0
-        by_prov = {p: {"l_v": 0.0, "l_q": 0.0, "n_samples": 0} for p in PROVENANCES}
-        n_batches = 0
-        for batch_idx in _shuffled_batches(
-            len(dataset), config.data.batch_size, config.seed + epoch
+        skip = start_batch if epoch == start_epoch else 0
+        if skip and progress:
+            epoch_l_v = float(progress.get("epoch_l_v", 0.0))
+            epoch_l_q = float(progress.get("epoch_l_q", 0.0))
+            by_prov = _zero_prov()
+            for p, d in (progress.get("by_prov") or {}).items():
+                if p in by_prov:
+                    by_prov[p].update(d)
+            n_batches = int(progress.get("n_batches", 0))
+        else:
+            epoch_l_v = epoch_l_q = 0.0
+            by_prov = _zero_prov()
+            n_batches = 0
+        for b, batch_idx in enumerate(
+            _shuffled_batches(len(dataset), config.data.batch_size, config.seed + epoch)
         ):
-            set_request_id(str(step))
+            if b < skip:
+                continue
+            set_request_id(str(global_step))
             optimizer.zero_grad()
             b_l_v = b_l_q = 0.0
             for chunk_start in range(0, len(batch_idx), config.data.inner_batch_size):
@@ -211,13 +262,26 @@ def train(
             epoch_l_v += b_l_v
             epoch_l_q += b_l_q
             n_batches += 1
-            step += 1
-        # Seed V_target = V exactly and save the weights-only value_state.pt at step 0
-        # (overwrites each epoch; the RL run resumes from *its* step 0).
-        backbone.polyak_update_v_target(tau=1.0)
-        ckpt_manager.save(step=0, backbone=backbone, optimizer=optimizer)
-        resume_manager.save(step=epoch + 1, backbone=backbone, optimizer=optimizer)
-        resume_manager.maybe_clean()
+            global_step += 1
+            if (
+                config.ckpt_every_steps
+                and (b + 1) % config.ckpt_every_steps == 0
+                and (b + 1) < n_batches_per_epoch
+            ):
+                _save(
+                    global_step, epoch, b + 1,
+                    {"epoch_l_v": epoch_l_v, "epoch_l_q": epoch_l_q, "by_prov": by_prov, "n_batches": n_batches},
+                )
+                logger.info(
+                    f"checkpoint: epoch {epoch} batch {b + 1}/{n_batches_per_epoch} "
+                    f"(step {global_step}/{total_steps}) running l_v={epoch_l_v / n_batches:.5f} "
+                    f"l_q={epoch_l_q / n_batches:.5f}"
+                )
+        # Epoch end: the next resume point is the start of the following epoch.
+        _save(
+            global_step, epoch + 1, 0,
+            {"epoch_l_v": 0.0, "epoch_l_q": 0.0, "by_prov": _zero_prov(), "n_batches": 0},
+        )
         epoch_summary = {
             "epoch": epoch,
             "steps": n_batches,
@@ -246,10 +310,9 @@ def train(
         logger.success(
             f"epoch={epoch} l_v={epoch_summary['l_v']:.5f} "
             f"l_q={epoch_summary['l_q']:.5f} steps={n_batches} | {split} "
-            f"-> saved value_state.pt (+ resume step {epoch + 1}/{config.max_epochs})"
+            f"-> saved value_state.pt (+ resume step {global_step}/{total_steps})"
         )
     return summary
-
 
 def main() -> None:
     """Entry point: `uv run warmstart-train @ warmstart-train.toml`."""

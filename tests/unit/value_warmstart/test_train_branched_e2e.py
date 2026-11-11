@@ -44,12 +44,13 @@ def _records():
     return out
 
 
-def _config(tmp_path, path, kind, max_epochs=1, resume=True):
+def _config(tmp_path, path, kind, max_epochs=1, resume=True, batch_size=2, ckpt_every_steps=100):
     return WarmStartTrainConfig(
         model=ValueNetworkConfig(base_model_name="tiny", lora=LoRAConfig(rank=8, alpha=16.0, dropout=0.0), polyak_tau=0.005),
-        data=WarmStartDataConfig(path=path, kind=kind, batch_size=2, inner_batch_size=1),
+        data=WarmStartDataConfig(path=path, kind=kind, batch_size=batch_size, inner_batch_size=1),
         max_epochs=max_epochs,
         resume=resume,
+        ckpt_every_steps=ckpt_every_steps,
         output_dir=tmp_path / "out",
     )
 
@@ -117,10 +118,10 @@ def test_resume_continues_epochs_and_restores_weights(tmp_path):
     shutil.rmtree(tmp_path / "out")
     bb1 = _backbone()
     s1 = train(_config(tmp_path, path, "branched", max_epochs=1), backbone=bb1, tokenizer=tok)
-    resume_ckpt = tmp_path / "out" / "resume" / "checkpoints" / "step_1" / "trainer" / "value_state.pt"
+    resume_ckpt = tmp_path / "out" / "resume" / "checkpoints" / "step_2" / "trainer" / "value_state.pt"
     assert resume_ckpt.exists()
     payload = torch.load(resume_ckpt, map_location="cpu", weights_only=False)
-    assert payload["step"] == 1 and "optimizer_state_dict" in payload
+    assert payload["step"] == 2 and "optimizer_state_dict" in payload  # 2 batches per epoch
     w1 = _trainable(bb1)
 
     # job 2: same command with max_epochs=2 -> loads epoch-1 weights, trains epoch 1 only
@@ -128,8 +129,8 @@ def test_resume_continues_epochs_and_restores_weights(tmp_path):
     s2 = train(_config(tmp_path, path, "branched", max_epochs=2), backbone=bb2, tokenizer=tok)
     assert [e["epoch"] for e in s2["epochs"]] == [0, 1]
     assert s2["final"]["epoch"] == 1 and s2["epochs"][0] == s1["epochs"][0]
-    assert (tmp_path / "out" / "resume" / "checkpoints" / "step_2").exists()
-    assert not (tmp_path / "out" / "resume" / "checkpoints" / "step_1").exists()  # keep_last=1
+    assert (tmp_path / "out" / "resume" / "checkpoints" / "step_4").exists()
+    assert not (tmp_path / "out" / "resume" / "checkpoints" / "step_2").exists()  # keep_last=1
     w2 = _trainable(bb2)
     assert any(not torch.equal(w1[k], w2[k]) for k in w1)  # it trained further
     # the resumed run started from job 1's weights: a fresh backbone loaded from the
@@ -147,3 +148,74 @@ def test_resume_continues_epochs_and_restores_weights(tmp_path):
     bb4 = _backbone()
     s4 = train(_config(tmp_path, path, "branched", max_epochs=1, resume=False), backbone=bb4, tokenizer=tok)
     assert [e["epoch"] for e in s4["epochs"]] == [0]
+
+
+def _tagged_records():
+    """Four training samples whose first prompt id is their dataset index."""
+    def sample(tag, n_dps=3):
+        s = _sample(n_dps)
+        s.prompt_ids = [tag, 4, 5]
+        return s
+
+    out = []
+    tag = 0
+    for g in ("g1", "g2"):
+        out.append(BranchRecord(samples=[sample(tag)], reward=1.0, is_truncated=False, game_id=g, trunk_id=f"{g}-t0"))
+        tag += 1
+        out.append(BranchRecord(samples=[sample(tag)], reward=0.0, is_truncated=False, label_from_dp=1, root_dp=1,
+                                root_forced=True, game_id=g, trunk_id=f"{g}-t0", branch_id=f"{g}-b1", root_turn=1,
+                                block_source="sampled", action_source="own"))
+        tag += 1
+    return out
+
+
+def test_resume_inside_an_epoch_replays_and_skips_no_batch(tmp_path, monkeypatch):
+    import pytest
+
+    import prime_rl.value_warmstart.train as tr
+
+    path = tmp_path / "tagged.msgpack"
+    with RecordWriter(path) as w:
+        for r in _tagged_records():
+            w.write(r)
+    tok = _CharTok()
+    real = tr.value_regression_backward
+    seen: list[int] = []
+    state = {"calls": 0, "die_at": 3}
+
+    def spy(backbone, group, tokenizer, chunk_scale, device):
+        state["calls"] += 1
+        if state["die_at"] is not None and state["calls"] == state["die_at"]:
+            raise KeyboardInterrupt  # the walltime kill, before this batch is trained
+        seen.append(group[0].prompt_ids[0])
+        return real(backbone, group, tokenizer, chunk_scale, device)
+
+    monkeypatch.setattr(tr, "value_regression_backward", spy)
+    cfg = lambda: _config(tmp_path, path, "branched", max_epochs=2, batch_size=1, ckpt_every_steps=1)  # noqa: E731
+
+    # job 1: killed while starting the third batch of epoch 0
+    with pytest.raises(KeyboardInterrupt):
+        train(cfg(), backbone=_backbone(), tokenizer=tok)
+    order0 = [b[0] for b in tr._shuffled_batches(4, 1, 0)]
+    order1 = [b[0] for b in tr._shuffled_batches(4, 1, 1)]
+    assert seen == order0[:2]
+    progress = json.loads((tmp_path / "out" / "resume" / "progress.json").read_text())
+    assert (progress["global_step"], progress["epoch"], progress["batch_in_epoch"], progress["n_batches"]) == (2, 0, 2, 2)
+    assert (tmp_path / "out" / "resume" / "checkpoints" / "step_2").exists()
+    # the weights-only file exists mid-epoch (contrast_eval can read it between jobs)
+    assert (get_step_path(get_ckpt_dir(tmp_path / "out"), 0) / "trainer" / "value_state.pt").exists()
+    assert not (tmp_path / "out" / "summary.json").exists()  # no epoch finished yet
+
+    # job 2: same command, runs to the end
+    state["die_at"] = None
+    summary = train(cfg(), backbone=_backbone(), tokenizer=tok)
+    assert seen == order0 + order1  # every batch exactly once, in the original order
+    assert sorted(seen[:4]) == [0, 1, 2, 3] and sorted(seen[4:]) == [0, 1, 2, 3]
+    assert [e["epoch"] for e in summary["epochs"]] == [0, 1]
+    assert summary["epochs"][0]["steps"] == 4  # the interrupted epoch's sums were restored
+    assert (tmp_path / "out" / "resume" / "checkpoints" / "step_8").exists()
+
+    # a different batch shape must not silently resume
+    with pytest.raises(ValueError):
+        train(_config(tmp_path, path, "branched", max_epochs=3, batch_size=2, ckpt_every_steps=1),
+              backbone=_backbone(), tokenizer=tok)
