@@ -19,11 +19,19 @@ that finds one continues at the exact batch (the per-epoch shuffle depends only
 on seed + epoch) and trains up to max_epochs in total, so a walltime-killed job
 is simply resubmitted. The weights-only value_state.pt at checkpoints/step_0
 (what the RL run and the gate read) is refreshed at every checkpoint.
+
+Milestones (config.milestone_every_steps): a permanent weights-only copy under
+output_dir/milestones, and with milestone_contrast the held-out contrast pairs
+scored by the current Q+ (gate/contrast_step<N>.json, milestones/curve.jsonl).
+Job 755044 reached its best losses in the first 2,000 steps, then degraded, and
+the rolling resume checkpoints had already deleted the good states; the loss
+alone also said nothing about the gate metric.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterator
@@ -42,6 +50,12 @@ from prime_rl.configs.value_warmstart import WarmStartTrainConfig
 from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
 from prime_rl.utils.config import cli
 from prime_rl.utils.logger import setup_logger
+from prime_rl.value_warmstart.contrast_eval import (
+    build_q_fn,
+    contrast_pairs,
+    holdout_records,
+    score_pairs,
+)
 from prime_rl.value_warmstart.data import BranchedDataset, WarmStartDataset
 
 PROVENANCES = ("trunk", "branch")
@@ -95,6 +109,43 @@ def _write_json(path: Path, payload: dict) -> None:
         json.dump(payload, f, indent=2, sort_keys=True)
 
 
+def lr_scale(
+    step: int, warmup_steps: int, total_steps: int, decay: str = "none", final_scale: float = 0.1
+) -> float:
+    """Multiplier on the base learning rates at optimizer step `step` (0-based):
+    linear warmup over the first warmup_steps, then `decay` (cosine or linear)
+    down to final_scale at the last step, total_steps - 1."""
+    warm = min(1.0, (step + 1) / warmup_steps) if warmup_steps else 1.0
+    if decay == "none" or total_steps - 1 <= warmup_steps:
+        return warm
+    frac = min(1.0, max(0.0, (step - warmup_steps) / (total_steps - 1 - warmup_steps)))
+    shape = 0.5 * (1.0 + math.cos(math.pi * frac)) if decay == "cosine" else 1.0 - frac
+    return warm * (final_scale + (1.0 - final_scale) * shape)
+
+
+def constant_baselines(dataset) -> dict:
+    """What a network that has learned nothing scores: the loss of the best
+    constant prediction for each leg, in the trainer's own weighting (mean over
+    samples of the per-sample mean squared error over its decision points, a
+    masked leg counting as zero). Every logged loss should be read against it:
+    job 756302 sat at this level for 2,600 steps before anyone compared.
+    Returns {"l_v": {"constant", "loss", "weight"}, "l_q": {...}}; weight is the
+    mean unmasked weight per sample (below 1 for V: forced roots carry no V target)."""
+    n = len(dataset)
+    out: dict = {}
+    for leg, target, weight in (("l_v", "v_target", "v_weight"), ("l_q", "q_plus_target", "q_weight")):
+        rows: list[tuple[float, float]] = []
+        for i in range(n):
+            targets = dataset[i].decision_point_targets
+            for t in targets:
+                rows.append((float(getattr(t, weight)) / len(targets), float(getattr(t, target))))
+        sw = sum(w for w, _ in rows)
+        const = sum(w * g for w, g in rows) / sw if sw else 0.0
+        loss = sum(w * (g - const) ** 2 for w, g in rows) / n if n else 0.0
+        out[leg] = {"constant": const, "loss": loss, "weight": sw / n if n else 0.0}
+    return out
+
+
 def train(
     config: WarmStartTrainConfig,
     *,
@@ -128,8 +179,13 @@ def train(
         tokenizer = AutoTokenizer.from_pretrained(config.model.base_model_name)
     # float32 master weights + float32 AdamW state: with bfloat16 parameters the
     # second-moment decay rounds away and spikes lower the learning rate for good.
+    # head_learning_rate set: the two value heads get their own groups (3 and 4).
     optimizer = setup_value_optimizer(
-        backbone, config.v_learning_rate, config.q_plus_learning_rate, fp32_master=True
+        backbone,
+        config.v_learning_rate,
+        config.q_plus_learning_rate,
+        fp32_master=True,
+        head_lr=config.head_learning_rate,
     )
 
     dataset, provenance, holdout_ids = _load_dataset(config)
@@ -141,6 +197,11 @@ def train(
     if len(dataset) == 0:
         raise ValueError(f"Warm-start dataset at {config.data.path} is empty.")
     _write_json(Path(config.output_dir) / "holdout.json", {"game_ids": holdout_ids})
+    baselines = constant_baselines(dataset)
+    logger.info(
+        "Free baseline (best constant prediction = a network that has learned nothing): "
+        f"l_v={baselines['l_v']['loss']:.4f} l_q={baselines['l_q']['loss']:.4f}"
+    )
 
     # Checkpointing. Two artifacts, both written at every checkpoint (every
     # config.ckpt_every_steps optimizer steps and at each epoch end):
@@ -191,6 +252,7 @@ def train(
         "n_samples": len(dataset),
         "n_samples_by_provenance": {p: provenance.count(p) for p in PROVENANCES},
         "holdout_game_ids": holdout_ids,
+        "constant_baseline": baselines,
         "epochs": [],
     }
     if config.data.kind == "branched":
@@ -215,18 +277,29 @@ def train(
     # Optimization guards (job 753932: the Q+ loss blew up at steps 500-600 with
     # no clipping, no warmup and lr 1e-3, and stayed at twice its earlier level).
     # Group order is fixed by setup_value_optimizer: V, Q+, V_target (lr 0).
+    # With head_learning_rate: + the V head and the Q+ head (groups 3 and 4).
     base_lrs = [config.v_learning_rate, config.q_plus_learning_rate, 0.0]
+    has_head_groups = config.head_learning_rate is not None
+    if has_head_groups:
+        base_lrs += [config.head_learning_rate, config.head_learning_rate]
+    if len(base_lrs) != len(optimizer.param_groups):
+        raise ValueError(
+            f"optimizer has {len(optimizer.param_groups)} groups, the config implies {len(base_lrs)}"
+        )
     clip = float(config.max_grad_norm) if config.max_grad_norm else float("inf")
 
     def _set_lrs(step_now: int) -> None:
-        # Re-applied every step from the config: warmup, and a learning rate changed
-        # between jobs takes effect on resume (the checkpoint would restore the old one).
-        scale = min(1.0, (step_now + 1) / config.warmup_steps) if config.warmup_steps else 1.0
+        # Re-applied every step from the config: warmup and decay, and a learning rate
+        # changed between jobs takes effect on resume (the checkpoint would restore the old one).
+        scale = lr_scale(step_now, config.warmup_steps, total_steps, config.lr_decay, config.lr_final_scale)
         for group, base in zip(optimizer.param_groups, base_lrs):
             group["lr"] = base * scale
 
     def _zero_window() -> dict:
-        return {"max_l_v": 0.0, "max_l_q": 0.0, "max_gn_v": 0.0, "max_gn_q": 0.0, "clipped": 0}
+        return {
+            "max_l_v": 0.0, "max_l_q": 0.0, "sum_l_v": 0.0, "sum_l_q": 0.0, "n": 0,
+            "max_gn_v": 0.0, "max_gn_q": 0.0, "max_gn_hv": 0.0, "max_gn_hq": 0.0, "clipped": 0,
+        }
 
     window = _zero_window()
 
@@ -240,6 +313,67 @@ def train(
             progress_path,
             {**shape, "global_step": step_now, "epoch": epoch_now, "batch_in_epoch": batch_in_epoch, **sums},
         )
+
+    # Milestones: permanent weights-only copies, and the held-out contrast pairs
+    # scored by the current Q+ (the gate metric as a curve over training).
+    milestone_every = int(config.milestone_every_steps)
+    milestone_dir = Path(config.output_dir) / "milestones"
+    gate_dir = Path(config.output_dir) / "gate"
+    milestone_manager = None
+    milestone_pairs: list = []
+    if milestone_every:
+        milestone_manager = AdvantageCheckpointManager(milestone_dir, CheckpointConfig(skip_optimizer=True))
+        if config.milestone_contrast and config.data.kind == "branched":
+            ids = _load_holdout_ids(config.data.holdout_ids_path)
+            milestone_pairs = contrast_pairs(
+                holdout_records(config.data.path, ids),
+                holdout_only=True,
+                holdout_ids=ids,
+                min_p_accept=config.data.min_p_accept,
+            )
+            if not milestone_pairs:
+                logger.warning("milestone_contrast: no held-out contrast pairs; milestones keep weights only")
+        logger.info(
+            f"Milestones every {milestone_every} optimizer steps: weights kept under {milestone_dir}"
+            + (f", {len(milestone_pairs)} held-out contrast pairs scored" if milestone_pairs else "")
+        )
+    last_ckpt_step = global_step
+
+    def _milestone(step_now: int, epoch_now: int, run_l_v: float, run_l_q: float) -> None:
+        milestone_manager.save(step=step_now, backbone=backbone, optimizer=optimizer)
+        row: dict = {"step": step_now, "epoch": epoch_now, "running_l_v": run_l_v, "running_l_q": run_l_q}
+        msg = f"milestone: step {step_now}/{total_steps} weights kept"
+        if milestone_pairs:
+            payload = score_pairs(milestone_pairs, build_q_fn(backbone, tokenizer, device))
+            backbone.train()  # build_q_fn switched the backbone to eval mode
+            payload["step"] = step_now
+            payload["value_state"] = str(milestone_manager.get_ckpt_path(step_now))
+            payload["dataset"] = str(config.data.path)
+            _write_json(gate_dir / f"contrast_step{step_now}.json", payload)
+            for k in (
+                "accuracy", "accuracy_no_ties", "n_ties", "mean_margin", "n_pairs", "n_roots", "by_pair_kind"
+            ):
+                row[k] = payload[k]
+            msg += (
+                f" | contrast accuracy={payload['accuracy']:.3f} "
+                f"(without ties {payload['accuracy_no_ties'] or 0.0:.3f}, ties {payload['n_ties']}) "
+                f"mean margin={payload['mean_margin']:+.4f} over {payload['n_pairs']} pairs"
+            )
+        milestone_dir.mkdir(parents=True, exist_ok=True)
+        with open(milestone_dir / "curve.jsonl", "a") as fh:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+        logger.success(msg)
+
+    def _maybe_milestone(step_now: int, epoch_now: int, run_l_v: float, run_l_q: float) -> None:
+        # Called after every checkpoint: due at the first checkpoint at or after each
+        # multiple of milestone_every, and at the final step.
+        nonlocal last_ckpt_step
+        due = bool(milestone_every) and (
+            step_now // milestone_every > last_ckpt_step // milestone_every or step_now >= total_steps
+        )
+        last_ckpt_step = step_now
+        if due:
+            _milestone(step_now, epoch_now, run_l_v, run_l_q)
 
     for epoch in range(start_epoch, config.max_epochs):
         skip = start_batch if epoch == start_epoch else 0
@@ -286,9 +420,16 @@ def train(
             gn_v, gn_q = norms[0], norms[1]
             window["max_l_v"] = max(window["max_l_v"], b_l_v)
             window["max_l_q"] = max(window["max_l_q"], b_l_q)
+            window["sum_l_v"] += b_l_v
+            window["sum_l_q"] += b_l_q
+            window["n"] += 1
             window["max_gn_v"] = max(window["max_gn_v"], gn_v)
             window["max_gn_q"] = max(window["max_gn_q"], gn_q)
             window["clipped"] += int(gn_v > clip) + int(gn_q > clip)
+            if has_head_groups:
+                window["max_gn_hv"] = max(window["max_gn_hv"], norms[3])
+                window["max_gn_hq"] = max(window["max_gn_hq"], norms[4])
+                window["clipped"] += int(norms[3] > clip) + int(norms[4] > clip)
             epoch_l_v += b_l_v
             epoch_l_q += b_l_q
             n_batches += 1
@@ -302,20 +443,32 @@ def train(
                     global_step, epoch, b + 1,
                     {"epoch_l_v": epoch_l_v, "epoch_l_q": epoch_l_q, "by_prov": by_prov, "n_batches": n_batches},
                 )
+                wn = max(window["n"], 1)
+                coh = optimizer.coherence() if hasattr(optimizer, "coherence") else []
+                heads_gn = heads_coh = heads_lr = ""
+                if has_head_groups:
+                    heads_gn = f" head V={window['max_gn_hv']:.3g} head Q+={window['max_gn_hq']:.3g}"
+                    heads_lr = f" head={optimizer.param_groups[3]['lr']:.2e}"
+                    if len(coh) > 4:
+                        heads_coh = f" head V={coh[3]:.3f} head Q+={coh[4]:.3f}"
+                coh_txt = f" | coherence V={coh[0]:.3f} Q+={coh[1]:.3f}{heads_coh}" if len(coh) > 1 else ""
                 logger.info(
                     f"checkpoint: epoch {epoch} batch {b + 1}/{n_batches_per_epoch} "
                     f"(step {global_step}/{total_steps}) running l_v={epoch_l_v / n_batches:.5f} "
-                    f"l_q={epoch_l_q / n_batches:.5f} | window max batch l_v={window['max_l_v']:.4f} "
-                    f"l_q={window['max_l_q']:.4f} max grad norm V={window['max_gn_v']:.3g} "
-                    f"Q+={window['max_gn_q']:.3g} clipped={window['clipped']} "
-                    f"lr V={optimizer.param_groups[0]['lr']:.2e} Q+={optimizer.param_groups[1]['lr']:.2e}"
+                    f"l_q={epoch_l_q / n_batches:.5f} | window mean l_v={window['sum_l_v'] / wn:.5f} "
+                    f"l_q={window['sum_l_q'] / wn:.5f} max batch l_v={window['max_l_v']:.4f} "
+                    f"l_q={window['max_l_q']:.4f} | max grad norm V={window['max_gn_v']:.3g} "
+                    f"Q+={window['max_gn_q']:.3g}{heads_gn} clipped={window['clipped']}{coh_txt} | "
+                    f"lr V={optimizer.param_groups[0]['lr']:.2e} Q+={optimizer.param_groups[1]['lr']:.2e}{heads_lr}"
                 )
                 window = _zero_window()
+                _maybe_milestone(global_step, epoch, epoch_l_v / n_batches, epoch_l_q / n_batches)
         # Epoch end: the next resume point is the start of the following epoch.
         _save(
             global_step, epoch + 1, 0,
             {"epoch_l_v": 0.0, "epoch_l_q": 0.0, "by_prov": _zero_prov(), "n_batches": 0},
         )
+        _maybe_milestone(global_step, epoch, epoch_l_v / max(n_batches, 1), epoch_l_q / max(n_batches, 1))
         epoch_summary = {
             "epoch": epoch,
             "steps": n_batches,

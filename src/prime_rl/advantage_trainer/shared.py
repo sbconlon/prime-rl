@@ -139,6 +139,32 @@ class MasterWeightAdamW:
                 p_.copy_(m_)  # rounds the float32 master to the parameter's dtype
         return norms
 
+    def coherence(self) -> list[float]:
+        """Mean |m_hat| / sqrt(v_hat) per group, from the bias-corrected AdamW
+        moments: about 1 when the gradient keeps its sign from step to step
+        (consistent signal), about 0.23 for random signs (pure noise, beta1 = 0.9),
+        about 0.05 when the sign flips every step (the update overshoots). It is
+        the size of the actual update relative to lr. 0.0 for a group without state."""
+        out: list[float] = []
+        for group, ms in zip(self._opt.param_groups, self._masters):
+            beta1, beta2 = group["betas"]
+            total = 0.0
+            count = 0
+            for m_ in ms:
+                st = self._opt.state.get(m_)
+                if not st or "exp_avg_sq" not in st:
+                    continue
+                n = float(st["step"])
+                if n <= 0:
+                    continue
+                m_hat = st["exp_avg"].abs() / (1.0 - beta1**n)
+                v_hat = st["exp_avg_sq"] / (1.0 - beta2**n)
+                r = m_hat / (v_hat.sqrt() + 1e-12)
+                total += float(r.sum())
+                count += r.numel()
+            out.append(total / count if count else 0.0)
+        return out
+
     def sync_from_params(self) -> None:
         """Reset the masters to the model's current parameters (after a load)."""
         with torch.no_grad():
@@ -156,20 +182,43 @@ class MasterWeightAdamW:
 
 
 def setup_value_optimizer(
-    backbone: ValueNetworkBackbone, v_lr: float, q_plus_lr: float, fp32_master: bool = False
+    backbone: ValueNetworkBackbone,
+    v_lr: float,
+    q_plus_lr: float,
+    fp32_master: bool = False,
+    head_lr: float | None = None,
 ) -> "optim.Optimizer | MasterWeightAdamW":
     """Per-slot AdamW: V (lora_*.0 + v_head) @ v_lr, Q+ (lora_*.1 + q_plus_head)
     @ q_plus_lr, V_target (lora_*.2 + v_target_head) @ lr=0. V_target is never
     gradient-trained (moved only by Polyak); lr=0 is explicit + defensive. Verbatim
     lift of the partition in advantage_trainer.train.train().
+
+    head_lr (optional): v_head and q_plus_head leave their slot's group and get
+    two groups of their own, appended as groups 3 and 4, at head_lr. Why: the
+    heads read the base model's final hidden state, whose L1 norm is about 4,000
+    (final-norm gain: L2 137, L1 5,315 on the 1.5B SFT base), so one Adam step at
+    rate r moves a prediction by up to ~4,000 r. At the LoRA's rate (3e-4) that
+    exceeds the 0/1 target range: measured on job 756302, the head gradient
+    flipped sign every step (mean |m|/sqrt(v) 0.04 for V's head) and the head held
+    98 % (V) / 66 % (Q+) of the slot's gradient energy, so slot-level clipping
+    scaled the LoRA's gradient by a factor that changed 40-100x between steps and
+    froze it. Separate groups give the heads their own rate and their own clip.
     """
     logger = get_logger()
     v_params: list = []
     q_plus_params: list = []
     v_target_params: list = []
     other_trainable: list[tuple[str, "torch.nn.Parameter"]] = []
+    v_head_params: list = []
+    q_head_params: list = []
     for name, p_ in backbone.named_parameters():
         if not p_.requires_grad:
+            continue
+        if head_lr is not None and "v_head" in name and "v_target_head" not in name:
+            v_head_params.append(p_)
+            continue
+        if head_lr is not None and "q_plus_head" in name:
+            q_head_params.append(p_)
             continue
         if name.endswith(".lora_A.0") or name.endswith(".lora_B.0") or (
             "v_head" in name and "v_target_head" not in name
@@ -191,7 +240,9 @@ def setup_value_optimizer(
         )
         v_params.extend(p_ for _, p_ in other_trainable)
 
-    n_trainable = sum(p_.numel() for p_ in v_params + q_plus_params + v_target_params)
+    n_trainable = sum(
+        p_.numel() for p_ in v_params + q_plus_params + v_target_params + v_head_params + q_head_params
+    )
     logger.info(
         f"Trainable parameters: {n_trainable:,} "
         f"(V={sum(p_.numel() for p_ in v_params):,}, "
@@ -205,6 +256,12 @@ def setup_value_optimizer(
         {"params": q_plus_params, "lr": q_plus_lr},
         {"params": v_target_params, "lr": 0.0},
     ]
+    if head_lr is not None:
+        if not v_head_params or not q_head_params:
+            raise ValueError("head_lr was given but v_head / q_plus_head parameters were not found")
+        groups.append({"params": v_head_params, "lr": head_lr})
+        groups.append({"params": q_head_params, "lr": head_lr})
+        logger.info(f"Value heads in their own optimizer groups at lr={head_lr:.2e}")
     if fp32_master:
         return MasterWeightAdamW(groups)
     return optim.AdamW(groups)

@@ -218,6 +218,55 @@ class WarmStartTrainConfig(BaseConfig):
             ),
         ),
     ] = 0
+    lr_decay: Annotated[
+        Literal["none", "cosine", "linear"],
+        Field(
+            description=(
+                "Learning-rate decay after the warmup, down to lr_final_scale x the base rate at the "
+                "last optimizer step of max_epochs. The schedule spans max_epochs, so keep max_epochs "
+                "fixed across the resubmits of one run."
+            )
+        ),
+    ] = "none"
+    lr_final_scale: Annotated[
+        float,
+        Field(ge=0.0, le=1.0, description="End point of lr_decay as a fraction of the base learning rate."),
+    ] = 0.1
+    head_learning_rate: Annotated[
+        float | None,
+        Field(
+            gt=0.0,
+            description=(
+                "Learning rate of the two linear value heads (v_head, q_plus_head), which then get their "
+                "own optimizer groups and their own gradient clip. The heads read a hidden state of L1 "
+                "norm ~4,000, so one Adam step at rate r moves a prediction by up to ~4,000 r: at 3e-4 "
+                "that exceeds the 0/1 target range and the head gradient flips sign every step (job "
+                "756302). None = the heads train in their slot's group at the slot's rate."
+            ),
+        ),
+    ] = None
+    milestone_every_steps: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Keep a permanent weights-only copy (output_dir/milestones/checkpoints/step_<N>) at the "
+                "first checkpoint at or after every multiple of this many optimizer steps, and at the "
+                "final step. The rolling resume checkpoints are deleted (resume_keep_last), so without "
+                "milestones a good state is lost when training later degrades. 0 = off."
+            ),
+        ),
+    ] = 0
+    milestone_contrast: Annotated[
+        bool,
+        Field(
+            description=(
+                "At each milestone score the held-out contrast pairs with the current Q+ (branched kind "
+                "only): gate/contrast_step<N>.json plus one line in milestones/curve.jsonl, i.e. the "
+                "gate metric as a curve over training."
+            )
+        ),
+    ] = True
     resume_keep_last: Annotated[
         int,
         Field(

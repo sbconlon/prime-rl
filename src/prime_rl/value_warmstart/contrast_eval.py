@@ -283,11 +283,17 @@ def score_pairs(
         return {"n": n, "accuracy": (sum(flags) / n) if n else None}
 
     all_flags = [r["correct"] for r in rows]
+    untied = [r["correct"] for r in rows if r["q_i"] != r["q_j"]]
+    # Q+ gap in the direction of the returns: positive = the better action scored higher.
+    margins = [(r["q_i"] - r["q_j"]) * (1.0 if r["g_i"] > r["g_j"] else -1.0) for r in rows]
     return {
         "schema": 1,
         "n_pairs": len(rows),
         "n_roots": len({(r["trunk_id"], r["root_turn"]) for r in rows}),
         "accuracy": (sum(all_flags) / len(all_flags)) if all_flags else None,
+        "n_ties": len(rows) - len(untied),
+        "accuracy_no_ties": (sum(untied) / len(untied)) if untied else None,
+        "mean_margin": (sum(margins) / len(margins)) if margins else None,
         "by_pair_kind": {k: agg(v) for k, v in sorted(kinds.items())},
         "by_provenance": {k: agg(v) for k, v in sorted(splits["provenance"].items())},
         "by_block_source": {k: agg(v) for k, v in sorted(splits["block_source"].items())},
@@ -302,6 +308,16 @@ def _load_holdout_ids(path: Path | None) -> set[str]:
         return set()
     with open(path) as f:
         return {str(i) for i in json.load(f)}
+
+
+def holdout_records(path: Path, holdout_ids: set[str] | None = None) -> Iterable[BranchRecord]:
+    """Stream only the held-out records (flag or id list). contrast_pairs keeps its
+    whole input in memory, and the full dataset is tens of thousands of token-id
+    records; the held-out part is a few percent of it."""
+    ids = set(holdout_ids or ())
+    for r in read_branch_records(path):
+        if r.holdout or r.game_id in ids:
+            yield r
 
 
 def build_q_fn(backbone: ValueNetworkBackbone, tokenizer, device) -> Callable[[list[int], str], float]:
@@ -333,10 +349,11 @@ def contrast_eval(config: ContrastEvalConfig) -> dict:
     load_warm_start(backbone, config.value_state)
     tokenizer = AutoTokenizer.from_pretrained(config.model.base_model_name)
 
+    ids = _load_holdout_ids(config.holdout_ids_path)
     pairs = contrast_pairs(
-        read_branch_records(config.dataset),
+        holdout_records(config.dataset, ids) if config.holdout_only else read_branch_records(config.dataset),
         holdout_only=config.holdout_only,
-        holdout_ids=_load_holdout_ids(config.holdout_ids_path),
+        holdout_ids=ids,
         min_p_accept=config.min_p_accept,
     )
     if not pairs:
