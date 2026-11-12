@@ -236,8 +236,8 @@ def test_warmup_clipping_and_learning_rate_on_resume(tmp_path, monkeypatch):
     captured = {}
     real_setup = tr.setup_value_optimizer
 
-    def setup_spy(backbone, v_lr, q_lr):
-        captured["opt"] = real_setup(backbone, v_lr, q_lr)
+    def setup_spy(backbone, v_lr, q_lr, **kw):
+        captured["opt"] = real_setup(backbone, v_lr, q_lr, **kw)
         return captured["opt"]
 
     lrs: list[tuple[float, float, float]] = []
@@ -280,3 +280,49 @@ def test_warmup_clipping_and_learning_rate_on_resume(tmp_path, monkeypatch):
     assert len(lrs) == 4  # epoch 1 only
     assert all(abs(q - 2e-4) < 1e-12 and abs(v - 4e-4) < 1e-12 for v, q, _ in lrs)
     assert clips == [float("inf")] * 8  # measured, not clipped
+
+
+def test_training_loop_on_a_bfloat16_model(tmp_path):
+    """The GPU condition: bfloat16 weights, float32 masters and optimizer state.
+    Skipped when this torch build lacks a bfloat16 CPU kernel the tiny model needs."""
+    import pytest
+
+    path = tmp_path / "tagged.msgpack"
+    with RecordWriter(path) as w:
+        for r in _tagged_records():
+            w.write(r)
+    tok = _CharTok()
+    bf16 = torch.bfloat16
+    try:
+        bb = _backbone().to(bf16)
+        cfg = _config(tmp_path, path, "branched", max_epochs=1, batch_size=1, ckpt_every_steps=2,
+                      resume_keep_last=3, max_grad_norm=1.0, warmup_steps=2)
+        before = {k: v.detach().clone() for k, v in bb.state_dict().items()}
+        summary = train(cfg, backbone=bb, tokenizer=tok)
+    except RuntimeError as exc:
+        if "bfloat16" in str(exc).lower() or "not implemented" in str(exc).lower():
+            pytest.skip(f"bfloat16 CPU kernel missing: {exc}")
+        raise
+    assert summary["final"]["steps"] == 4
+    assert all(p.dtype == bf16 for p in bb.parameters())  # the model stays in bfloat16
+    resume = torch.load(tmp_path / "out" / "resume" / "checkpoints" / "step_4" / "trainer" / "value_state.pt",
+                        map_location="cpu", weights_only=False)
+    states = [s for s in resume["optimizer_state_dict"]["state"].values() if "exp_avg_sq" in s]
+    assert states and all(s["exp_avg_sq"].dtype == torch.float32 for s in states)  # float32 state
+    assert all(t.dtype == bf16 for t in resume["trainable_state_dict"].values())
+    after = bb.state_dict()
+    changed = [k for k in before if not torch.equal(before[k], after[k])]
+    assert any(k.endswith(".lora_B.0") or "v_head" in k for k in changed)   # V trained
+    assert any(k.endswith(".lora_B.1") or "q_plus_head" in k for k in changed)  # Q+ trained
+    # the last save seeded V_target = V and no optimizer step ran after it
+    for k in after:
+        if k.endswith(".lora_B.2"):
+            assert torch.equal(after[k], after[k[:-1] + "0"])
+
+    # resume on the bfloat16 model: nothing left, weights reload identically
+    bb2 = _backbone().to(bf16)
+    s2 = train(_config(tmp_path, path, "branched", max_epochs=1, batch_size=1, ckpt_every_steps=2,
+                       resume_keep_last=3, max_grad_norm=1.0, warmup_steps=2), backbone=bb2, tokenizer=tok)
+    assert s2["final"]["steps"] == 4
+    after2 = bb2.state_dict()
+    assert all(torch.equal(after[k], after2[k]) for k in after if ".lora_" in k or "head" in k)

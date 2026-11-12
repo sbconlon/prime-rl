@@ -66,9 +66,98 @@ def value_regression_backward(
     return l_v_contrib, l_q_contrib
 
 
+class MasterWeightAdamW:
+    """AdamW with float32 master weights and float32 state for parameters that
+    live in a lower precision (bfloat16 on GPU).
+
+    Why: with bfloat16 parameters torch's AdamW keeps its state in bfloat16.
+    The second-moment decay (beta2 = 0.999, a 0.1 % change per step) is below
+    bfloat16's resolution, so it rounds away and the estimate can only grow: a
+    gradient spike then lowers that parameter's learning rate permanently.
+    Measured on the branched warm-start (job 755044): 0 of 18.5M second-moment
+    entries per network decreased over 100 steps. Small weight updates are
+    quantised the same way.
+
+    Each trainable parameter gets a float32 master. step() copies the gradients
+    to the masters, clips per group there, runs AdamW, and rounds the masters
+    into the model's parameters. A group whose learning rate is 0 and a
+    parameter that received no gradient are left alone, so V_target (moved only
+    by Polyak updates on the model) is never overwritten. After loading weights
+    into the model call sync_from_params().
+
+    Duck-types the torch optimizer surface the trainers and the checkpoint
+    manager use: param_groups, zero_grad, step, state_dict, load_state_dict."""
+
+    def __init__(self, groups: list[dict]):
+        self._model_params: list[list] = [list(g["params"]) for g in groups]
+        self._masters: list[list] = [
+            [torch.nn.Parameter(p_.detach().to(torch.float32).clone()) for p_ in ps]
+            for ps in self._model_params
+        ]
+        self._opt = optim.AdamW(
+            [{"params": ms, "lr": g["lr"]} for ms, g in zip(self._masters, groups)]
+        )
+
+    @property
+    def param_groups(self) -> list[dict]:
+        return self._opt.param_groups
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        for ps in self._model_params:
+            for p_ in ps:
+                p_.grad = None
+        self._opt.zero_grad(set_to_none=True)
+
+    def step(self, max_grad_norm: float | None = None) -> list[float]:
+        """One update. Returns each group's gradient norm before clipping
+        (float32). max_grad_norm clips each group separately; None measures only."""
+        clip = float("inf") if max_grad_norm is None else float(max_grad_norm)
+        norms: list[float] = []
+        touched: list[tuple] = []
+        for gi, (ps, ms) in enumerate(zip(self._model_params, self._masters)):
+            if self._opt.param_groups[gi]["lr"] == 0.0:
+                # A frozen group (V_target): its parameters are moved on the model
+                # by Polyak updates, and the multi-slot LoRA hands them zero-valued
+                # (not None) gradients. Never step it and never write its stale
+                # masters back over the model.
+                for m_ in ms:
+                    m_.grad = None
+                norms.append(0.0)
+                continue
+            with_grad = []
+            for p_, m_ in zip(ps, ms):
+                if p_.grad is None:
+                    m_.grad = None
+                    continue
+                m_.grad = p_.grad.detach().to(torch.float32)
+                with_grad.append(m_)
+                touched.append((p_, m_))
+            norms.append(float(torch.nn.utils.clip_grad_norm_(with_grad, clip)) if with_grad else 0.0)
+        self._opt.step()
+        with torch.no_grad():
+            for p_, m_ in touched:
+                p_.copy_(m_)  # rounds the float32 master to the parameter's dtype
+        return norms
+
+    def sync_from_params(self) -> None:
+        """Reset the masters to the model's current parameters (after a load)."""
+        with torch.no_grad():
+            for ps, ms in zip(self._model_params, self._masters):
+                for p_, m_ in zip(ps, ms):
+                    m_.copy_(p_.detach().to(torch.float32))
+
+    def state_dict(self) -> dict:
+        return self._opt.state_dict()
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        # torch casts loaded state tensors to the (float32) master dtype, so a
+        # checkpoint written by the bfloat16 optimizer loads too.
+        self._opt.load_state_dict(state_dict)
+
+
 def setup_value_optimizer(
-    backbone: ValueNetworkBackbone, v_lr: float, q_plus_lr: float
-) -> optim.Optimizer:
+    backbone: ValueNetworkBackbone, v_lr: float, q_plus_lr: float, fp32_master: bool = False
+) -> "optim.Optimizer | MasterWeightAdamW":
     """Per-slot AdamW: V (lora_*.0 + v_head) @ v_lr, Q+ (lora_*.1 + q_plus_head)
     @ q_plus_lr, V_target (lora_*.2 + v_target_head) @ lr=0. V_target is never
     gradient-trained (moved only by Polyak); lr=0 is explicit + defensive. Verbatim
@@ -111,10 +200,11 @@ def setup_value_optimizer(
     )
     logger.info(f"Per-slot learning rates: V={v_lr:.2e}, Q+={q_plus_lr:.2e}, V_target=0.0")
 
-    return optim.AdamW(
-        [
-            {"params": v_params, "lr": v_lr},
-            {"params": q_plus_params, "lr": q_plus_lr},
-            {"params": v_target_params, "lr": 0.0},
-        ]
-    )
+    groups = [
+        {"params": v_params, "lr": v_lr},
+        {"params": q_plus_params, "lr": q_plus_lr},
+        {"params": v_target_params, "lr": 0.0},
+    ]
+    if fp32_master:
+        return MasterWeightAdamW(groups)
+    return optim.AdamW(groups)

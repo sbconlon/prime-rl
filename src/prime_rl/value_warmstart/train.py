@@ -126,8 +126,10 @@ def train(
         device = next(backbone.parameters()).device
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(config.model.base_model_name)
+    # float32 master weights + float32 AdamW state: with bfloat16 parameters the
+    # second-moment decay rounds away and spikes lower the learning rate for good.
     optimizer = setup_value_optimizer(
-        backbone, config.v_learning_rate, config.q_plus_learning_rate
+        backbone, config.v_learning_rate, config.q_plus_learning_rate, fp32_master=True
     )
 
     dataset, provenance, holdout_ids = _load_dataset(config)
@@ -173,6 +175,7 @@ def train(
                 "filters, batch size and seed, or pass resume=False (or another output_dir)."
             )
         global_step = resume_manager.load(last, backbone, optimizer)
+        optimizer.sync_from_params()  # masters follow the weights just loaded
         if progress.get("global_step") != global_step:
             progress = {}  # killed between the checkpoint and its sidecar: the epoch's sums restart
         logger.info(
@@ -214,7 +217,6 @@ def train(
     # Group order is fixed by setup_value_optimizer: V, Q+, V_target (lr 0).
     base_lrs = [config.v_learning_rate, config.q_plus_learning_rate, 0.0]
     clip = float(config.max_grad_norm) if config.max_grad_norm else float("inf")
-    slot_params = [g["params"] for g in optimizer.param_groups[:2]]
 
     def _set_lrs(step_now: int) -> None:
         # Re-applied every step from the config: warmup, and a learning rate changed
@@ -278,15 +280,15 @@ def train(
                     by_prov[prov]["l_v"] += l_v
                     by_prov[prov]["l_q"] += l_q
                     by_prov[prov]["n_samples"] += len(group)
-            # Per-slot clipping (inf = measure only): one slot's bad batch must not
-            # shrink the other slot's update.
-            gn_v, gn_q = (float(torch.nn.utils.clip_grad_norm_(ps, clip)) for ps in slot_params)
+            # Per-slot clipping in float32 (None = measure only): one slot's bad
+            # batch must not shrink the other slot's update.
+            norms = optimizer.step(max_grad_norm=config.max_grad_norm)
+            gn_v, gn_q = norms[0], norms[1]
             window["max_l_v"] = max(window["max_l_v"], b_l_v)
             window["max_l_q"] = max(window["max_l_q"], b_l_q)
             window["max_gn_v"] = max(window["max_gn_v"], gn_v)
             window["max_gn_q"] = max(window["max_gn_q"], gn_q)
             window["clipped"] += int(gn_v > clip) + int(gn_q > clip)
-            optimizer.step()
             epoch_l_v += b_l_v
             epoch_l_q += b_l_q
             n_batches += 1
