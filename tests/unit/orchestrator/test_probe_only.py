@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import tomllib
+from pathlib import Path
 from types import SimpleNamespace
 
 from prime_rl.configs.orchestrator import OrchestratorConfig
@@ -55,3 +57,35 @@ def test_is_probe_only():
     assert is_probe_only(SimpleNamespace(orchestrator=SimpleNamespace(probe=None))) is False
     assert is_probe_only(SimpleNamespace(orchestrator=SimpleNamespace(probe=SimpleNamespace(only=False)))) is False
     assert is_probe_only(SimpleNamespace(orchestrator=SimpleNamespace(probe=SimpleNamespace(only=True)))) is True
+
+
+def _gate_config(name: str) -> dict:
+    path = Path(__file__).resolve().parents[3] / "configs" / "alfworld" / name
+    return tomllib.loads(path.read_text(encoding="utf-8"))
+
+
+def test_pps_gate_config_differs_from_first_gate_only_in_probe_set_and_run_name():
+    first = _gate_config("arm_action_1.5b_ctx2048_pps_warm_branched_gate.toml")
+    pps = _gate_config("arm_action_1.5b_ctx2048_pps_warm_branched_gate_pps.toml")
+
+    assert pps["orchestrator"]["probe"]["only"] is True
+    assert pps["orchestrator"]["probe"]["env"]["args"]["probe_set"] == "alfworld-pps-24-v1"
+    assert first["orchestrator"]["probe"]["env"]["args"]["probe_set"] == "alfworld-24-v1"
+    # both value processes load the same file (both-warm invariant), and it is the first gate's
+    warm = pps["advantage_server"]["warm_start_path"]
+    assert warm == pps["advantage_trainer"]["warm_start_path"] == first["advantage_server"]["warm_start_path"]
+    assert "value_nets_v3" in warm
+    # a run directory of its own, with the Advantage Trainer's output under it
+    assert pps["output_dir"] != first["output_dir"]
+    assert pps["advantage_trainer"]["output_dir"].startswith(pps["output_dir"] + "/")
+
+    # everything else is the first gate's config
+    def strip(cfg: dict) -> dict:
+        cfg = json.loads(json.dumps(cfg))
+        cfg.pop("output_dir")
+        cfg["advantage_trainer"].pop("output_dir")
+        cfg["orchestrator"]["model"]["lora"].pop("name")
+        cfg["orchestrator"]["probe"]["env"]["args"].pop("probe_set")
+        return cfg
+
+    assert strip(pps) == strip(first)
