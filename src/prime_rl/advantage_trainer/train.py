@@ -41,10 +41,19 @@ from prime_rl.advantage_trainer.data import (
     prepare_batched_advantage_samples,
 )
 from prime_rl.advantage_trainer._prof import prof, set_request_id
-from prime_rl.advantage_trainer.ckpt import load_warm_start, setup_advantage_ckpt_manager
-from prime_rl.advantage_trainer.shared import setup_value_optimizer, value_regression_backward
+from prime_rl.advantage_trainer.ckpt import (
+    AdvantageCheckpointManager,
+    load_warm_start,
+    setup_advantage_ckpt_manager,
+)
+from prime_rl.advantage_trainer.shared import (
+    MasterWeightAdamW,
+    setup_value_optimizer,
+    value_regression_backward,
+)
 from prime_rl.utils.utils import resolve_latest_ckpt_step
 from prime_rl.configs.advantage_trainer import AdvantageTrainerConfig
+from prime_rl.configs.trainer import CheckpointConfig
 from prime_rl.orchestrator.value_networks import ValueNetworkBackbone
 from prime_rl.transport.advantage_batch import (
     setup_advantage_training_batch_receiver,
@@ -108,13 +117,148 @@ def _broadcast_weights(
 
 
 # ---------------------------------------------------------------------------
+# Optimizer plumbing (arm-redesign Phase 3). Every piece is opt-in through the
+# config (fp32_master, head_learning_rate, max_grad_norm, warmup_cycles); at
+# their defaults the optimizer, its groups and its updates are unchanged.
+# ---------------------------------------------------------------------------
+
+# Optimizer group order, fixed by setup_value_optimizer: V, Q+, V_target (rate 0,
+# moved only by Polyak), then with head_learning_rate the V head and the Q+ head.
+_V_TARGET_GROUP = 2
+
+
+def _setup_optimizer(
+    backbone: ValueNetworkBackbone, config: AdvantageTrainerConfig
+) -> tuple["optim.Optimizer | MasterWeightAdamW", list[float]]:
+    """The value optimizer `config` asks for, and the base learning rate of each
+    of its groups (what _set_learning_rates re-applies every cycle)."""
+    v_lr = config.v_learning_rate if config.v_learning_rate is not None else config.learning_rate
+    q_plus_lr = (
+        config.q_plus_learning_rate if config.q_plus_learning_rate is not None else config.learning_rate
+    )
+    optimizer = setup_value_optimizer(
+        backbone,
+        v_lr,
+        q_plus_lr,
+        fp32_master=config.fp32_master,
+        head_lr=config.head_learning_rate,
+    )
+    base_lrs = [v_lr, q_plus_lr, 0.0]
+    if config.head_learning_rate is not None:
+        base_lrs += [config.head_learning_rate, config.head_learning_rate]
+    if len(base_lrs) != len(optimizer.param_groups):
+        raise ValueError(
+            f"optimizer has {len(optimizer.param_groups)} groups, the config implies {len(base_lrs)}"
+        )
+    return optimizer, base_lrs
+
+
+def _warmup_scale(cycle: int, warmup_cycles: int) -> float:
+    """Multiplier on the base learning rates at cycle `cycle` (0-based): linear
+    over the first warmup_cycles, 1.0 from then on. Same as the offline trainer's
+    lr_scale without decay (an online run has no fixed horizon to decay over)."""
+    return min(1.0, (cycle + 1) / warmup_cycles) if warmup_cycles else 1.0
+
+
+def _set_learning_rates(
+    optimizer: "optim.Optimizer | MasterWeightAdamW",
+    base_lrs: list[float],
+    cycle: int,
+    warmup_cycles: int,
+) -> None:
+    """Re-apply the configured rates at the start of a cycle, scaled by the warmup.
+    From the config every time, so a rate changed between jobs takes effect on
+    resume (the checkpoint would restore the old one; before Phase 3 it did, for
+    every optimizer). V_target stays at exactly 0."""
+    scale = _warmup_scale(cycle, warmup_cycles)
+    for group, base in zip(optimizer.param_groups, base_lrs):
+        group["lr"] = base * scale
+
+
+def _clip_each_group(optimizer: optim.Optimizer, max_grad_norm: float) -> list[float]:
+    """Clip each param group's gradient norm separately (one group's bad batch
+    must not shrink another group's update). Returns the norms before clipping.
+    A group at rate 0 (V_target) is skipped, as in MasterWeightAdamW.step."""
+    norms: list[float] = []
+    for group in optimizer.param_groups:
+        params = [p for p in group["params"] if p.grad is not None]
+        if group["lr"] == 0.0 or not params:
+            norms.append(0.0)
+            continue
+        norms.append(float(torch.nn.utils.clip_grad_norm_(params, max_grad_norm)))
+    return norms
+
+
+def _optimizer_step(
+    optimizer: "optim.Optimizer | MasterWeightAdamW", max_grad_norm: float | None
+) -> list[float] | None:
+    """One optimizer step. Returns each param group's gradient norm before
+    clipping, or None when it was not measured.
+
+    MasterWeightAdamW clips each group in float32 inside its own step() and
+    always measures. A plain torch optimizer is clipped group by group here when
+    max_grad_norm is set; without it this is a bare optimizer.step()."""
+    if isinstance(optimizer, MasterWeightAdamW):
+        return optimizer.step(max_grad_norm=max_grad_norm)
+    norms = _clip_each_group(optimizer, max_grad_norm) if max_grad_norm is not None else None
+    optimizer.step()
+    return norms
+
+
+def _max_per_group(running: list[float] | None, norms: list[float] | None) -> list[float] | None:
+    """Per-group maximum over a cycle's optimizer steps (None while nothing was measured)."""
+    if norms is None:
+        return running
+    if running is None:
+        return list(norms)
+    return [max(a, b) for a, b in zip(running, norms)]
+
+
+def _cycle_log_line(step: int, metrics: dict) -> str:
+    """The cycle's log line.
+
+    Race-condition diagnostic: first/last epoch mean L_V/L_Q captures whether the
+    inner loop is converging the value networks within a cycle (spec 20260516);
+    q_plus_target_abs_mean tracks the predicted-bounded-vs-growing CFR+ target
+    invariant.
+
+    Health readings, appended only when present in `metrics` (the Phase-3
+    settings; the default line is unchanged). Each is a list in optimizer-group
+    order without the frozen V_target group: [v, q+] or, with head groups,
+    [v, q+, v_head, q_head].
+      gnorm  largest gradient norm before clipping over the cycle's optimizer steps
+      coh    update coherence, MasterWeightAdamW.coherence(): ~1 a gradient that
+             keeps its sign, ~0.23 noise, ~0.05 a sign flipping every step
+      lr     the rates this cycle ran at
+    """
+    line = (
+        f"step={step} inner_steps={metrics['inner_steps']} "
+        f"l_v_first_epoch={metrics['l_v_first_epoch']:.4f} "
+        f"l_v_last_epoch={metrics['l_v_last_epoch']:.4f} "
+        f"l_v_mean={metrics['l_v']:.4f} "
+        f"l_q_first_epoch={metrics['l_q_first_epoch']:.4f} "
+        f"l_q_last_epoch={metrics['l_q_last_epoch']:.4f} "
+        f"l_q_mean={metrics['l_q']:.4f} "
+        f"q_tgt_abs={metrics['q_plus_target_abs_mean']:.4f} "
+        f"n_samples={metrics['n_samples']}"
+    )
+    for key, spec in (("gnorm", ".4g"), ("coh", ".3f"), ("lr", ".2e")):
+        values = metrics.get(key)
+        if values is None:
+            continue
+        shown = [v for i, v in enumerate(values) if i != _V_TARGET_GROUP]
+        line += f" {key}=[" + ",".join(format(v, spec) for v in shown) + "]"
+    return line
+
+
+# ---------------------------------------------------------------------------
 # Per-step logic (testable in isolation -- no transport, no model loading)
 # ---------------------------------------------------------------------------
 
 
 def _train_step(
     backbone: ValueNetworkBackbone,
-    optimizer: optim.Optimizer,
+    optimizer: "optim.Optimizer | MasterWeightAdamW",
     batch: AdvantageTrainingBatch,
     algorithm: Literal["ppo", "arm"],
     polyak_tau: float,
@@ -122,7 +266,8 @@ def _train_step(
     minibatch_size: int | None = None,
     inner_batch_size: int = 1,
     generator: torch.Generator | None = None,
-) -> dict[str, float]:
+    max_grad_norm: float | None = None,
+) -> dict:
     """Run one Jin-aligned training cycle over a batch.
 
     Per-cycle structure (spec 20260516):
@@ -159,6 +304,11 @@ def _train_step(
     The Polyak update fires AFTER the inner loop (so V_target tracks the
     fully-updated V) and BEFORE the weight broadcast (so the Server
     receives the latest V_target).
+
+    `max_grad_norm` clips each optimizer group separately before every
+    optimizer step (see _optimizer_step). When the gradient norms were
+    measured (MasterWeightAdamW, or clipping on) the metrics carry "gnorm":
+    per optimizer group, the largest pre-clip norm over the cycle's steps.
     """
     device = next(backbone.parameters()).device
     backbone.train()
@@ -204,6 +354,7 @@ def _train_step(
     l_q_sum = 0.0
     loss_sum = 0.0
     n_inner_steps = 0
+    grad_norm_max: list[float] | None = None
     # Per-epoch accumulators -- the race diagnostic compares first-epoch
     # mean vs. last-epoch mean. Each epoch sweeps all n_total samples
     # (just shuffled differently), so the mean across an epoch's
@@ -296,7 +447,9 @@ def _train_step(
                 mb_l_q += l_q_value * chunk_scale
 
             with prof("advtrainer.optimizer_step", sync_cuda=True):
-                optimizer.step()
+                grad_norm_max = _max_per_group(
+                    grad_norm_max, _optimizer_step(optimizer, max_grad_norm)
+                )
             n_inner_steps += 1
             epoch_l_v += mb_l_v
             epoch_l_q += mb_l_q
@@ -331,7 +484,7 @@ def _train_step(
     l_v_last_epoch = last_epoch_l_v_sum / last_epoch_steps if last_epoch_steps else 0.0
     l_q_last_epoch = last_epoch_l_q_sum / last_epoch_steps if last_epoch_steps else 0.0
 
-    return {
+    metrics: dict = {
         # Backward-compat keys (existing log consumers expect these):
         "loss": float(loss_mean),
         "mean_loss": float(loss_mean),
@@ -348,11 +501,14 @@ def _train_step(
         "q_plus_target_abs_mean": float(q_plus_target_abs_mean),
         "inner_steps": int(n_inner_steps),
     }
+    if grad_norm_max is not None:
+        metrics["gnorm"] = grad_norm_max
+    return metrics
 
 
 def _train_step_action(
     backbone: ValueNetworkBackbone,
-    optimizer: optim.Optimizer,
+    optimizer: "optim.Optimizer | MasterWeightAdamW",
     batch: AdvantageTrainingBatch,
     tokenizer,
     polyak_tau: float,
@@ -360,7 +516,8 @@ def _train_step_action(
     minibatch_size: int | None = None,
     inner_batch_size: int = 1,
     generator: torch.Generator | None = None,
-) -> dict[str, float]:
+    max_grad_norm: float | None = None,
+) -> dict:
     """Action-level ARM training cycle: regress V/Q+ against the per-decision-point
     targets (AdvantageTrainingSample.decision_point_targets, Phase 6).
 
@@ -373,6 +530,7 @@ def _train_step_action(
     Loss is per-decision-point MSE with per-sample-equal weighting (weights from
     prepare_action_advantage_samples), so a many-turn rollout doesn't dominate.
     The weight broadcast stays in train() (as for the token-level path).
+    `max_grad_norm` and the "gnorm" metric: as in _train_step.
     """
     device = next(backbone.parameters()).device
     backbone.train()
@@ -397,6 +555,7 @@ def _train_step_action(
     mb_size = minibatch_size if minibatch_size is not None else n_total
     l_v_sum = l_q_sum = loss_sum = 0.0
     n_inner_steps = 0
+    grad_norm_max: list[float] | None = None
     first_lv = first_lq = first_steps = 0.0
     last_lv = last_lq = last_steps = 0.0
 
@@ -424,7 +583,9 @@ def _train_step_action(
                 mb_l_v += l_v_contrib
                 mb_l_q += l_q_contrib
 
-            optimizer.step()
+            grad_norm_max = _max_per_group(
+                grad_norm_max, _optimizer_step(optimizer, max_grad_norm)
+            )
             n_inner_steps += 1
             epoch_lv += mb_l_v
             epoch_lq += mb_l_q
@@ -439,7 +600,7 @@ def _train_step_action(
 
     backbone.polyak_update_v_target(tau=polyak_tau)
 
-    return {
+    metrics: dict = {
         "loss": float(loss_sum / n_inner_steps) if n_inner_steps else 0.0,
         "mean_loss": float(loss_sum / n_inner_steps) if n_inner_steps else 0.0,
         "l_v": float(l_v_sum / n_inner_steps) if n_inner_steps else 0.0,
@@ -452,6 +613,9 @@ def _train_step_action(
         "q_plus_target_abs_mean": float(q_plus_target_abs_mean),
         "inner_steps": int(n_inner_steps),
     }
+    if grad_norm_max is not None:
+        metrics["gnorm"] = grad_norm_max
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -504,11 +668,19 @@ def train(config: AdvantageTrainerConfig) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Could not load tokenizer for action-level ARM: {exc}")
 
-    v_lr = config.v_learning_rate if config.v_learning_rate is not None else config.learning_rate
-    q_plus_lr = (
-        config.q_plus_learning_rate if config.q_plus_learning_rate is not None else config.learning_rate
+    # Defaults: plain AdamW over the three slot groups. fp32_master: float32
+    # master weights + float32 AdamW state (with bfloat16 parameters the
+    # second-moment decay rounds away and a spike lowers the rate for good).
+    # head_learning_rate: the two value heads get their own groups (3 and 4).
+    optimizer, base_lrs = _setup_optimizer(backbone, config)
+    # The rates join the cycle log line once any of the Phase-3 settings is on;
+    # at the defaults the line is unchanged.
+    log_rates = (
+        config.fp32_master
+        or config.head_learning_rate is not None
+        or config.max_grad_norm is not None
+        or config.warmup_cycles > 0
     )
-    optimizer = setup_value_optimizer(backbone, v_lr, q_plus_lr)
 
     # Checkpoint manager. Mirrors the LLM trainer\'s setup_ckpt_managers
     # pattern: returns None when config.ckpt is None (no checkpointing
@@ -535,6 +707,28 @@ def train(config: AdvantageTrainerConfig) -> None:
     else:
         resume_start_step = 0
 
+    if isinstance(optimizer, MasterWeightAdamW):
+        # The float32 masters were copied from the model when the optimizer was
+        # built, before the checkpoint / warm start was loaded into it. Without
+        # this the first step would write the pre-load weights back over the
+        # loaded ones.
+        optimizer.sync_from_params()
+
+    # arm-redesign D-9: permanent weights-only copies of the value networks every
+    # milestone_every_steps cycles, for scoring on the held-out contrast pairs
+    # after the run. Same layout and file format as the offline trainer's
+    # milestones (warm_start_path / contrast_eval read them); never pruned.
+    milestone_every = int(config.milestone_every_steps or 0)
+    milestone_manager: AdvantageCheckpointManager | None = None
+    if milestone_every:
+        milestone_manager = AdvantageCheckpointManager(
+            config.output_dir / "milestones", CheckpointConfig(skip_optimizer=True)
+        )
+        logger.info(
+            f"Value milestones every {milestone_every} steps: weights kept under "
+            f"{config.output_dir / 'milestones'}"
+        )
+
     receiver = setup_advantage_training_batch_receiver(
         config.transport, input_dir=config.transport_input_dir
     )
@@ -554,6 +748,8 @@ def train(config: AdvantageTrainerConfig) -> None:
 
         for batch in batches:
             set_request_id(str(step))
+            # Rates from the config at every cycle, scaled by the warmup.
+            _set_learning_rates(optimizer, base_lrs, step, config.warmup_cycles)
             if torch.cuda.is_available():
                 mem_start_gb = torch.cuda.memory_allocated() / 1e9
                 torch.cuda.reset_peak_memory_stats()
@@ -573,6 +769,7 @@ def train(config: AdvantageTrainerConfig) -> None:
                             n_epochs=config.n_epochs,
                             minibatch_size=config.minibatch_size,
                             inner_batch_size=config.inner_batch_size,
+                            max_grad_norm=config.max_grad_norm,
                         )
                     else:
                         metrics = _train_step(
@@ -584,6 +781,7 @@ def train(config: AdvantageTrainerConfig) -> None:
                             n_epochs=config.n_epochs,
                             minibatch_size=config.minibatch_size,
                             inner_batch_size=config.inner_batch_size,
+                            max_grad_norm=config.max_grad_norm,
                         )
 
                 # Phase 7c: broadcast updated weights to the Advantage Server
@@ -600,18 +798,13 @@ def train(config: AdvantageTrainerConfig) -> None:
                 # epoch mean L_V/L_Q captures whether the inner loop is
                 # converging the value networks within a cycle (spec 20260516);
                 # q_plus_target_abs_mean tracks the predicted-bounded-vs-
-                # growing CFR+ target invariant.
-                logger.info(
-                    f"step={step} inner_steps={metrics['inner_steps']} "
-                    f"l_v_first_epoch={metrics['l_v_first_epoch']:.4f} "
-                    f"l_v_last_epoch={metrics['l_v_last_epoch']:.4f} "
-                    f"l_v_mean={metrics['l_v']:.4f} "
-                    f"l_q_first_epoch={metrics['l_q_first_epoch']:.4f} "
-                    f"l_q_last_epoch={metrics['l_q_last_epoch']:.4f} "
-                    f"l_q_mean={metrics['l_q']:.4f} "
-                    f"q_tgt_abs={metrics['q_plus_target_abs_mean']:.4f} "
-                    f"n_samples={metrics['n_samples']}"
-                )
+                # growing CFR+ target invariant. With the Phase-3 settings the
+                # line also carries the health readings (see _cycle_log_line).
+                if isinstance(optimizer, MasterWeightAdamW):
+                    metrics["coh"] = optimizer.coherence()
+                if log_rates:
+                    metrics["lr"] = [group["lr"] for group in optimizer.param_groups]
+                logger.info(_cycle_log_line(step, metrics))
                 step += 1
 
                 # Save checkpoint at interval (mirrors LLM trainer\'s save block).
@@ -626,6 +819,15 @@ def train(config: AdvantageTrainerConfig) -> None:
                         logger.info(f"Saving AdvTrainer checkpoint at step {step}")
                         ckpt_manager.save(step, backbone, optimizer)
                         ckpt_manager.maybe_clean()
+
+                # Weights-only milestone (the final step included, unlike the
+                # periodic checkpoint above).
+                if milestone_manager is not None and step % milestone_every == 0:
+                    milestone_manager.save(step, backbone, optimizer)
+                    logger.info(
+                        f"milestone: value step {step} weights kept at "
+                        f"{milestone_manager.get_ckpt_path(step)}"
+                    )
 
             if torch.cuda.is_available():
                 mem_peak_gb = torch.cuda.max_memory_allocated() / 1e9

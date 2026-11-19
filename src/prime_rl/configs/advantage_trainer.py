@@ -112,6 +112,79 @@ class AdvantageTrainerConfig(BaseConfig):
         ),
     ] = None
 
+    # ---- Optimizer fixes shared with the offline warm-start trainer --------
+    # (arm-redesign Phase 3). All four are opt-in: at their defaults the
+    # optimizer, its groups, its updates and the cycle log line are what they
+    # were before these settings existed.
+
+    fp32_master: Annotated[
+        bool,
+        Field(
+            description=(
+                "Keep a float32 master copy of every trainable parameter and the AdamW state in "
+                "float32 (MasterWeightAdamW). With bfloat16 parameters torch's AdamW keeps its state "
+                "in bfloat16, where the second-moment decay (0.1 % per step) rounds away: a gradient "
+                "spike then lowers that parameter's learning rate for good. Also adds the per-group "
+                "gradient norms and the update coherence to the cycle log line. False = plain AdamW "
+                "in the parameters' dtype."
+            ),
+        ),
+    ] = False
+
+    head_learning_rate: Annotated[
+        float | None,
+        Field(
+            gt=0.0,
+            description=(
+                "Learning rate of the two linear value heads (v_head, q_plus_head), which then get "
+                "their own optimizer groups (3 and 4) and their own gradient clip. The heads read a "
+                "hidden state of L1 norm ~4,000, so one Adam step at rate r moves a prediction by up "
+                "to ~4,000 r. None = the heads train in their slot's group at the slot's rate, and "
+                "v_learning_rate / q_plus_learning_rate / learning_rate cover LoRA and head alike."
+            ),
+        ),
+    ] = None
+
+    max_grad_norm: Annotated[
+        float | None,
+        Field(
+            gt=0.0,
+            description=(
+                "Clip the gradient norm of each optimizer group separately (V slot, Q+ slot, and "
+                "with head_learning_rate the V head and the Q+ head) to this value before every "
+                "optimizer step. None = no clipping."
+            ),
+        ),
+    ] = None
+
+    warmup_cycles: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Linear learning-rate warmup over the first N cycles (AdvTrainer steps): cycle c "
+                "runs at min(1, (c + 1) / N) x the configured rates. The rates are re-applied from "
+                "this config at the start of every cycle, so a rate changed between jobs takes "
+                "effect on resume. 0 = no warmup."
+            ),
+        ),
+    ] = 0
+
+    # arm-redesign D-9. Opt-in: None writes nothing.
+    milestone_every_steps: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Keep a permanent weights-only copy of the value networks every N cycles (AdvTrainer "
+                "steps) under output_dir/milestones/checkpoints/step_<N>/trainer/value_state.pt, in "
+                "the format warm_start_path and contrast_eval read. About 111 MB each for the 1.5B "
+                "backbone with rank-16 LoRA, against a full checkpoint with optimizer state that "
+                "ckpt.keep_interval would keep. Never pruned. None = no milestones."
+            ),
+        ),
+    ] = None
+
     # Phase 10 lever 2: how many samples per forward+backward chunk inside
     # ONE minibatch (memory knob). Used purely for activation-memory control.
     # Defaults to 8, comfortable on a 40GB MIG slice at canary-shape sequences.
