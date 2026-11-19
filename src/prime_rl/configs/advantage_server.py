@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from prime_rl.configs.trainer import LoRAConfig
 from prime_rl.utils.config import BaseConfig
@@ -136,6 +136,61 @@ class AdvantageServerConfig(BaseConfig):
         ),
     ] = "regret_matching"
 
+    # --- plan/arm-redesign Phase 1 (action-level path only) -------------------
+    # Defaults reproduce the original action-level rule exactly. Note that
+    # `arm_advantage_formula` above belongs to the token-level path; the
+    # action-level path reads the four fields below instead.
+    arm_action_advantage_form: Annotated[
+        Literal["log_ratio", "difference"],
+        Field(
+            description=(
+                "Action-level ARM advantage. \"log_ratio\" (default, original): "
+                "A(a*) = log pi_RM(a*) - log pi_hat(a*), floored, with a uniform "
+                "pi_RM when no regret is positive. \"difference\" (anchored regret "
+                "matching): R(a) = max(0, Q+ - V - arm_margin), S = sum R, "
+                "target(a) = (R(a) + arm_anchor * pi_hat(a)) / (S + arm_anchor), "
+                "A(a*) = target(a*) - pi_hat(a*). Bounded in (-1, 1), exactly 0 when "
+                "no regret clears the margin, and no fallback distribution."
+            ),
+        ),
+    ] = "log_ratio"
+
+    arm_margin: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            description=(
+                "delta: stored regret (Q+ - V) at or below this counts as zero "
+                "(difference form only). In the units of the return. Measured on "
+                "held-out pairs of the warm-start networks: 0.10."
+            ),
+        ),
+    ] = 0.0
+
+    arm_anchor: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            description=(
+                "kappa: votes the current policy holds in the anchored target "
+                "(difference form only; must be > 0 there). Total cleared regret "
+                "equal to arm_anchor gives a half-strength push."
+            ),
+        ),
+    ] = 0.0
+
+    arm_target_form: Annotated[
+        Literal["sum", "average"],
+        Field(
+            description=(
+                "Q+ regression target. \"sum\" (default, original): arm_phi_decay * "
+                "max(0, Q+ - V) + g. \"average\": arm_phi_decay * max(Q+, V) + "
+                "(1 - arm_phi_decay) * g, so stored regret settles at one times the "
+                "instantaneous regret and arm_phi_decay is a pure memory-length knob."
+            ),
+        ),
+    ] = "sum"
+
     warm_start_path: Annotated[
         str | None,
         Field(
@@ -146,6 +201,12 @@ class AdvantageServerConfig(BaseConfig):
             ),
         ),
     ] = None
+
+    @model_validator(mode="after")
+    def _difference_form_needs_anchor(self):
+        if self.arm_action_advantage_form == "difference" and self.arm_anchor <= 0.0:
+            raise ValueError("arm_action_advantage_form='difference' requires arm_anchor > 0")
+        return self
 
 
 class AdvantageServerClientConfig(BaseConfig):

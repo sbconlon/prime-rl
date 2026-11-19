@@ -67,6 +67,12 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
     # CFR+ regret-accumulation decay for action-level ARM q_plus_target. <1 bounds
     # the regret accumulation (the run-001 collapse was effective phi_decay=1.0).
     app.state.arm_phi_decay = config.arm_phi_decay
+    # plan/arm-redesign Phase 1: action-level advantage / target forms. Defaults
+    # reproduce the original rule.
+    app.state.arm_action_advantage_form = config.arm_action_advantage_form
+    app.state.arm_margin = config.arm_margin
+    app.state.arm_anchor = config.arm_anchor
+    app.state.arm_target_form = config.arm_target_form
     # Tracks how many weight broadcasts the AdvServer has received from the
     # AdvTrainer. Initialized to 0 (= initial zero-init backbone, no broadcast
     # yet). Incremented by /update_weights AFTER the state dict is loaded.
@@ -169,12 +175,16 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
                 # Re-set the request id inside the executor thread; ContextVar
                 # is not propagated across threads automatically.
                 set_request_id(rid)
-                kwargs: dict[str, float | int] = {"gamma": app.state.gamma}
+                kwargs: dict[str, float | int | str] = {"gamma": app.state.gamma}
                 if decoded.algorithm == "ppo":
                     kwargs["lam"] = app.state.lam
                 else:
                     kwargs["n_step"] = app.state.n_step
                     kwargs["arm_phi_decay"] = app.state.arm_phi_decay
+                    kwargs["arm_action_advantage_form"] = app.state.arm_action_advantage_form
+                    kwargs["arm_margin"] = app.state.arm_margin
+                    kwargs["arm_anchor"] = app.state.arm_anchor
+                    kwargs["arm_target_form"] = app.state.arm_target_form
                 # training-probe (Phase 2, D-8): the value-net version that serves
                 # THIS call, read in the compute thread right before the forwards.
                 weight_step = int(app.state.weight_step)

@@ -58,6 +58,53 @@ def action_advantage(pi_rm_star: float, pi_hat_star: float, floor: float = 1e-6)
     return math.log(max(pi_rm_star, floor)) - math.log(max(pi_hat_star, floor))
 
 
+# ---------------------------------------------------------------------------
+# ARM redesign (plan/arm-redesign, Phase 1): anchored regret matching.
+#
+# Vocabulary: the *instantaneous regret* of an action is its plain action value
+# minus V; the *stored regret* is what Q+ - V holds. The functions below read the
+# stored regret.
+# ---------------------------------------------------------------------------
+
+ADVANTAGE_FORMS = ("log_ratio", "difference")
+TARGET_FORMS = ("sum", "average")
+
+
+def cleared_regrets(q_plus: list[float], v: float, margin: float = 0.0) -> list[float]:
+    """R(a) = max(0, Q+(o,a) - V(o) - margin): the stored regret that clears the
+    noise margin. Continuous in every input; zero for every action whose gap is
+    at or below the margin."""
+    if len(q_plus) == 0:
+        raise ValueError("q_plus must be non-empty")
+    if margin < 0.0:
+        raise ValueError(f"margin must be >= 0, got {margin}")
+    return [max(0.0, q - v - margin) for q in q_plus]
+
+
+def difference_advantage(regret_star: float, total: float, pi_hat_star: float, anchor: float) -> float:
+    """A(a*) = target(a*) - pi_hat(a*), with the anchored target
+
+        target(a) = (R(a) + anchor * pi_hat(a)) / (S + anchor),   S = sum_b R(b).
+
+    The current policy holds `anchor` votes, split the way it splits its
+    probability; each action adds its cleared regret as extra votes. Algebraically
+
+        A(a*) = (R(a*) - S * pi_hat(a*)) / (S + anchor).
+
+    Properties (pinned by tests): exactly 0.0 when S == 0 (no cleared regret means
+    no target, so no fallback distribution exists); |A| <= S / (S + anchor) < 1;
+    A == 0 for every action exactly when pi_hat == R / S; continuous in R, S and
+    pi_hat because the divisor never falls below `anchor`. pi_hat is used as
+    scored (not renormalised), so probability mass that leaks off the admissible
+    actions puts every action with cleared regret below its target.
+    """
+    if anchor <= 0.0:
+        raise ValueError(f"anchor must be > 0 for the difference advantage, got {anchor}")
+    if total <= 0.0:
+        return 0.0
+    return (regret_star - total * pi_hat_star) / (total + anchor)
+
+
 def n_step_return_action_level(
     rewards: list[float],
     v_target: list[float],
@@ -103,8 +150,24 @@ def v_target_from_return(g_k: float) -> float:
     return g_k
 
 
-def q_plus_target(q_plus_star: float, v: float, g_k: float, phi_decay: float = 1.0) -> float:
-    """Q+ regression target: phi_decay * max(0, q_plus_star - v) + g_k.
+def q_plus_target(
+    q_plus_star: float, v: float, g_k: float, phi_decay: float = 1.0, form: str = "sum"
+) -> float:
+    """Q+ regression target.
+
+    form="sum" (default, the original rule): phi_decay * max(0, q_plus_star - v) + g_k.
+
+    form="average" (plan/arm-redesign D-5): phi_decay * max(q_plus_star, v)
+    + (1 - phi_decay) * g_k. In stored-regret terms (x = Q+ - V) this is
+    x <- phi * max(0, x) + (1 - phi) * (g - V): the store holds the *average* of
+    regret, so for a steady instantaneous regret r > 0 it settles at r, not at
+    r / (1 - phi). That is the unit the warm start is in (its labels are plain
+    returns), so thresholds on the stored regret keep their meaning through a
+    run, and phi_decay becomes a pure memory-length knob. It is the "sum" rule
+    divided by 1 / (1 - phi); negative regret does not accumulate in either.
+    phi_decay = 0 gives the plain return.
+
+    Notes on the "sum" form follow.
 
     The CFR+ accumulation's 'previous weights' are supplied implicitly by
     pipeline lag (the AdvServer's forward lags the trainer's update), so
@@ -121,6 +184,10 @@ def q_plus_target(q_plus_star: float, v: float, g_k: float, phi_decay: float = 1
     (per_token_advantage: phi = arm_phi_decay * clamp(q+ - v, min=0)). phi_decay=1.0
     is the previous (unbounded) behavior.
     """
+    if form == "average":
+        return phi_decay * max(q_plus_star, v) + (1.0 - phi_decay) * g_k
+    if form != "sum":
+        raise ValueError(f"unknown Q+ target form {form!r}; expected one of {TARGET_FORMS}")
     return phi_decay * max(0.0, q_plus_star - v) + g_k
 
 
@@ -141,8 +208,23 @@ class ActionAdvantageInputs:
     gamma: float = 1.0
     n_step: int = 1  # tunable; default a placeholder, set in config (DQ2.3)
     phi_decay: float = 1.0  # arm_phi_decay: CFR+ regret-accumulation decay (<1 bounds it)
+    # plan/arm-redesign Phase 1. Defaults reproduce the original rule exactly.
+    advantage_form: str = "log_ratio"  # "log_ratio" | "difference" (anchored regret matching)
+    margin: float = 0.0  # delta: stored regret at or below it counts as zero (difference form)
+    anchor: float = 0.0  # kappa: votes held by the current policy (difference form, must be > 0)
+    target_form: str = "sum"  # "sum" | "average" (see q_plus_target)
 
     def __post_init__(self) -> None:
+        if self.advantage_form not in ADVANTAGE_FORMS:
+            raise ValueError(
+                f"unknown advantage_form {self.advantage_form!r}; expected one of {ADVANTAGE_FORMS}"
+            )
+        if self.target_form not in TARGET_FORMS:
+            raise ValueError(f"unknown target_form {self.target_form!r}; expected one of {TARGET_FORMS}")
+        if self.margin < 0.0:
+            raise ValueError(f"margin must be >= 0, got {self.margin}")
+        if self.advantage_form == "difference" and self.anchor <= 0.0:
+            raise ValueError(f"the difference advantage needs anchor > 0, got {self.anchor}")
         k = len(self.q_plus)
         for name, seq in (
             ("v", self.v),
@@ -174,6 +256,10 @@ class ActionAdvantageOutputs:
     # kept for the diagnostics view. Additive; existing callers ignore them.
     pi_rm: list[list[float]] | None = None  # pi_rm[k][a] = π_RM(a | o_k) over A(o_k)
     g: list[float] | None = None  # g[k] = n-step return at decision point k
+    # plan/arm-redesign Phase 1: regret[k][a] = cleared regret R(a | o_k). Set only
+    # under the difference form (None under the original rule, so its outputs are
+    # unchanged). Under that form pi_rm[k] is R / S, and all zeros when S == 0.
+    regret: list[list[float]] | None = None
 
 
 def action_advantage_fn(inputs: ActionAdvantageInputs) -> ActionAdvantageOutputs:
@@ -189,14 +275,25 @@ def action_advantage_fn(inputs: ActionAdvantageInputs) -> ActionAdvantageOutputs
     v_target_out: list[float] = []
     q_plus_target_out: list[float] = []
     pi_rm_rows: list[list[float]] = []
+    difference = inputs.advantage_form == "difference"
+    regret_rows: list[list[float]] | None = [] if difference else None
     for k in range(len(inputs.v)):
         e = inputs.executed_idx[k]
-        rm = pi_rm(inputs.q_plus[k], inputs.v[k])
+        if difference:
+            # Anchored regret matching: no fallback distribution. With no cleared
+            # regret the target is the policy itself and the advantage is 0.
+            r = cleared_regrets(inputs.q_plus[k], inputs.v[k], inputs.margin)
+            total = sum(r)
+            rm = [x / total for x in r] if total > 0.0 else [0.0] * len(r)
+            regret_rows.append(r)
+            advantage.append(difference_advantage(r[e], total, inputs.pi_hat_star[k], inputs.anchor))
+        else:
+            rm = pi_rm(inputs.q_plus[k], inputs.v[k])
+            advantage.append(action_advantage(rm[e], inputs.pi_hat_star[k]))
         pi_rm_rows.append(rm)
-        advantage.append(action_advantage(rm[e], inputs.pi_hat_star[k]))
         v_target_out.append(v_target_from_return(g[k]))
         q_plus_target_out.append(
-            q_plus_target(inputs.q_plus[k][e], inputs.v[k], g[k], inputs.phi_decay)
+            q_plus_target(inputs.q_plus[k][e], inputs.v[k], g[k], inputs.phi_decay, inputs.target_form)
         )
     return ActionAdvantageOutputs(
         advantage=advantage,
@@ -204,6 +301,7 @@ def action_advantage_fn(inputs: ActionAdvantageInputs) -> ActionAdvantageOutputs
         q_plus_target_out=q_plus_target_out,
         pi_rm=pi_rm_rows,
         g=list(g),
+        regret=regret_rows,
     )
 
 

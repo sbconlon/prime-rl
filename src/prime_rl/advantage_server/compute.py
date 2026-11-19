@@ -272,6 +272,10 @@ def compute_advantages_and_targets_arm_action(
     n_step: int = 1,
     arm_phi_decay: float = 1.0,
     return_diagnostics: bool = False,
+    arm_action_advantage_form: str = "log_ratio",
+    arm_margin: float = 0.0,
+    arm_anchor: float = 0.0,
+    arm_target_form: str = "sum",
 ) -> (
     list[tuple[TrainingSample, AdvantageTrainingSample]]
     | tuple[list[tuple[TrainingSample, AdvantageTrainingSample]], list[DecisionPointDiagnostics]]
@@ -279,6 +283,11 @@ def compute_advantages_and_targets_arm_action(
     """Action-level ARM: A(a*) = log pi_RM(a*|o) - log pi_hat(a*|o) per decision
     point, plus the action-level V/Q+ regression targets. Same four-step skeleton
     as the token-level path, regrained from per-token to per-decision-point.
+
+    plan/arm-redesign Phase 1: ``arm_action_advantage_form="difference"`` swaps the
+    advantage for anchored regret matching (``arm_margin``, ``arm_anchor``) and
+    ``arm_target_form="average"`` swaps the Q+ target; see action_advantage.py.
+    The defaults reproduce the rule above exactly.
 
     pi_hat is shipped from the rollout (Phase 4) on DecisionPoint.pi_hat. The
     decision points of all samples form one episode sequence, so the n-step return
@@ -333,21 +342,27 @@ def compute_advantages_and_targets_arm_action(
         gamma=gamma,
         n_step=n_step,
         phi_decay=arm_phi_decay,
+        advantage_form=arm_action_advantage_form,
+        margin=arm_margin,
+        anchor=arm_anchor,
+        target_form=arm_target_form,
     )
     _log_q_plus_distribution_action(records)
     out = action_advantage_fn(inputs)
     for k, ph in enumerate(pi_hat_raw):
         if ph is None:
             out.advantage[k] = 0.0
-    _log_advantage_magnitudes_action(out)
+    _log_advantage_magnitudes_action(out, records)
 
     paired = _build_paired_outputs_action(samples, records, out)
     if return_diagnostics:
-        return paired, _build_diagnostics_action(records, out)
+        return paired, _build_diagnostics_action(records, out, anchor=arm_anchor)
     return paired
 
 
-def _build_diagnostics_action(records: list[dict], out) -> list[DecisionPointDiagnostics]:
+def _build_diagnostics_action(
+    records: list[dict], out, anchor: float | None = None
+) -> list[DecisionPointDiagnostics]:
     """training-probe (Phase 2, D-8): one DecisionPointDiagnostics per record, in
     ``records`` order (decision-point order across the rollout's samples, the same
     order _build_paired_outputs_action relies on). Pure view over the values the
@@ -362,6 +377,9 @@ def _build_diagnostics_action(records: list[dict], out) -> list[DecisionPointDia
             f"diagnostics length mismatch: records={len(records)} advantage={len(out.advantage)} "
             f"pi_rm={len(out.pi_rm)} g={len(out.g)}"
         )
+    regret_rows = getattr(out, "regret", None)
+    if regret_rows is not None and len(regret_rows) != len(records):
+        raise ValueError(f"diagnostics length mismatch: records={len(records)} regret={len(regret_rows)}")
     diagnostics: list[DecisionPointDiagnostics] = []
     for k, r in enumerate(records):
         if len(out.pi_rm[k]) != len(r["q_plus"]):
@@ -379,6 +397,11 @@ def _build_diagnostics_action(records: list[dict], out) -> list[DecisionPointDia
                 adv_star=float(out.advantage[k]),
                 g_k=float(out.g[k]),
                 q_plus_target_star=float(out.q_plus_target_out[k]),
+                # plan/arm-redesign Phase 1: cleared regrets and the anchor,
+                # difference form only (None, and off the wire, under the
+                # original rule).
+                regret=([float(x) for x in regret_rows[k]] if regret_rows is not None else None),
+                anchor=(float(anchor) if regret_rows is not None and anchor is not None else None),
             )
         )
     return diagnostics
@@ -459,20 +482,53 @@ def _log_q_plus_distribution_action(records: list[dict]) -> None:
     )
 
 
-def _log_advantage_magnitudes_action(out) -> None:
-    """ARM_DIAG for action-level: advantage / target magnitudes per rollout."""
+def arm_diag_extras(out, records: list[dict] | None) -> dict[str, float]:
+    """plan/arm-redesign Phase 2: per-rollout numbers appended to ARM_DIAG (pure).
+
+    ``v_bias`` (property 4, tracking): mean of g - V over the decision points.
+    The server forwards V and builds g before the Advantage Trainer sees the
+    batch, so this is "outcome minus V, before training on it". Above zero: the
+    policy improved faster than V followed; below zero: V is stale high. It is
+    also the inflow that would build a common offset between Q+ and V.
+    ``adv_zero_frac``: share of exactly zero advantages. ``s_mean``: mean total
+    positive stored regret per decision point (cleared regret under the
+    difference form, max(0, Q+ - V) summed under the original rule).
+    """
+    n = len(out.advantage)
+    extras = {"adv_zero_frac": sum(1 for a in out.advantage if a == 0.0) / n if n else 0.0}
+    if records is not None and out.g is not None and len(records) == n and n:
+        extras["v_bias"] = sum(float(g) - float(r["v"]) for g, r in zip(out.g, records)) / n
+        regret_rows = getattr(out, "regret", None)
+        if regret_rows is not None:
+            extras["s_mean"] = sum(sum(row) for row in regret_rows) / n
+        else:
+            extras["s_mean"] = sum(sum(max(0.0, q - r["v"]) for q in r["q_plus"]) for r in records) / n
+    return extras
+
+
+def _log_advantage_magnitudes_action(out, records: list[dict] | None = None) -> None:
+    """ARM_DIAG for action-level: advantage / target magnitudes per rollout.
+
+    The first five keys keep their order and format (log parsers match them as a
+    prefix); plan/arm-redesign Phase 2 appends v_bias, adv_zero_frac and s_mean.
+    """
     adv = out.advantage
     if not adv:
         return
     n = len(adv)
     abs_adv = [abs(a) for a in adv]
+    extras = arm_diag_extras(out, records)
     _LOGGER.info(
-        "ARM_DIAG n_dp=%d adv_mean=%.6f adv_absmax=%.6f vtg_mean=%.6f qtg_mean=%.6f",
+        "ARM_DIAG n_dp=%d adv_mean=%.6f adv_absmax=%.6f vtg_mean=%.6f qtg_mean=%.6f"
+        " v_bias=%.6f adv_zero_frac=%.4f s_mean=%.6f",
         n,
         sum(adv) / n,
         max(abs_adv),
         sum(out.v_target_out) / n,
         sum(out.q_plus_target_out) / n,
+        extras.get("v_bias", float("nan")),
+        extras["adv_zero_frac"],
+        extras.get("s_mean", float("nan")),
     )
 
 

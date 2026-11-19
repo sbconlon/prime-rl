@@ -192,13 +192,36 @@ def assemble_probe_rollout(
         pi_rm = [float(x) for x in d.pi_rm]
         if len(q_plus) != n or len(pi_rm) != n:
             raise ProbeAssemblyError(f"turn {k}: |q_plus|={len(q_plus)} |pi_rm|={len(pi_rm)} != |admissible|={n}")
+        # plan/arm-redesign Phase 1: the diagnostics carry the cleared regrets and
+        # the anchor only under the difference form (anchored regret matching).
+        d_regret = getattr(d, "regret", None)
+        regret = [float(x) for x in d_regret] if d_regret is not None else None
+        if regret is not None and len(regret) != n:
+            raise ProbeAssemblyError(f"turn {k}: |regret|={len(regret)} != |admissible|={n}")
+        advantage_form = "difference" if regret is not None else "log_ratio"
+        d_anchor = getattr(d, "anchor", None)
+        if regret is not None and (d_anchor is None or float(d_anchor) <= 0.0):
+            raise ProbeAssemblyError(f"turn {k}: difference form but no positive anchor in the diagnostics")
+        anchor = float(d_anchor) if d_anchor is not None else 0.0
 
         pi_hat_raw = probe.get("pi_hat_marginal")
         if pi_hat_raw is not None:
             pi_hat = [float(x) for x in pi_hat_raw]
             if len(pi_hat) != n:
                 raise ProbeAssemblyError(f"turn {k}: |pi_hat_marginal|={len(pi_hat)} != |admissible|={n}")
-            adv = [math.log(max(pr, ADV_FLOOR)) - math.log(max(ph, ADV_FLOOR)) for pr, ph in zip(pi_rm, pi_hat)]
+            if advantage_form == "difference":
+                # plan/arm-redesign Phase 1: A(a) = (R(a) - S * pi_hat(a)) / (S + kappa),
+                # the server's formula (action_advantage.difference_advantage) over
+                # every admissible action; zero everywhere when no regret clears.
+                total = sum(regret)
+                if total > 0.0:
+                    adv = [(r - total * ph) / (total + anchor) for r, ph in zip(regret, pi_hat)]
+                else:
+                    adv = [0.0] * n
+            else:
+                adv = [
+                    math.log(max(pr, ADV_FLOOR)) - math.log(max(ph, ADV_FLOOR)) for pr, ph in zip(pi_rm, pi_hat)
+                ]
             if abs(adv[e] - float(d.adv_star)) > ADV_STAR_TOL:
                 raise ProbeAssemblyError(
                     f"turn {k}: adv[a*]={adv[e]:.8f} != server adv_star={float(d.adv_star):.8f}"
@@ -265,6 +288,13 @@ def assemble_probe_rollout(
                     "adv_star_valid": adv_star_valid,
                     "g_k": float(d.g_k),
                     "q_plus_target_star": float(d.q_plus_target_star),
+                    # plan/arm-redesign Phase 1 (additive): present only under the
+                    # difference form. `pi_rm` is then R / S (all zeros when S = 0).
+                    **(
+                        {"regret": regret, "advantage_form": advantage_form, "anchor": anchor}
+                        if regret is not None
+                        else {}
+                    ),
                 },
                 "oracle": dict(probe.get("oracle") or _ORACLE_OFF),
                 "env_response": env_response,
@@ -371,6 +401,126 @@ def gate_metrics(turns: list[dict[str, Any]]) -> dict[str, float]:
     return m
 
 
+# plan/arm-redesign Phase 2: one metric per property (D-8) and two monitors.
+# A "dead" turn is one of the last DEAD_TURN_LAST turns of a probe game that ran
+# out of turns without a win: a stand-in for "the game can no longer be won". A
+# push there is phony by definition.
+DEAD_TURN_LAST = 3
+DEAD_TURN_PUSH_EPS = 0.05
+# The opening the branch prefill gives a forced step's reasoning (verifiers
+# branching, "<<prefill>><think>I will now {action}").
+PREFILL_PHRASE = "I will now"
+
+
+def dead_turns(record: dict[str, Any], last: int = DEAD_TURN_LAST) -> list[dict[str, Any]]:
+    """The last ``last`` turns of a record that ended by running out of turns
+    without a win; [] for any other record."""
+    if bool(record.get("won")) or record.get("stop_condition") != "max_turns_reached":
+        return []
+    first = int(record.get("num_turns") or len(record.get("turns") or [])) - last
+    return [t for t in (record.get("turns") or []) if int(t.get("turn", -1)) >= first]
+
+
+def _opens_with_prefill_phrase(reasoning: str) -> bool:
+    text = (reasoning or "").lstrip()
+    if text.startswith("<think>"):
+        text = text[len("<think>") :].lstrip()
+    return text.startswith(PREFILL_PHRASE)
+
+
+def redesign_metrics(records: list[dict[str, Any]]) -> dict[str, float]:
+    """Round metrics of plan/arm-redesign Phase 2 (pure; additive keys).
+
+    ``probe/dead_turn_push_frac`` (property 1, knowing): share of dead turns whose
+    executed-action advantage exceeds DEAD_TURN_PUSH_EPS in size; with
+    ``probe/dead_turns`` their count.
+
+    ``probe/pi_rm_agreement`` (property 2, convergent): the regret-matching weight
+    on the executed action, averaged over turns where pi_RM is defined, i.e. some
+    regret is positive (cleared regret under the difference form; Q+ above V under
+    the original rule, where the uniform fallback does not count as defined).
+    ``probe/pi_rm_defined_frac`` is the share of such turns.
+
+    Monitors: ``probe/reason_action_agreement`` = over the sampled reasoning
+    blocks, the probability the block gives to the action it itself emitted;
+    ``probe/prefill_phrase_frac`` = share of executed and sampled reasoning that
+    opens with the branch prefill phrase.
+    """
+    m: dict[str, float] = {}
+    turns = [t for r in records for t in (r.get("turns") or [])]
+    if not turns:
+        return m
+
+    dead = [t for r in records for t in dead_turns(r) if (t.get("values") or {}).get("adv_star_valid")]
+    m["probe/dead_turns"] = float(len(dead))
+    if dead:
+        hits = sum(abs(float(t["values"]["adv_star"])) > DEAD_TURN_PUSH_EPS for t in dead)
+        m["probe/dead_turn_push_frac"] = hits / len(dead)
+
+    weights: list[float] = []
+    for t in turns:
+        values = t.get("values") or {}
+        rm = values.get("pi_rm") or []
+        idx = (t.get("executed") or {}).get("idx")
+        if not rm or idx is None or not 0 <= int(idx) < len(rm):
+            continue
+        regret = values.get("regret")
+        if regret is not None:
+            defined = sum(float(x) for x in regret) > 0.0
+        else:
+            v = float(values.get("v", 0.0))
+            defined = any(float(q) > v for q in (values.get("q_plus") or []))
+        if defined:
+            weights.append(float(rm[int(idx)]))
+    m["probe/pi_rm_defined_frac"] = len(weights) / len(turns)
+    if weights:
+        m["probe/pi_rm_agreement"] = float(sum(weights) / len(weights))
+
+    own: list[float] = []
+    opens: list[float] = []
+    for t in turns:
+        adm = [str(a) for a in (t.get("admissible") or [])]
+        executed = t.get("executed") or {}
+        if executed.get("reasoning"):
+            opens.append(float(_opens_with_prefill_phrase(str(executed["reasoning"]))))
+        for block in t.get("blocks") or []:
+            if block.get("reasoning"):
+                opens.append(float(_opens_with_prefill_phrase(str(block["reasoning"]))))
+            cond = block.get("cond") or []
+            action = block.get("action")
+            if action in adm and len(cond) == len(adm):
+                own.append(float(cond[adm.index(action)]))
+    if own:
+        m["probe/reason_action_agreement"] = float(sum(own) / len(own))
+    if opens:
+        m["probe/prefill_phrase_frac"] = float(sum(opens) / len(opens))
+    return m
+
+
+REDESIGN_SUMMARY_KEYS = (
+    "probe/dead_turns",
+    "probe/dead_turn_push_frac",
+    "probe/pi_rm_defined_frac",
+    "probe/pi_rm_agreement",
+    "probe/admissible_mass_mean",
+    "probe/q_plus_std_median",
+    "probe/reason_action_agreement",
+    "probe/prefill_phrase_frac",
+)
+
+
+def redesign_summary_line(ckpt_step: int, metrics: dict[str, float]) -> str:
+    """One greppable log line per probe round with the per-property numbers:
+    ``PROBE_REDESIGN ckpt=<k> dead_turns=42 dead_turn_push_frac=0.1190 ...``.
+    A key the round did not produce (e.g. no dead turn) is printed as ``na``."""
+    parts = [f"PROBE_REDESIGN ckpt={int(ckpt_step)}"]
+    for key in REDESIGN_SUMMARY_KEYS:
+        name = key.split("/", 1)[1]
+        value = metrics.get(key)
+        parts.append(f"{name}={float(value):.4f}" if value is not None else f"{name}=na")
+    return " ".join(parts)
+
+
 def probe_metrics(
     records: list[dict[str, Any]],
     completion_lens: list[int],
@@ -448,6 +598,8 @@ def probe_metrics(
     if valid:
         m["probe/adv_star_mean"] = _mean(valid)
         m["probe/adv_star_absmax"] = float(max(abs(x) for x in valid))
+    # plan/arm-redesign Phase 2: the per-property numbers (additive keys).
+    m.update(redesign_metrics(records))
     return m
 
 
@@ -615,6 +767,9 @@ class ProbeRunner:
             f"{len(records)} record(s) written, {num_skipped} skipped"
             + (f", Avg@1={avg:.4f}" if avg is not None else "")
         )
+        # plan/arm-redesign Phase 2: the per-property probe numbers on one greppable
+        # line (the monitor may be a no-op when W&B is off, as on the cluster).
+        logger.info(redesign_summary_line(ckpt_step, metrics))
         return metrics
 
 

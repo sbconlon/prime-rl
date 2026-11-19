@@ -78,6 +78,15 @@ class DecisionPointDiagnostics(msgspec.Struct, array_like=True, gc=False, omit_d
     adv_star: float
     g_k: float
     q_plus_target_star: float
+    # plan/arm-redesign Phase 1: present only under the difference advantage form
+    # (anchored regret matching). `regret` = the cleared regrets
+    # R(a) = max(0, Q+ - V - margin) over the admissible set; `anchor` = kappa.
+    # With them the orchestrator assembles the per-action advantage
+    # (R(a) - S * pi_hat(a)) / (S + anchor) using the server's own settings, and
+    # `regret is not None` identifies the form. Trailing defaulted fields:
+    # records without them still decode, and the response struct is unchanged.
+    regret: list[float] | None = None
+    anchor: float | None = None
 
 
 class ComputeAdvantagesResponse(msgspec.Struct, array_like=True, gc=False, omit_defaults=True):
