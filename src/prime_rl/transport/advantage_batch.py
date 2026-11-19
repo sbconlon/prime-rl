@@ -67,8 +67,10 @@ class FileSystemAdvantageTrainingBatchReceiver(TrainingBatchReceiver):
     Args:
       input_dir: Directory the orchestrator writes batches into. The launcher
         wires this to <orchestrator_output_dir>/advantage_trainer_transport.
-      start_step: Step to begin reading at. Defaults to 0; ckpt resume can
-        pass a higher value (Phase 7d).
+      start_step: Step to begin reading at. 0 for a fresh run. A resumed
+        Advantage Trainer passes its checkpoint step: the orchestrator files
+        each batch under its own (absolute) step, and the checkpoint at step
+        N holds the weights after batches 0..N-1, so the next one is step_N.
     """
 
     _batch_type = AdvantageTrainingBatch
@@ -80,8 +82,34 @@ class FileSystemAdvantageTrainingBatchReceiver(TrainingBatchReceiver):
         self._next_step = start_step
         self._waiting_since: float | None = None
 
+    @property
+    def next_step(self) -> int:
+        """The step whose batch is read next."""
+        return self._next_step
+
     def _batch_path(self, step: int) -> Path:
         return get_step_path(self.rollout_dir, step) / BATCH_FILE_NAME
+
+    def find_gap(self) -> int | None:
+        """The lowest step on disk above the next expected one, when the next
+        expected one is missing; None otherwise.
+
+        The sender writes one batch per step, in order, so a batch that is
+        missing while a later one is there will never arrive and the reader
+        would wait for ever. It happens after a resume when the checkpoint is
+        older than the batches still on disk.
+        """
+        if self.can_receive() or not self.rollout_dir.is_dir():
+            return None
+        later: list[int] = []
+        for step_dir in self.rollout_dir.glob("step_*"):
+            try:
+                step = int(step_dir.name.split("_")[-1])
+            except ValueError:
+                continue
+            if step > self._next_step and (step_dir / BATCH_FILE_NAME).exists():
+                later.append(step)
+        return min(later) if later else None
 
     def can_receive(self) -> bool:
         """True iff the next-expected step\'s batch file exists."""
@@ -200,6 +228,10 @@ class ZMQAdvantageTrainingBatchReceiver(TrainingBatchReceiver):
         steps = sorted(self._pending_by_step.keys())
         return [self._pending_by_step.pop(s) for s in steps]
 
+    def find_gap(self) -> int | None:
+        """No step files here, so no batch can be seen to be missing."""
+        return None
+
     def close(self) -> None:
         try:
             self.socket.close(linger=0)
@@ -226,12 +258,14 @@ def setup_advantage_training_batch_sender(
 def setup_advantage_training_batch_receiver(
     transport: TransportConfig,
     input_dir: Path | None = None,
+    start_step: int = 0,
 ) -> FileSystemAdvantageTrainingBatchReceiver | ZMQAdvantageTrainingBatchReceiver:
     """Construct the receiver matching `transport`.
 
     For filesystem transport, `input_dir` is required (the directory the
-    orchestrator writes batches into). For ZMQ transport, `input_dir` is
-    ignored.
+    orchestrator writes batches into) and `start_step` is the first step to
+    read: 0 for a fresh run, the checkpoint step after a resume. For ZMQ
+    transport both are ignored (batches arrive as they are sent).
     """
     if transport.type == "filesystem":
         if input_dir is None:
@@ -240,7 +274,7 @@ def setup_advantage_training_batch_receiver(
                 "launcher should wire it to "
                 "<orchestrator.output_dir>/advantage_trainer_transport."
             )
-        return FileSystemAdvantageTrainingBatchReceiver(input_dir)
+        return FileSystemAdvantageTrainingBatchReceiver(input_dir, start_step=start_step)
     elif transport.type == "zmq":
         return ZMQAdvantageTrainingBatchReceiver(transport)
     else:

@@ -14,7 +14,7 @@ import tomli_w
 from prime_rl.configs.rl import RLConfig
 from prime_rl.utils.config import cli
 from prime_rl.utils.logger import setup_logger
-from prime_rl.utils.pathing import validate_output_dir
+from prime_rl.utils.pathing import has_checkpoints, validate_output_dir
 from prime_rl.utils.process import cleanup_processes, cleanup_threads, monitor_process
 from prime_rl.utils.utils import (
     get_free_port,
@@ -86,6 +86,19 @@ def is_probe_only(config) -> bool:
     and the Advantage Trainer are skipped (one probe round at ckpt 0, then exit)."""
     probe = getattr(getattr(config, "orchestrator", None), "probe", None)
     return bool(probe is not None and getattr(probe, "only", False))
+
+
+def continues_existing_run(config) -> bool:
+    """True when this launch resumes a run that already has checkpoints (a resume
+    step is set and the checkpoint directory is not empty). A config that always
+    carries resume_step = -1 is a fresh run until the first checkpoint exists."""
+    ckpt = getattr(config, "ckpt", None)
+    if ckpt is None or ckpt.resume_step is None:
+        return False
+    dirs = [config.output_dir]
+    if getattr(ckpt, "output_dir", None) is not None:
+        dirs.append(ckpt.output_dir)
+    return any(has_checkpoints(d) for d in dirs)
 
 
 def write_config(config: RLConfig, output_dir: Path, exclude: set[str] | None = None) -> None:
@@ -296,6 +309,9 @@ def rl_local(config: RLConfig):
     # Prepare paths to communicate with the trainer
     log_dir = get_log_dir(config.output_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
+    # A resume appends to the process logs: truncating them lost every line the
+    # run had written before the interruption.
+    log_mode = "a" if continues_existing_run(config) else "w"
 
     # Start processes
     processes: list[Popen] = []
@@ -310,7 +326,7 @@ def rl_local(config: RLConfig):
             logger.info(f"Starting inference on GPU(s) {' '.join(map(str, infer_gpu_ids))}")
             logger.debug(f"Inference start command: {' '.join(inference_cmd)}")
             # If we don't log stdout, the server hangs
-            with open(log_dir / "inference.stdout", "w") as log_file:
+            with open(log_dir / "inference.stdout", log_mode) as log_file:
                 inference_process = Popen(
                     inference_cmd,
                     env={
@@ -354,7 +370,7 @@ def rl_local(config: RLConfig):
             teacher_inference_cmd = ["uv", "run", "inference", "@", (config_dir / TEACHER_INFERENCE_TOML).as_posix()]
             logger.info(f"Starting teacher inference process on GPU(s) {' '.join(map(str, teacher_gpu_ids))}")
             logger.debug(f"Teacher inference start command: {' '.join(teacher_inference_cmd)}")
-            with open(log_dir / "teacher_inference.stdout", "w") as log_file:
+            with open(log_dir / "teacher_inference.stdout", log_mode) as log_file:
                 teacher_inference_process = Popen(
                     teacher_inference_cmd,
                     env={
@@ -392,7 +408,7 @@ def rl_local(config: RLConfig):
             logger.info(
                 f"Advantage Server pinned to GPU(s) {' '.join(map(str, advantage_server_gpu_ids))}"
             )
-            with open(log_dir / "advantage_server.stdout", "w") as log_file:
+            with open(log_dir / "advantage_server.stdout", log_mode) as log_file:
                 advantage_server_process = Popen(
                     adv_server_cmd,
                     env={
@@ -439,7 +455,7 @@ def rl_local(config: RLConfig):
             logger.info(
                 f"Advantage Trainer pinned to GPU(s) {' '.join(map(str, advantage_trainer_gpu_ids))}"
             )
-            with open(log_dir / "advantage_trainer.stdout", "w") as log_file:
+            with open(log_dir / "advantage_trainer.stdout", log_mode) as log_file:
                 advantage_trainer_process = Popen(
                     adv_trainer_cmd,
                     env={
@@ -471,7 +487,7 @@ def rl_local(config: RLConfig):
         ]
         logger.info("Starting orchestrator process")
         logger.debug(f"Orchestrator start command: {' '.join(orchestrator_cmd)}")
-        with open(log_dir / "orchestrator.stdout", "w") as log_file:
+        with open(log_dir / "orchestrator.stdout", log_mode) as log_file:
             orchestrator_process = Popen(
                 orchestrator_cmd,
                 stdout=log_file,
@@ -524,7 +540,7 @@ def rl_local(config: RLConfig):
             ]
             logger.info(f"Starting trainer on GPU(s) {' '.join(map(str, trainer_gpu_ids))}")
             logger.debug(f"Training start command: {' '.join(trainer_cmd)}")
-            with open(log_dir / "trainer.stdout", "w") as log_file:
+            with open(log_dir / "trainer.stdout", log_mode) as log_file:
                 trainer_process = Popen(
                     trainer_cmd,
                     env={

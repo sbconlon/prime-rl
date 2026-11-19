@@ -127,16 +127,18 @@ def _tiny_base():
     )
 
 
-def _online(monkeypatch, out: Path, batches, transport_name: str = "transport", **settings):
+def _online(monkeypatch, out: Path, batches, transport_name: str = "transport", first_step: int = 0, **settings):
     """Run the real train() entrypoint on the tiny CPU backbone. The batches are
-    written to a filesystem transport dir as steps 0..n-1 (the receiver starts at
-    its step_0 file, also after a resume) and the model / tokenizer loaders are
-    replaced. Returns the optimizer, the rates at every legs call and the cycle
-    log lines. max_steps must not ask for more cycles than there are batches."""
+    written to a filesystem transport dir as steps first_step..first_step+n-1,
+    the way the orchestrator files them (a resumed trainer reads on from its
+    checkpoint step, so a resumed run passes that step), and the model /
+    tokenizer loaders are replaced. Returns the optimizer, the rates at every
+    legs call and the cycle log lines. max_steps must not ask for more cycles
+    than there are batches."""
     transport = out / transport_name
     sender = FileSystemAdvantageTrainingBatchSender(transport)
     for i, b in enumerate(batches):
-        sender.send(AdvantageTrainingBatch(examples=b.examples, step=i))
+        sender.send(AdvantageTrainingBatch(examples=b.examples, step=first_step + i))
     config = _config(out, transport, **settings)
 
     seen = SimpleNamespace(opt=None, backbone=None, lrs=[], lines=[], config=config)
@@ -540,7 +542,7 @@ def test_rates_follow_the_config_on_resume(tmp_path, monkeypatch, fp32_master):
     assert first.lrs == [(1e-3, 1e-3, 0.0)]
     assert [g["lr"] for g in _saved(out, 1)["optimizer_state_dict"]["param_groups"]] == [1e-3, 1e-3, 0.0]
 
-    second = _online(monkeypatch, out, [_one(1)], transport_name="transport_resumed", max_steps=2,
+    second = _online(monkeypatch, out, [_one(1)], first_step=1, max_steps=2,
                      ckpt=CheckpointConfig(interval=1, resume_step=-1), learning_rate=1e-3,
                      q_plus_learning_rate=2e-4, **common)
     assert second.lrs == [(1e-3, 2e-4, 0.0)]
@@ -590,7 +592,7 @@ def test_checkpoint_round_trip_online(tmp_path, monkeypatch):
     states = [s for s in mid["optimizer_state_dict"]["state"].values() if "exp_avg_sq" in s]
     assert states and all(s["exp_avg_sq"].dtype == torch.float32 for s in states)
     # ... and resumed for the third
-    resumed = _online(monkeypatch, tmp_path / "cut", batches[2:], transport_name="transport_resumed", max_steps=3,
+    resumed = _online(monkeypatch, tmp_path / "cut", batches[2:], first_step=2, max_steps=3,
                       ckpt=CheckpointConfig(interval=1, resume_step=-1), **settings)
     assert len(cut.lrs) == 4 and len(resumed.lrs) == 2  # two optimizer steps per cycle; one cycle after the resume
     assert [list(row) for row in resumed.lrs] == _approx_rows([[0.75e-3, 0.75e-3, 0.0, 0.75e-4, 0.75e-4]] * 2)
@@ -626,7 +628,7 @@ def test_group_layout_can_change_at_a_resume_online(tmp_path, monkeypatch):
     _online(monkeypatch, out, [_one(0)], max_steps=1, warm_start_path=warm, learning_rate=1e-3, n_epochs=2,
             polyak_tau=0.5, ckpt=CheckpointConfig(interval=1))
     assert len(_saved(out, 1)["optimizer_state_dict"]["param_groups"]) == 3
-    resumed = _online(monkeypatch, out, [_one(1)], transport_name="transport_resumed", max_steps=2,
+    resumed = _online(monkeypatch, out, [_one(1)], first_step=1, max_steps=2,
                       warm_start_path=warm, ckpt=CheckpointConfig(interval=1, resume_step=-1), **SETTINGS)
     assert isinstance(resumed.opt, MasterWeightAdamW) and len(resumed.opt.param_groups) == 5
     assert resumed.lines[0].startswith("step=1 ")

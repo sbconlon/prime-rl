@@ -230,9 +230,30 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
         State dict contains LoRA adapters + value head weights only (not the
         frozen base). load_state_dict(..., strict=False) tolerates the missing
         base parameters.
+
+        Query parameter weight_step (optional): set the counter to this value
+        instead of adding one. Only the Advantage Trainer's resume hand-over
+        sends it: after a restart this server holds the warm-start weights and
+        weight_step 0, while the resumed orchestrator waits for weight_step >=
+        its own step.
         """
         if not app.state.ready:
             return Response(status_code=503, content=b'{"error":"not ready"}', media_type="application/json")
+
+        explicit_step: int | None = None
+        raw_step = request.query_params.get("weight_step")
+        if raw_step is not None:
+            # Checked before the weights are touched.
+            try:
+                explicit_step = int(raw_step)
+            except ValueError:
+                explicit_step = -1
+            if explicit_step < 0:
+                return Response(
+                    status_code=400,
+                    content=b'{"error":"weight_step must be a non-negative integer"}',
+                    media_type="application/json",
+                )
 
         body = await request.body()
         backbone: ValueNetworkBackbone = app.state.backbone
@@ -261,7 +282,14 @@ def create_app(config: AdvantageServerConfig) -> FastAPI:
         # weights are live in the backbone. The orchestrator's
         # wait_for_weight_step gate can therefore rely on the counter as
         # an "applied-and-active" signal, not a "received-but-pending" one.
-        app.state.weight_step = app.state.weight_step + 1
+        if explicit_step is None:
+            app.state.weight_step = app.state.weight_step + 1
+        else:
+            _LOGGER.info(
+                "update_weights: weight_step set to %d (was %d): resume hand-over",
+                explicit_step, app.state.weight_step,
+            )
+            app.state.weight_step = explicit_step
         _LOGGER.debug(
             "update_weights: applied state_dict (weight_step=%d, %d missing, %d unexpected)",
             app.state.weight_step, n_missing, n_unexpected,

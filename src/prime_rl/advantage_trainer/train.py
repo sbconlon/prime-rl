@@ -51,6 +51,7 @@ from prime_rl.advantage_trainer.shared import (
     setup_value_optimizer,
     value_regression_backward,
 )
+from prime_rl.utils.pathing import get_stable_ckpt_steps
 from prime_rl.utils.utils import resolve_latest_ckpt_step
 from prime_rl.configs.advantage_trainer import AdvantageTrainerConfig
 from prime_rl.configs.trainer import CheckpointConfig
@@ -85,6 +86,37 @@ def _serialize_trainable_state_dict(backbone: ValueNetworkBackbone) -> bytes:
     return buffer.getvalue()
 
 
+def _post_weights(
+    backbone: ValueNetworkBackbone,
+    server_url: str,
+    *,
+    timeout: float,
+    weight_step: int | None = None,
+) -> str | None:
+    """POST the trainable params to the Advantage Server's /update_weights.
+    Returns None on success, else a one-line description of what went wrong.
+
+    weight_step: None lets the server count the broadcast (its weight_step
+    goes up by one). A number sets the server's weight_step to it; only the
+    resume hand-over does that.
+    """
+    try:
+        body = _serialize_trainable_state_dict(backbone)
+        params = None if weight_step is None else {"weight_step": str(int(weight_step))}
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(
+                f"{server_url.rstrip('/')}/update_weights",
+                content=body,
+                params=params,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+        if response.status_code != 200:
+            return f"server responded {response.status_code}: {response.text[:200]}"
+        return None
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
 def _broadcast_weights(
     backbone: ValueNetworkBackbone, server_url: str, *, timeout: float = 60.0
 ) -> bool:
@@ -95,25 +127,101 @@ def _broadcast_weights(
     step with stale weights. Repeated failures suggest a real connectivity
     problem and the operator should investigate.
     """
-    try:
-        body = _serialize_trainable_state_dict(backbone)
-        with httpx.Client(timeout=timeout) as client:
-            response = client.post(
-                f"{server_url.rstrip('/')}/update_weights",
-                content=body,
-                headers={"Content-Type": "application/octet-stream"},
-            )
-        if response.status_code != 200:
-            get_logger().warning(
-                "weight broadcast: server responded %d: %s",
-                response.status_code,
-                response.text[:200],
-            )
-            return False
-        return True
-    except Exception as exc:
-        get_logger().warning("weight broadcast failed: %s", exc)
+    error = _post_weights(backbone, server_url, timeout=timeout)
+    if error is not None:
+        get_logger().warning(f"weight broadcast failed: {error}")
         return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Resume. The orchestrator files each batch under its own step and, before it
+# scores step N, waits until the Advantage Server's weight_step is at least N.
+# A restarted server holds the warm-start weights and weight_step 0, so after
+# a resume the Advantage Trainer hands over the weights it loaded and their
+# step; and it reads on from its checkpoint step (see train()).
+# ---------------------------------------------------------------------------
+
+# The server loads its base model at start; the hand-over waits for it.
+RESUME_PUSH_TIMEOUT_S = 1800.0
+RESUME_PUSH_RETRY_S = 5.0
+# How often a waiting reader looks for a batch that can no longer arrive.
+GAP_CHECK_INTERVAL_S = 30.0
+
+
+def _push_resume_weights(
+    backbone: ValueNetworkBackbone,
+    server_url: str,
+    step: int,
+    *,
+    timeout: float = RESUME_PUSH_TIMEOUT_S,
+    retry_interval: float = RESUME_PUSH_RETRY_S,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> int:
+    """After a resume: give the Advantage Server the loaded value networks and
+    set its weight_step to the checkpoint step. Retries until the server takes
+    them; returns the number of attempts. Raises after `timeout` seconds: with
+    a server that never got them the orchestrator would wait for ever and
+    score with the warm-start weights."""
+    logger = get_logger()
+    deadline = clock() + timeout
+    attempts = 0
+    while True:
+        attempts += 1
+        error = _post_weights(backbone, server_url, timeout=60.0, weight_step=step)
+        if error is None:
+            logger.info(
+                f"resume: value weights of checkpoint step {step} handed to the Advantage Server "
+                f"(weight_step={step}, attempt {attempts})"
+            )
+            return attempts
+        if clock() >= deadline:
+            raise RuntimeError(
+                f"resume: the Advantage Server at {server_url} did not take the value weights of "
+                f"checkpoint step {step} within {timeout:.0f}s ({attempts} attempts; last error: {error})"
+            )
+        if attempts == 1 or attempts % 12 == 0:
+            logger.info(f"resume: waiting for the Advantage Server (attempt {attempts}: {error})")
+        sleep(retry_interval)
+
+
+class _GapWatch:
+    """Stops a wait that cannot end. While the reader waits, check() looks every
+    `interval` seconds for a later batch on disk; a gap seen on two checks in a
+    row raises."""
+
+    def __init__(self, interval: float = GAP_CHECK_INTERVAL_S):
+        self.interval = interval
+        self._last: float | None = None
+        self._seen = False
+
+    def reset(self) -> None:
+        """A batch arrived."""
+        self._last = None
+        self._seen = False
+
+    def check(self, receiver, now: float) -> None:
+        if self._last is None:
+            self._last = now
+            return
+        if now - self._last < self.interval:
+            return
+        self._last = now
+        later = receiver.find_gap()
+        if later is None:
+            self._seen = False
+            return
+        if not self._seen:
+            self._seen = True
+            return
+        missing = getattr(receiver, "next_step", "?")
+        raise RuntimeError(
+            f"The Advantage Trainer waits for the batch of step {missing}, which is not on disk, "
+            f"while the batch of step {later} is. Batches are written in order, so step {missing} "
+            f"will not arrive (after a resume: the value checkpoint is older than the batches kept "
+            f"on disk). Stopping instead of waiting for ever; rerun fresh."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +797,17 @@ def train(config: AdvantageTrainerConfig) -> None:
     checkpoint_step: int | None = None
     if config.ckpt and config.ckpt.resume_step is not None and ckpt_manager is not None:
         if config.ckpt.resume_step == -1:
-            checkpoint_step = resolve_latest_ckpt_step(ckpt_manager.ckpt_dir)
+            # The newest COMPLETE checkpoint: STABLE is written last, so a step
+            # dir without it is a save the job died in. The one before it is one
+            # interval back; its batches are replayed from disk.
+            newest = resolve_latest_ckpt_step(ckpt_manager.ckpt_dir)
+            stable = get_stable_ckpt_steps(ckpt_manager.ckpt_dir)
+            checkpoint_step = stable[-1] if stable else None
+            if newest is not None and newest != checkpoint_step:
+                logger.warning(
+                    f"AdvTrainer checkpoint step {newest} has no STABLE marker (half written): "
+                    f"resuming from {'step ' + str(checkpoint_step) if stable else 'the start'}"
+                )
         else:
             checkpoint_step = config.ckpt.resume_step
 
@@ -729,25 +847,45 @@ def train(config: AdvantageTrainerConfig) -> None:
             f"{config.output_dir / 'milestones'}"
         )
 
+    # The checkpoint at step N holds the weights after batches 0..N-1, and the
+    # orchestrator files each batch under its own step: read on from step_N.
+    # (Starting again at step_0 froze the value networks after a resume: that
+    # file is long deleted, or, if it is still there, old batches were trained
+    # a second time.)
     receiver = setup_advantage_training_batch_receiver(
-        config.transport, input_dir=config.transport_input_dir
+        config.transport, input_dir=config.transport_input_dir, start_step=resume_start_step
     )
     logger.info(
         f"Transport receiver ready ({config.transport.type}, "
-        f"input_dir={config.transport_input_dir})"
+        f"input_dir={config.transport_input_dir}, first batch step={resume_start_step})"
     )
 
+    if checkpoint_step is not None and config.advantage_server_url:
+        # The Advantage Server restarted with the warm-start weights and
+        # weight_step 0. Give it the loaded weights and their step before the
+        # orchestrator scores anything (it waits for weight_step >= its step).
+        _push_resume_weights(backbone, config.advantage_server_url, resume_start_step)
+
+    gap_watch = _GapWatch()
     step = resume_start_step
     while step < config.max_steps:
         # Wait for at least one batch.
         if not receiver.can_receive():
+            gap_watch.check(receiver, time.monotonic())
             time.sleep(0.1)
             continue
+        gap_watch.reset()
         with prof("advtrainer.recv"):
             batches = receiver.receive()
 
         for batch in batches:
             set_request_id(str(step))
+            if batch.step != step:
+                # Equal in a correct run: one batch per orchestrator step, read in order.
+                logger.warning(
+                    f"step={step}: training the batch of orchestrator step {batch.step} "
+                    f"(the two counters should agree)"
+                )
             # Rates from the config at every cycle, scaled by the warmup.
             _set_learning_rates(optimizer, base_lrs, step, config.warmup_cycles)
             if torch.cuda.is_available():
