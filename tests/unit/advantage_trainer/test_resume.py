@@ -298,6 +298,11 @@ def test_resume_does_not_train_old_batches_again(tmp_path, monkeypatch):
         assert torch.equal(a["trainable_state_dict"][name], b["trainable_state_dict"][name]), name
 
 
+def _same(served: torch.Tensor, saved: torch.Tensor) -> bool:
+    """A served weight equals a saved one in the server's own dtype (bfloat16 on a GPU)."""
+    return torch.equal(served.cpu(), saved.to(served.dtype).cpu())
+
+
 def _server_behind(monkeypatch, client: TestClient, log: list) -> None:
     """The trainer's HTTP client talks to the real server app."""
 
@@ -333,7 +338,7 @@ def test_resume_hands_weights_and_step_to_the_server(tmp_path, monkeypatch):
     with TestClient(app) as client:
         assert client.get("/weight_status").json() == {"weight_step": 0}
         served = _trainable(app.state.backbone)
-        assert any(not torch.equal(served[n], ckpt[n]) for n in ckpt)
+        assert any(not torch.equal(served[n].cpu(), ckpt[n].cpu()) for n in ckpt)
         _server_behind(monkeypatch, client, posts)
 
         seen_at_first_cycle = {}
@@ -352,13 +357,13 @@ def test_resume_hands_weights_and_step_to_the_server(tmp_path, monkeypatch):
         # before the first cycle after the resume the server holds checkpoint 2 at step 2
         assert seen_at_first_cycle["weight_step"] == 2
         for name, value in ckpt.items():
-            assert torch.equal(seen_at_first_cycle["weights"][name], value), name
+            assert _same(seen_at_first_cycle["weights"][name], value), name
         # then one ordinary broadcast: step 3, the trainer's final weights
         assert posts == ["2", None]
         assert client.get("/weight_status").json() == {"weight_step": 3}
         final, served = _trainable(resumed.backbone), _trainable(app.state.backbone)
         for name, value in final.items():
-            assert torch.equal(served[name], value), name
+            assert _same(served[name], value), name
 
 
 def test_a_fresh_run_never_sets_the_step(tmp_path, monkeypatch):
