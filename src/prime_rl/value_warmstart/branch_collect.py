@@ -23,7 +23,8 @@ token inference client. Resumable per game (done/<game_id>.json).
 Gold-set options (plan bulletproof-warm-start, Round 0): `all_actions` branches
 every admissible action at a root, the played one included; `replays` runs each
 (root, action) several times; `game_start` skips the first games of the dataset
-order (to collect only the held-out ones).
+order (to collect only the held-out ones); `replays_extra` gives the played action
+and every action that did better in the first pass more episodes.
 """
 
 from __future__ import annotations
@@ -287,6 +288,7 @@ async def _process_root(
 
     chosen_rows: list[dict] = []
     tasks = []
+    launch: dict[int, tuple] = {}  # id(row) -> (action, source, synthesis, k), for a second pass
     for k, (a, src) in enumerate(picks):
         if budget[0] + cfg.replays > cfg.max_branches_per_game:
             await ctx.bump(lambda s: CollectStats._bump(s.branches_skipped, "budget"))
@@ -341,6 +343,7 @@ async def _process_root(
         if n_rep > 1:
             row["branch_ids"] = ids
         chosen_rows.append(row)
+        launch[id(row)] = (a, src, syn, k)
         for bid in ids:
             tasks.append(
                 (
@@ -369,6 +372,54 @@ async def _process_root(
             row["g_replays"] = gs
         action_results.append(row["g"])
 
+    # Second pass: more episodes for the played action and for every action that did
+    # better than it, so "is the played action beaten?" rests on more than a few replays.
+    extra_results: list = []
+    if cfg.replays_extra > 0 and cfg.all_actions and stage is None:
+        taken_row = next((r for r in chosen_rows if r.get("source") == "taken" and r.get("g") is not None), None)
+        contenders = []
+        if taken_row is not None:
+            for r in chosen_rows:
+                if r is taken_row or r.get("g") is None or id(r) not in launch:
+                    continue
+                lead = r["g"] - taken_row["g"]
+                if lead > 0.0 and lead >= cfg.extra_lead - 1e-12:
+                    contenders.append(r)
+        if contenders:
+            extra_tasks = []
+            touched = []
+            for row in [taken_row] + contenders:
+                if budget[0] + cfg.replays_extra > cfg.max_branches_per_game:
+                    await ctx.bump(lambda s: CollectStats._bump(s.branches_skipped, "budget"))
+                    continue
+                budget[0] += cfg.replays_extra
+                a, src, syn, k = launch[id(row)]
+                have = list(row.get("branch_ids") or [row["branch_id"]])
+                new_ids = [f"{trunk_id}-t{t}-b{k}-r{len(have) + j}" for j in range(cfg.replays_extra)]
+                row["branch_ids"] = have + new_ids
+                row["extra_replays"] = cfg.replays_extra
+                touched.append(row)
+                for bid in new_ids:
+                    extra_tasks.append(
+                        (
+                            row,
+                            _run_branch(
+                                ctx, example=example, trunk_out=trunk_out, steps=steps, t=t, action=a, source=src,
+                                syn=syn, game_id=game_id, trunk_id=trunk_id, branch_id=bid, stage=stage,
+                                holdout=holdout,
+                            ),
+                        )
+                    )
+            extra_results = await asyncio.gather(*[c for _, c in extra_tasks]) if extra_tasks else []
+            for (row, _), g in zip(extra_tasks, extra_results):
+                by_row[id(row)].append(g)
+            for row in touched:
+                gs = by_row[id(row)]
+                ok = [g for g in gs if g is not None]
+                row["g"] = (sum(ok) / len(ok)) if ok else None
+                row["g_replays"] = gs
+            action_results = [r["g"] for r in chosen_rows if id(r) in by_row]
+
     contrast = any(g is not None and g != G for g in action_results)
     if contrast:
         await ctx.bump(lambda s: setattr(s, "roots_with_contrast", s.roots_with_contrast + 1))
@@ -376,7 +427,8 @@ async def _process_root(
     payload = node_json(
         game_id=game_id, trunk_id=trunk_id, turn=t, admissible=admissible, a_taken=a_taken,
         trunk_return=G, node=node, chosen=chosen_rows, allocation=cfg.allocation, stage=stage,
-        pivotal=pivotal, replay_ok=all(g is not None for g in results) if results else True,
+        pivotal=pivotal,
+        replay_ok=all(g is not None for g in list(results) + list(extra_results)) if results else True,
         timing=timing,
     )
     write_node_json(ctx.nodes_dir, game_id, trunk_id, t, payload)
@@ -568,7 +620,8 @@ async def branch_collect(config: BranchCollectConfig) -> None:
         f"Branch collect: env={config.env.id} split={env_args.get('split')} allocation={config.allocation} "
         f"B={config.roots_per_trunk} K={config.branches_per_root} n_unif={config.n_uniform} m={config.node_blocks} "
         f"tau={config.tau} theta={config.theta} n_elicit={config.n_elicit} "
-        f"all_actions={config.all_actions} replays={config.replays} game_start={config.game_start} -> {out_dir}"
+        f"all_actions={config.all_actions} replays={config.replays}+{config.replays_extra} "
+        f"game_start={config.game_start} -> {out_dir}"
     )
 
     env = vf.load_environment(config.env.id, **env_args)

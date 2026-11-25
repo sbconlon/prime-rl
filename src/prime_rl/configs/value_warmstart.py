@@ -373,6 +373,29 @@ class BranchCollectConfig(CollectConfig):
             ),
         ),
     ] = 1
+    replays_extra: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Second pass (all_actions only): when some action's mean return over the first pass "
+                "leads the played action's by extra_lead or more, the played action and every such "
+                "action get this many more episodes. Spends replays where the verdict "
+                "'is the played action beaten?' depends on them. 0 = no second pass."
+            ),
+        ),
+    ] = 0
+    extra_lead: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "First-pass lead over the played action that sends an action to the second pass. "
+                "0 = any action that did strictly better."
+            ),
+        ),
+    ] = 0.0
     # --- synthesis (D-4) ---
     tau: Annotated[
         float,
@@ -473,6 +496,8 @@ class BranchCollectConfig(CollectConfig):
             raise ValueError("theta must be <= tau")
         if self.all_actions and self.allocation == "two_stage":
             raise ValueError("all_actions needs allocation = 'stratified' or 'even'")
+        if self.replays_extra > 0 and not self.all_actions:
+            raise ValueError("replays_extra needs all_actions (the played action must be among the forced ones)")
         if self.replays > self.max_branches_per_game:
             raise ValueError("replays must be <= max_branches_per_game (the cap counts episodes)")
         return self

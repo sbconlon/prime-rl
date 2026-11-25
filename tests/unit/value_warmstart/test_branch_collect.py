@@ -469,6 +469,70 @@ def test_replays_count_against_the_game_budget(tmp_path, monkeypatch):
     assert ctx.stats.branches_skipped == {"budget": 2}
 
 
+def test_second_pass_replays_the_played_action_and_what_beat_it(tmp_path, monkeypatch):
+    """First pass: 'open drawer 1' wins, the played action and 'look' lose. Only the
+    played action and the action that beat it get the extra episodes."""
+    _install_fakes(monkeypatch, {"open drawer 1": 1.0, "look": 0.0, "go to desk 1": 0.0})
+    cfg = _cfg(tmp_path, roots_per_trunk=1, all_actions=True, replays=2, replays_extra=3, max_branches_per_game=100)
+    ctx = _make_ctx(tmp_path, cfg, _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]))
+    asyncio.run(bc.collect_game(ctx, 0, _gold_example(9)))
+    node = json.loads(next((tmp_path / "nodes").rglob("t*.json")).read_text())
+    by = {c["action"]: c for c in node["chosen"]}
+    assert len(by["go to desk 1"]["g_replays"]) == 5 and by["go to desk 1"]["extra_replays"] == 3
+    assert len(by["open drawer 1"]["g_replays"]) == 5 and by["open drawer 1"]["g"] == 1.0
+    assert len(by["look"]["g_replays"]) == 2 and "extra_replays" not in by["look"]
+    ids = [b.branch_id for b in ctx.writer.records if b.root_forced]
+    assert len(ids) == len(set(ids)) == 12  # 3 actions x 2, then 2 actions x 3
+    assert by["open drawer 1"]["branch_ids"][-1].endswith("-r4")
+    assert ctx.stats.branches_run == 12
+    assert json.loads((tmp_path / "done" / "pps-x__trial_9.json").read_text())["branches"] == 12
+
+
+def test_no_second_pass_when_nothing_beat_the_played_action(tmp_path, monkeypatch):
+    _install_fakes(monkeypatch, {"go to desk 1": 1.0, "open drawer 1": 1.0, "look": 0.0})
+    cfg = _cfg(tmp_path, roots_per_trunk=1, all_actions=True, replays=2, replays_extra=3, max_branches_per_game=100)
+    ctx = _make_ctx(tmp_path, cfg, _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]))
+    asyncio.run(bc.collect_game(ctx, 0, _gold_example(10)))
+    assert ctx.stats.branches_run == 6  # a tie with the played action is not a lead
+    node = json.loads(next((tmp_path / "nodes").rglob("t*.json")).read_text())
+    assert all("extra_replays" not in c for c in node["chosen"])
+
+
+def test_second_pass_needs_the_lead_and_respects_the_budget(tmp_path, monkeypatch):
+    _install_fakes(monkeypatch, {})
+
+    async def fake_run_rollout(env, client, example, model_name, sampling_args, max_retries):
+        seed = (example.get("info") or {}).get("branch_seed")
+        if seed is None:
+            return _trunk_out(T=3, reward=0.0)
+        # 'open drawer 1' wins one of its two first replays: a lead of 0.5 over the played action
+        win = seed["forced_action"] == "open drawer 1" and seed["branch_id"].endswith("-r0")
+        return {"reward": 1.0 if win else 0.0, "is_truncated": False, "error": None, "trajectory": [],
+                "completion": [], "example_id": 0, "sampling_args": {"temperature": 0.8}}
+
+    monkeypatch.setattr(bc, "run_rollout", fake_run_rollout)
+    common = dict(roots_per_trunk=1, all_actions=True, replays=2, replays_extra=2)
+
+    strict = _make_ctx(tmp_path / "a", _cfg(tmp_path / "a", extra_lead=0.75, max_branches_per_game=100, **common),
+                       _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]))
+    asyncio.run(bc.collect_game(strict, 0, _gold_example(11)))
+    assert strict.stats.branches_run == 6  # the lead of 0.5 is below 0.75
+
+    loose = _make_ctx(tmp_path / "b", _cfg(tmp_path / "b", extra_lead=0.5, max_branches_per_game=100, **common),
+                      _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]))
+    asyncio.run(bc.collect_game(loose, 0, _gold_example(12)))
+    assert loose.stats.branches_run == 10  # the played action and the contender, two more each
+    node = json.loads(next((tmp_path / "b" / "nodes").rglob("t*.json")).read_text())
+    by = {c["action"]: c for c in node["chosen"]}
+    assert by["open drawer 1"]["g_replays"] == [1.0, 0.0, 0.0, 0.0] and by["open drawer 1"]["g"] == 0.25
+
+    tight = _make_ctx(tmp_path / "c", _cfg(tmp_path / "c", extra_lead=0.5, max_branches_per_game=8, **common),
+                      _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]))
+    asyncio.run(bc.collect_game(tight, 0, _gold_example(13)))
+    # 6 first-pass episodes, room for one more pair only: the played action gets it
+    assert tight.stats.branches_run == 8 and tight.stats.branches_skipped == {"budget": 1}
+
+
 def test_single_replay_keeps_the_old_ids_and_rows(tmp_path, monkeypatch):
     _install_fakes(monkeypatch, {"open drawer 1": 1.0})
     cfg = _cfg(tmp_path, roots_per_trunk=1, branches_per_root=1, n_uniform=0)
@@ -521,6 +585,8 @@ def test_gold_options_validation(tmp_path):
     with pytest.raises(ValueError, match="all_actions"):
         _cfg(tmp_path, all_actions=True, allocation="two_stage", stage1_roots=2, stage2_roots=1)
     assert _cfg(tmp_path, all_actions=True, allocation="even").allocation == "even"
+    with pytest.raises(ValueError, match="replays_extra"):
+        _cfg(tmp_path, replays_extra=2)
     with pytest.raises(ValueError, match="replays"):
         _cfg(tmp_path, replays=5, max_branches_per_game=4)
 
