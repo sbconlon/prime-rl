@@ -319,8 +319,13 @@ class BranchCollectConfig(CollectConfig):
         Field(ge=1, description="B: roots per trunk under the stratified allocation."),
     ] = 6
     allocation: Annotated[
-        Literal["stratified", "two_stage"],
-        Field(description="Root allocation: stratified with early tilt, or two-stage hindsight."),
+        Literal["stratified", "two_stage", "even"],
+        Field(
+            description=(
+                "Root allocation: stratified with early tilt, two-stage hindsight, or even "
+                "(roots_per_trunk states at the centres of equal slices of the trunk)."
+            )
+        ),
     ] = "stratified"
     early_tilt: Annotated[
         float,
@@ -347,6 +352,27 @@ class BranchCollectConfig(CollectConfig):
         int,
         Field(ge=2, description="m: sampled reasoning blocks at a root (plus one greedy)."),
     ] = 8
+    all_actions: Annotated[
+        bool,
+        Field(
+            description=(
+                "Branch EVERY admissible action at a root, the played one included (source 'taken'). "
+                "For the gold test set and the full-action rounds of plan/bulletproof-warm-start: the "
+                "advantage rule reads all actions, so all of them get an outcome. branches_per_root "
+                "and n_uniform are then ignored. Not with the two-stage allocation."
+            )
+        ),
+    ] = False
+    replays: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Episodes per (root, action). Each replay runs the same forced step and a fresh "
+                "on-policy continuation; contrast_eval and the push scorer average them."
+            ),
+        ),
+    ] = 1
     # --- synthesis (D-4) ---
     tau: Annotated[
         float,
@@ -408,6 +434,26 @@ class BranchCollectConfig(CollectConfig):
         int,
         Field(ge=0, description="Last N games are tagged held-out (for the gate's G-A)."),
     ] = 50
+    game_start: Annotated[
+        int,
+        Field(
+            ge=0,
+            description=(
+                "Skip the first N games of the dataset order. With games=790 and holdout_games=50, "
+                "game_start=740 collects only the 50 held-out train games."
+            ),
+        ),
+    ] = 0
+    allowed_ids_path: Annotated[
+        Path | None,
+        Field(
+            description=(
+                "JSON list of game ids (or {'game_ids': [...]}) this collect may play. A game of its "
+                "slice outside the list aborts the run before the first rollout. For a gold test set on "
+                "the train split: the value networks' holdout.json, so no training game can slip in."
+            )
+        ),
+    ] = None
     output_dir: Annotated[
         Path,
         Field(description="Run directory: records.msgpack, nodes/, done/, collect_stats.json."),
@@ -425,4 +471,8 @@ class BranchCollectConfig(CollectConfig):
             raise ValueError("stage2_roots must be <= stage1_roots")
         if self.theta is not None and self.theta > self.tau:
             raise ValueError("theta must be <= tau")
+        if self.all_actions and self.allocation == "two_stage":
+            raise ValueError("all_actions needs allocation = 'stratified' or 'even'")
+        if self.replays > self.max_branches_per_game:
+            raise ValueError("replays must be <= max_branches_per_game (the cap counts episodes)")
         return self

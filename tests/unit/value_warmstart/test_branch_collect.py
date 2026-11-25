@@ -17,7 +17,7 @@ from prime_rl.configs.shared import ClientConfig
 from prime_rl.configs.value_warmstart import BranchCollectConfig
 from prime_rl.transport.types import DecisionPoint, TrainingSample
 from prime_rl.value_warmstart import branch_collect as bc
-from prime_rl.value_warmstart.allocation import pivotal_roots, stratified_roots
+from prime_rl.value_warmstart.allocation import even_roots, pivotal_roots, stratified_roots
 from prime_rl.value_warmstart.branch_records import (
     CollectStats,
     branch_example,
@@ -53,6 +53,19 @@ def test_stratified_roots_small_trunk_returns_all_but_terminal():
 def test_stratified_roots_full_tilt():
     roots = stratified_roots(T=30, B=4, early_tilt=1.0)
     assert len(roots) == 4 and max(roots) <= 9
+
+
+def test_even_roots_early_middle_late():
+    assert even_roots(T=15, B=3) == [2, 7, 11]
+    assert even_roots(T=10, B=3) == [1, 4, 7]
+    assert even_roots(T=6, B=3) == [0, 2, 4]
+    # never the terminal turn; short trunks give every candidate
+    assert even_roots(T=4, B=3) == [0, 1, 2] and even_roots(T=3, B=3) == [0, 1]
+    assert even_roots(T=1, B=3) == [] and even_roots(T=9, B=0) == []
+    for T in range(2, 40):
+        for B in range(1, 8):
+            r = even_roots(T, B)
+            assert r == sorted(set(r)) and len(r) == min(B, T - 1) and all(0 <= t < T - 1 for t in r)
 
 
 def test_pivotal_roots_rule():
@@ -381,6 +394,135 @@ def test_holdout_tagging(tmp_path, monkeypatch):
         by_game.setdefault(r.game_id, set()).add(r.holdout)
     assert by_game["pps-x__trial_0"] == {False}
     assert by_game["pps-x__trial_1"] == {True}
+
+
+def _gold_example(i=4):
+    return {"prompt": [], "info": {"game_file": f"/d/train/pps-x/trial_{i}/game.tw-pddl"}, "example_id": 0, "task": "t"}
+
+
+def test_all_actions_with_replays(tmp_path, monkeypatch):
+    """Gold-set mode: every admissible action at a root, the played one included,
+    each replayed; the node row carries the replays and their mean."""
+    _install_fakes(monkeypatch, {"open drawer 1": 1.0, "look": 0.0, "go to desk 1": 0.0})
+
+    def _no_pick(*a, **k):
+        raise AssertionError("the pick rule must not be consulted when all_actions is on")
+
+    monkeypatch.setattr(bc, "_pick_actions", _no_pick)
+    cfg = _cfg(tmp_path, roots_per_trunk=1, all_actions=True, replays=3, max_branches_per_game=100)
+    ctx = _make_ctx(tmp_path, cfg, _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]))
+    asyncio.run(bc.collect_game(ctx, 0, _gold_example()))
+
+    branches = [r for r in ctx.writer.records if r.root_forced]
+    # 1 root x 3 admissible actions x 3 replays
+    assert len(branches) == 9
+    assert {b.action_source for b in branches} == {"taken", "own", "tail"}
+    ids = [b.branch_id for b in branches]
+    assert len(set(ids)) == 9 and all(i.rsplit("-", 1)[1] in ("r0", "r1", "r2") for i in ids)
+    node = json.loads(next((tmp_path / "nodes").rglob("t*.json")).read_text())
+    assert [c["action"] for c in node["chosen"]] == ["go to desk 1", "open drawer 1", "look"]
+    by = {c["action"]: c for c in node["chosen"]}
+    assert by["go to desk 1"]["source"] == "taken"
+    assert by["open drawer 1"]["g"] == 1.0 and by["open drawer 1"]["g_replays"] == [1.0, 1.0, 1.0]
+    assert len(by["look"]["branch_ids"]) == 3 and by["look"]["branch_id"] == by["look"]["branch_ids"][0]
+    s = ctx.stats
+    assert s.branches_run == 9 and s.roots_with_contrast == 1
+    assert s.accept_by_action_source == {"taken": 1, "own": 1, "tail": 1}
+    assert json.loads((tmp_path / "done" / "pps-x__trial_4.json").read_text())["branches"] == 9
+
+
+def test_replay_mean_skips_dropped_replays(tmp_path, monkeypatch):
+    """One replay wins, one loses, one is dropped: the row's g is the mean of the two that ran."""
+    _install_fakes(monkeypatch, {})
+
+    async def fake_run_rollout(env, client, example, model_name, sampling_args, max_retries):
+        seed = (example.get("info") or {}).get("branch_seed")
+        if seed is None:
+            return _trunk_out(T=3, reward=0.0)
+        rep = seed["branch_id"].rsplit("-", 1)[1]
+        if seed["forced_action"] == "open drawer 1" and rep == "r2":
+            raise RuntimeError("wedged")
+        win = seed["forced_action"] == "open drawer 1" and rep == "r0"
+        return {"reward": 1.0 if win else 0.0, "is_truncated": False, "error": None, "trajectory": [],
+                "completion": [], "example_id": 0, "sampling_args": {"temperature": 0.8}}
+
+    monkeypatch.setattr(bc, "run_rollout", fake_run_rollout)
+    cfg = _cfg(tmp_path, roots_per_trunk=1, branches_per_root=1, n_uniform=0, replays=3)
+    ctx = _make_ctx(tmp_path, cfg, _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]))
+    asyncio.run(bc.collect_game(ctx, 0, _gold_example(5)))
+    node = json.loads(next((tmp_path / "nodes").rglob("t*.json")).read_text())
+    (row,) = node["chosen"]
+    assert row["action"] == "open drawer 1"
+    assert row["g_replays"] == [1.0, 0.0, None] and row["g"] == pytest.approx(0.5)
+    assert node["replay_ok"] is False
+    assert ctx.stats.branches_run == 2 and ctx.stats.branches_dropped == 1
+    assert ctx.stats.roots_with_contrast == 1  # 0.5 differs from the trunk's 0.0
+
+
+def test_replays_count_against_the_game_budget(tmp_path, monkeypatch):
+    """The per-game cap counts episodes: with 3 replays and a cap of 4 only one action fits."""
+    _install_fakes(monkeypatch, {"open drawer 1": 1.0})
+    cfg = _cfg(tmp_path, roots_per_trunk=1, all_actions=True, replays=3, max_branches_per_game=4)
+    ctx = _make_ctx(tmp_path, cfg, _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]))
+    asyncio.run(bc.collect_game(ctx, 0, _gold_example(6)))
+    assert ctx.stats.branches_run == 3
+    assert ctx.stats.branches_skipped == {"budget": 2}
+
+
+def test_single_replay_keeps_the_old_ids_and_rows(tmp_path, monkeypatch):
+    _install_fakes(monkeypatch, {"open drawer 1": 1.0})
+    cfg = _cfg(tmp_path, roots_per_trunk=1, branches_per_root=1, n_uniform=0)
+    ctx = _make_ctx(tmp_path, cfg, _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]))
+    asyncio.run(bc.collect_game(ctx, 0, _gold_example(7)))
+    (branch,) = [r for r in ctx.writer.records if r.root_forced]
+    assert branch.branch_id.endswith("-b0")
+    (row,) = json.loads(next((tmp_path / "nodes").rglob("t*.json")).read_text())["chosen"]
+    assert "g_replays" not in row and "branch_ids" not in row and row["g"] == 1.0
+
+
+def test_game_start_skips_earlier_games(tmp_path, monkeypatch):
+    _install_fakes(monkeypatch, {})
+    cfg = _cfg(tmp_path, roots_per_trunk=1, game_start=1, holdout_games=1)
+    ctx = _make_ctx(tmp_path, cfg, _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]), n_games=2)
+    asyncio.run(bc.collect_game(ctx, 0, _gold_example(0)))
+    assert ctx.writer.records == [] and ctx.stats.trunks == 0 and not (tmp_path / "done").exists()
+    asyncio.run(bc.collect_game(ctx, 1, _gold_example(1)))
+    assert {r.game_id for r in ctx.writer.records} == {"pps-x__trial_1"}
+    assert all(r.holdout for r in ctx.writer.records)
+
+
+def test_allowed_games_guard(tmp_path):
+    inputs = [_gold_example(i) for i in range(4)]
+    assert bc.slice_game_ids(inputs, 2) == ["pps-x__trial_2", "pps-x__trial_3"]
+    bc.check_allowed_games(inputs, 2, None)  # no list: nothing to check
+    as_list = tmp_path / "ids.json"
+    as_list.write_text(json.dumps(["pps-x__trial_2", "pps-x__trial_3"]))
+    bc.check_allowed_games(inputs, 2, as_list)
+    as_holdout = tmp_path / "holdout.json"  # the trainer's holdout.json shape
+    as_holdout.write_text(json.dumps({"game_ids": ["pps-x__trial_3"]}))
+    with pytest.raises(ValueError, match=r"1 of the 2 game\(s\).*pps-x__trial_2"):
+        bc.check_allowed_games(inputs, 2, as_holdout)
+    # the slice decides: the same list is fine once the collect starts at the listed game
+    bc.check_allowed_games(inputs, 3, as_holdout)
+
+
+def test_even_allocation_drives_the_roots(tmp_path, monkeypatch):
+    _install_fakes(monkeypatch, {})
+    cfg = _cfg(tmp_path, allocation="even", roots_per_trunk=2, branches_per_root=1, n_uniform=0)
+    ctx = _make_ctx(tmp_path, cfg, _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]))
+    asyncio.run(bc.collect_game(ctx, 0, _gold_example(8)))
+    # the fake trunk has 5 turns: candidates 0..3, two slices -> their centres 1 and 3
+    assert sorted(r.root_turn for r in ctx.writer.records if r.root_forced) == [1, 3]
+    node = json.loads(next((tmp_path / "nodes").rglob("t1.json")).read_text())
+    assert node["allocation"] == "even"
+
+
+def test_gold_options_validation(tmp_path):
+    with pytest.raises(ValueError, match="all_actions"):
+        _cfg(tmp_path, all_actions=True, allocation="two_stage", stage1_roots=2, stage2_roots=1)
+    assert _cfg(tmp_path, all_actions=True, allocation="even").allocation == "even"
+    with pytest.raises(ValueError, match="replays"):
+        _cfg(tmp_path, replays=5, max_branches_per_game=4)
 
 
 def test_branch_env_args_injects_branch_mode(tmp_path):

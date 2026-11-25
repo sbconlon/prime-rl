@@ -6,6 +6,8 @@ Pure functions over trunk lengths and returns:
   them in the first third (the early tilt); never the terminal turn.
 * pivotal_roots    -- the two-stage rule: a candidate root is pivotal when its
   stage-1 probe branch returned something other than the trunk did.
+* even_roots       -- B decision points at the centres of B equal slices of the
+  trunk (the gold test set: an early, a middle and a late state per game).
 """
 
 from __future__ import annotations
@@ -50,6 +52,17 @@ def stratified_roots(T: int, B: int, early_tilt: float = 0.5) -> list[int]:
     n_early = min(B - n_late, len(early_pool))
     picks = set(_evenly_spaced(early_pool, n_early)) | set(_evenly_spaced(late_pool, n_late))
     return sorted(picks)
+
+
+def even_roots(T: int, B: int) -> list[int]:
+    """B decision points at the centres of B equal slices of the candidates 0..T-2
+    (the terminal turn T-1 is never a root). With at most B candidates, all of them."""
+    if T <= 1 or B <= 0:
+        return []
+    n = T - 1
+    if n <= B:
+        return list(range(n))
+    return sorted({int((i + 0.5) * n / B) for i in range(B)})
 
 
 def pivotal_roots(stage1: dict[int, float | None], trunk_return: float, B2: int) -> list[int]:

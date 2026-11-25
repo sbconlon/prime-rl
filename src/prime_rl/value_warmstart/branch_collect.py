@@ -19,6 +19,11 @@ Per game (plan branched-dataset, master doc §2; phase-02 §5):
 
 Reuses collect.py's bounded-concurrency discipline, env-server setup, and the
 token inference client. Resumable per game (done/<game_id>.json).
+
+Gold-set options (plan bulletproof-warm-start, Round 0): `all_actions` branches
+every admissible action at a root, the played one included; `replays` runs each
+(root, action) several times; `game_start` skips the first games of the dataset
+order (to collect only the held-out ones).
 """
 
 from __future__ import annotations
@@ -41,7 +46,7 @@ from prime_rl.orchestrator.vf_utils import run_rollout, setup_env_client, spawn_
 from prime_rl.utils.client import setup_inference_pool
 from prime_rl.utils.config import cli
 from prime_rl.utils.logger import setup_logger
-from prime_rl.value_warmstart.allocation import pivotal_roots, stratified_roots
+from prime_rl.value_warmstart.allocation import even_roots, pivotal_roots, stratified_roots
 from prime_rl.value_warmstart.branch_records import (
     CollectStats,
     branch_example,
@@ -268,16 +273,22 @@ async def _process_root(
         await ctx.bump(_upd_root)
     node = node_cache[t]
 
-    # Stage-1 probe branches use the policy's own first choice (D-9); the tail
-    # is reached only when no own candidate survives the filters.
-    n_unif = 0 if stage == 1 else min(cfg.n_uniform, k_fan + len(exclude))
-    picks = _pick_actions(node.own, admissible, a_taken, k_fan + len(exclude), n_unif, rng)
-    picks = [(a, src) for a, src in picks if a not in exclude][:k_fan]
+    if cfg.all_actions and stage is None:
+        # Every admissible action, the played one included: the advantage rule
+        # reads all of them, so the gold set gives all of them an outcome.
+        own_set = set(node.own)
+        picks = [(a, "taken" if a == a_taken else ("own" if a in own_set else "tail")) for a in admissible]
+    else:
+        # Stage-1 probe branches use the policy's own first choice (D-9); the tail
+        # is reached only when no own candidate survives the filters.
+        n_unif = 0 if stage == 1 else min(cfg.n_uniform, k_fan + len(exclude))
+        picks = _pick_actions(node.own, admissible, a_taken, k_fan + len(exclude), n_unif, rng)
+        picks = [(a, src) for a, src in picks if a not in exclude][:k_fan]
 
     chosen_rows: list[dict] = []
     tasks = []
     for k, (a, src) in enumerate(picks):
-        if budget[0] >= cfg.max_branches_per_game:
+        if budget[0] + cfg.replays > cfg.max_branches_per_game:
             await ctx.bump(lambda s: CollectStats._bump(s.branches_skipped, "budget"))
             chosen_rows.append(
                 {"action": a, "source": src, "block_source": "none", "block_idx": None, "reasoning": None,
@@ -314,8 +325,10 @@ async def _process_root(
             s.generations_est += int(getattr(syn, "attempts", 0) or 0)
 
         await ctx.bump(_upd_acc)
-        budget[0] += 1
-        branch_id = f"{trunk_id}-t{t}-b{k}"
+        # One episode per replay: the same forced step, a fresh continuation.
+        n_rep = cfg.replays
+        budget[0] += n_rep
+        ids = [f"{trunk_id}-t{t}-b{k}" if n_rep == 1 else f"{trunk_id}-t{t}-b{k}-r{j}" for j in range(n_rep)]
         row = {
             "action": a, "source": src, "block_source": syn.source,
             "block_idx": getattr(syn, "block_idx", None), "reasoning": syn.reasoning,
@@ -323,25 +336,40 @@ async def _process_root(
             "reject_reasons": list(getattr(syn, "reject_reasons", []) or []),
             "attempt_log": list(getattr(syn, "attempt_log", None) or []),
             "strong": bool(syn.p_accept >= cfg.tau),
-            "branch_id": branch_id, "g": None,
+            "branch_id": ids[0], "g": None,
         }
+        if n_rep > 1:
+            row["branch_ids"] = ids
         chosen_rows.append(row)
-        tasks.append(
-            (
-                row,
-                _run_branch(
-                    ctx, example=example, trunk_out=trunk_out, steps=steps, t=t, action=a, source=src,
-                    syn=syn, game_id=game_id, trunk_id=trunk_id, branch_id=branch_id, stage=stage,
-                    holdout=holdout,
-                ),
+        for bid in ids:
+            tasks.append(
+                (
+                    row,
+                    _run_branch(
+                        ctx, example=example, trunk_out=trunk_out, steps=steps, t=t, action=a, source=src,
+                        syn=syn, game_id=game_id, trunk_id=trunk_id, branch_id=bid, stage=stage,
+                        holdout=holdout,
+                    ),
+                )
             )
-        )
 
     results = await asyncio.gather(*[c for _, c in tasks]) if tasks else []
+    # Per action: the mean return over the replays that ran (None when none did).
+    by_row: dict[int, list] = {}
     for (row, _), g in zip(tasks, results):
-        row["g"] = g
+        by_row.setdefault(id(row), []).append(g)
+    action_results: list[float | None] = []
+    for row in chosen_rows:
+        gs = by_row.get(id(row))
+        if gs is None:
+            continue  # skipped before any episode (budget, no congruent block)
+        ok = [g for g in gs if g is not None]
+        row["g"] = (sum(ok) / len(ok)) if ok else None
+        if cfg.replays > 1:
+            row["g_replays"] = gs
+        action_results.append(row["g"])
 
-    contrast = any(g is not None and g != G for g in results)
+    contrast = any(g is not None and g != G for g in action_results)
     if contrast:
         await ctx.bump(lambda s: setattr(s, "roots_with_contrast", s.roots_with_contrast + 1))
 
@@ -352,7 +380,7 @@ async def _process_root(
         timing=timing,
     )
     write_node_json(ctx.nodes_dir, game_id, trunk_id, t, payload)
-    return list(results)
+    return action_results
 
 
 def drop_unfinished_games(out_dir: Path, logger=None) -> dict:
@@ -386,8 +414,35 @@ def drop_unfinished_games(out_dir: Path, logger=None) -> dict:
     return result
 
 
+def slice_game_ids(inputs: list[dict], game_start: int = 0) -> list[str]:
+    """Game ids of the games this collect will play (dataset order, from game_start)."""
+    return [
+        game_id_from_file(str((ex.get("info") or {}).get("game_file", f"game{i}")))
+        for i, ex in enumerate(inputs)
+        if i >= game_start
+    ]
+
+
+def check_allowed_games(inputs: list[dict], game_start: int, allowed_ids_path: Path | None) -> None:
+    """Abort before the first rollout when the collect's slice holds a game that is
+    not in the allowed list (a JSON list, or {"game_ids": [...]} as holdout.json)."""
+    if allowed_ids_path is None:
+        return
+    raw = json.loads(Path(allowed_ids_path).read_text(encoding="utf-8"))
+    allowed = {str(g) for g in (raw.get("game_ids", []) if isinstance(raw, dict) else raw)}
+    ids = slice_game_ids(inputs, game_start)
+    outside = [g for g in ids if g not in allowed]
+    if outside:
+        raise ValueError(
+            f"{len(outside)} of the {len(ids)} game(s) of this collect are not in {allowed_ids_path} "
+            f"(first: {outside[:3]}). Check games / game_start / seed against the run that wrote the list."
+        )
+
+
 async def collect_game(ctx: _Ctx, idx: int, example: dict) -> None:
     cfg = ctx.config
+    if idx < cfg.game_start:
+        return  # outside this collect's slice of the dataset order
     game_file = str((example.get("info") or {}).get("game_file", f"game{idx}"))
     game_id = game_id_from_file(game_file)
     marker = ctx.done_dir / f"{game_id}.json"
@@ -427,8 +482,12 @@ async def collect_game(ctx: _Ctx, idx: int, example: dict) -> None:
     )
 
     # 2./3. roots and branches
-    if cfg.allocation == "stratified":
-        for t in stratified_roots(T, cfg.roots_per_trunk, cfg.early_tilt):
+    if cfg.allocation in ("stratified", "even"):
+        if cfg.allocation == "even":
+            root_turns = even_roots(T, cfg.roots_per_trunk)
+        else:
+            root_turns = stratified_roots(T, cfg.roots_per_trunk, cfg.early_tilt)
+        for t in root_turns:
             await _process_root(ctx, t=t, k_fan=cfg.branches_per_root, stage=None, exclude=set(), **common)
     else:
         cands = stratified_roots(T, cfg.stage1_roots, cfg.early_tilt)
@@ -508,7 +567,8 @@ async def branch_collect(config: BranchCollectConfig) -> None:
     logger.info(
         f"Branch collect: env={config.env.id} split={env_args.get('split')} allocation={config.allocation} "
         f"B={config.roots_per_trunk} K={config.branches_per_root} n_unif={config.n_uniform} m={config.node_blocks} "
-        f"tau={config.tau} theta={config.theta} n_elicit={config.n_elicit} -> {out_dir}"
+        f"tau={config.tau} theta={config.theta} n_elicit={config.n_elicit} "
+        f"all_actions={config.all_actions} replays={config.replays} game_start={config.game_start} -> {out_dir}"
     )
 
     env = vf.load_environment(config.env.id, **env_args)
@@ -530,7 +590,11 @@ async def branch_collect(config: BranchCollectConfig) -> None:
         dataset = env_group.get_dataset(seed=config.seed)
         n_games = config.games if config.games is not None else len(dataset)
         inputs = env._get_eval_inputs(n_games, 1)
-        logger.info(f"{len(inputs)} games | max_concurrent={config.max_concurrent} | holdout={config.holdout_games}")
+        check_allowed_games(inputs, config.game_start, config.allowed_ids_path)
+        logger.info(
+            f"{len(inputs)} games ({len(inputs) - min(config.game_start, len(inputs))} to play from index "
+            f"{config.game_start}) | max_concurrent={config.max_concurrent} | holdout={config.holdout_games}"
+        )
 
         inference_pool = await setup_inference_pool(
             config.client, model_name=config.model_name, client_type="openai_chat_completions_token"

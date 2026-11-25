@@ -54,7 +54,7 @@ class BranchRecord(msgspec.Struct, array_like=True, gc=False, omit_defaults=True
     trunk_id: str = ""
     branch_id: str | None = None
     root_turn: int | None = None
-    action_source: str | None = None  # "own" | "tail"
+    action_source: str | None = None  # "own" | "tail" | "taken" (all_actions: the played action, forced)
     block_source: str | None = None  # "sampled" | "elicited"
     p_accept: float | None = None
     allocation_stage: int | None = None
