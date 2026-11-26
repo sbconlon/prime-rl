@@ -467,6 +467,17 @@ class BranchCollectConfig(CollectConfig):
             ),
         ),
     ] = 0
+    game_end: Annotated[
+        int | None,
+        Field(
+            ge=1,
+            description=(
+                "Stop before this index of the dataset order (None = to the last game). With games=790, "
+                "game_start=740 and game_end=765 one job plays games 740..764; a second job with "
+                "game_start=765 plays the rest into its own output_dir, and merge_collects joins the two."
+            ),
+        ),
+    ] = None
     allowed_ids_path: Annotated[
         Path | None,
         Field(
@@ -474,6 +485,16 @@ class BranchCollectConfig(CollectConfig):
                 "JSON list of game ids (or {'game_ids': [...]}) this collect may play. A game of its "
                 "slice outside the list aborts the run before the first rollout. For a gold test set on "
                 "the train split: the value networks' holdout.json, so no training game can slip in."
+            )
+        ),
+    ] = None
+    denied_ids_path: Annotated[
+        Path | None,
+        Field(
+            description=(
+                "JSON list of game ids (or {'game_ids': [...]}) this collect must not play. A game of its "
+                "slice inside the list aborts the run before the first rollout. For a training collect: "
+                "the held-out games of the gold test set, so no test game can slip into the training data."
             )
         ),
     ] = None
@@ -496,6 +517,8 @@ class BranchCollectConfig(CollectConfig):
             raise ValueError("theta must be <= tau")
         if self.all_actions and self.allocation == "two_stage":
             raise ValueError("all_actions needs allocation = 'stratified' or 'even'")
+        if self.game_end is not None and self.game_end <= self.game_start:
+            raise ValueError("game_end must be > game_start")
         if self.replays_extra > 0 and not self.all_actions:
             raise ValueError("replays_extra needs all_actions (the played action must be among the forced ones)")
         if self.replays > self.max_branches_per_game:

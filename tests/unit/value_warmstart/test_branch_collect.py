@@ -555,6 +555,36 @@ def test_game_start_skips_earlier_games(tmp_path, monkeypatch):
     assert all(r.holdout for r in ctx.writer.records)
 
 
+def test_game_end_stops_the_slice(tmp_path, monkeypatch):
+    _install_fakes(monkeypatch, {})
+    cfg = _cfg(tmp_path, roots_per_trunk=1, game_start=1, game_end=2, holdout_games=0)
+    ctx = _make_ctx(tmp_path, cfg, _FakeNodeEnv(own=["go to desk 1", "open drawer 1"]), n_games=3)
+    for i in range(3):
+        asyncio.run(bc.collect_game(ctx, i, _gold_example(i)))
+    assert {r.game_id for r in ctx.writer.records} == {"pps-x__trial_1"}
+    assert sorted(p.stem for p in (tmp_path / "done").glob("*.json")) == ["pps-x__trial_1"]
+    inputs = [_gold_example(i) for i in range(4)]
+    assert bc.slice_game_ids(inputs, 1, 3) == ["pps-x__trial_1", "pps-x__trial_2"]
+    assert bc.slice_game_ids(inputs, 1, 99) == bc.slice_game_ids(inputs, 1)
+    with pytest.raises(ValueError, match="game_end"):
+        _cfg(tmp_path, game_start=2, game_end=2)
+
+
+def test_denied_games_guard(tmp_path):
+    inputs = [_gold_example(i) for i in range(4)]
+    bc.check_denied_games(inputs, 0, None)  # no list: nothing to check
+    held = tmp_path / "holdout.json"
+    held.write_text(json.dumps({"game_ids": ["pps-x__trial_3"]}))
+    with pytest.raises(ValueError, match=r"1 of the 4 game\(s\).*pps-x__trial_3"):
+        bc.check_denied_games(inputs, 0, held)
+    # the slice decides: ending before the listed game is fine
+    bc.check_denied_games(inputs, 0, held, 3)
+    # and the allowed list reads the same slice
+    with pytest.raises(ValueError, match=r"3 of the 3 game\(s\)"):
+        bc.check_allowed_games(inputs, 0, held, 3)
+    bc.check_allowed_games(inputs, 3, held, 4)
+
+
 def test_allowed_games_guard(tmp_path):
     inputs = [_gold_example(i) for i in range(4)]
     assert bc.slice_game_ids(inputs, 2) == ["pps-x__trial_2", "pps-x__trial_3"]

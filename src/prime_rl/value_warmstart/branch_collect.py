@@ -466,23 +466,35 @@ def drop_unfinished_games(out_dir: Path, logger=None) -> dict:
     return result
 
 
-def slice_game_ids(inputs: list[dict], game_start: int = 0) -> list[str]:
-    """Game ids of the games this collect will play (dataset order, from game_start)."""
+def in_slice(idx: int, game_start: int = 0, game_end: int | None = None) -> bool:
+    """Is index idx of the dataset order inside this collect's slice [game_start, game_end)?"""
+    return idx >= game_start and (game_end is None or idx < game_end)
+
+
+def slice_game_ids(inputs: list[dict], game_start: int = 0, game_end: int | None = None) -> list[str]:
+    """Game ids of the games this collect will play (dataset order, game_start up to game_end)."""
     return [
         game_id_from_file(str((ex.get("info") or {}).get("game_file", f"game{i}")))
         for i, ex in enumerate(inputs)
-        if i >= game_start
+        if in_slice(i, game_start, game_end)
     ]
 
 
-def check_allowed_games(inputs: list[dict], game_start: int, allowed_ids_path: Path | None) -> None:
+def _read_game_ids(path: Path) -> set[str]:
+    """A JSON list of game ids, or {"game_ids": [...]} as the trainer's holdout.json."""
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return {str(g) for g in (raw.get("game_ids", []) if isinstance(raw, dict) else raw)}
+
+
+def check_allowed_games(
+    inputs: list[dict], game_start: int, allowed_ids_path: Path | None, game_end: int | None = None
+) -> None:
     """Abort before the first rollout when the collect's slice holds a game that is
     not in the allowed list (a JSON list, or {"game_ids": [...]} as holdout.json)."""
     if allowed_ids_path is None:
         return
-    raw = json.loads(Path(allowed_ids_path).read_text(encoding="utf-8"))
-    allowed = {str(g) for g in (raw.get("game_ids", []) if isinstance(raw, dict) else raw)}
-    ids = slice_game_ids(inputs, game_start)
+    allowed = _read_game_ids(allowed_ids_path)
+    ids = slice_game_ids(inputs, game_start, game_end)
     outside = [g for g in ids if g not in allowed]
     if outside:
         raise ValueError(
@@ -491,9 +503,26 @@ def check_allowed_games(inputs: list[dict], game_start: int, allowed_ids_path: P
         )
 
 
+def check_denied_games(
+    inputs: list[dict], game_start: int, denied_ids_path: Path | None, game_end: int | None = None
+) -> None:
+    """Abort before the first rollout when the collect's slice holds a game of the
+    denied list (the gold test set's games, for a collect of training data)."""
+    if denied_ids_path is None:
+        return
+    denied = _read_game_ids(denied_ids_path)
+    ids = slice_game_ids(inputs, game_start, game_end)
+    inside = [g for g in ids if g in denied]
+    if inside:
+        raise ValueError(
+            f"{len(inside)} of the {len(ids)} game(s) of this collect are in {denied_ids_path} "
+            f"(first: {inside[:3]}). They are set aside for testing: move game_start / game_end off them."
+        )
+
+
 async def collect_game(ctx: _Ctx, idx: int, example: dict) -> None:
     cfg = ctx.config
-    if idx < cfg.game_start:
+    if not in_slice(idx, cfg.game_start, cfg.game_end):
         return  # outside this collect's slice of the dataset order
     game_file = str((example.get("info") or {}).get("game_file", f"game{idx}"))
     game_id = game_id_from_file(game_file)
@@ -643,10 +672,13 @@ async def branch_collect(config: BranchCollectConfig) -> None:
         dataset = env_group.get_dataset(seed=config.seed)
         n_games = config.games if config.games is not None else len(dataset)
         inputs = env._get_eval_inputs(n_games, 1)
-        check_allowed_games(inputs, config.game_start, config.allowed_ids_path)
+        check_allowed_games(inputs, config.game_start, config.allowed_ids_path, config.game_end)
+        check_denied_games(inputs, config.game_start, config.denied_ids_path, config.game_end)
+        n_play = len(slice_game_ids(inputs, config.game_start, config.game_end))
+        upto = "" if config.game_end is None else f" up to {min(config.game_end, len(inputs)) - 1}"
         logger.info(
-            f"{len(inputs)} games ({len(inputs) - min(config.game_start, len(inputs))} to play from index "
-            f"{config.game_start}) | max_concurrent={config.max_concurrent} | holdout={config.holdout_games}"
+            f"{len(inputs)} games ({n_play} to play from index {config.game_start}{upto}) | "
+            f"max_concurrent={config.max_concurrent} | holdout={config.holdout_games}"
         )
 
         inference_pool = await setup_inference_pool(

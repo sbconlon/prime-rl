@@ -48,6 +48,7 @@ from prime_rl.utils.config import BaseConfig, cli
 from prime_rl.utils.logger import setup_logger
 from prime_rl.value_warmstart.contrast_eval import _episode_return, _joint_dp
 from prime_rl.value_warmstart.dataset_io import BranchRecord, read_branch_records
+from prime_rl.value_warmstart.merge_collects import read_sources
 
 KINDS = ("fine", "beaten", "unclear")
 
@@ -340,6 +341,17 @@ def score_states(
     return rows
 
 
+def rows_by_source(rows: list[dict], source_of: dict[str, str]) -> dict[str, list[dict]]:
+    """The scored rows split by the source of their game (a merged gold set's
+    sources.json). {} when the set has no sources; a game outside the map is "other"."""
+    if not source_of:
+        return {}
+    out: dict[str, list[dict]] = defaultdict(list)
+    for r in rows:
+        out[source_of.get(r["game_id"], "other")].append(r)
+    return dict(out)
+
+
 def _rate(rows: list[dict], key: str) -> tuple[float | None, int]:
     vals = [r[key] for r in rows if r.get(key) is not None]
     return ((sum(1 for x in vals if x) / len(vals)) if vals else None), len(vals)
@@ -523,6 +535,19 @@ def push_eval(config: PushEvalConfig) -> dict:
             seed=config.seed,
         )
         payload["states"] = rows
+        by_source = rows_by_source(rows, read_sources(Path(config.dataset).parent))
+        if by_source:
+            payload["by_source"] = {
+                name: summarize(
+                    part,
+                    harm_max=config.harm_max,
+                    catch_min=config.catch_min,
+                    lift_min=config.lift_min,
+                    bootstrap=config.bootstrap,
+                    seed=config.seed,
+                )
+                for name, part in by_source.items()
+            }
         s = payload["summary"]
 
         def show(key: str) -> str:
