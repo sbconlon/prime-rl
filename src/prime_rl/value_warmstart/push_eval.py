@@ -19,7 +19,9 @@ For a value network the advantage rule is applied exactly as the Advantage Serve
 applies it (cleared regrets with a margin, anchored target, difference form), with
 the policy's probabilities taken from the node file the collect wrote. Then:
 
-* harm  -- fine states where the played action is pushed down;
+* harm  -- fine states where the played action is pushed down (reported also
+           for its two halves: "dead" states, where no labelled action ever won,
+           and "live" ones, where the played action wins and nothing beats it);
 * catch -- beaten states where the played action is pushed down;
 * lift  -- beaten states where the most-lifted action is clearly better.
 
@@ -38,7 +40,7 @@ from pathlib import Path
 from typing import Annotated, Callable, Iterable
 
 import torch
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from prime_rl.advantage_server.action_advantage import cleared_regrets, difference_advantage, tokenize_action
 from prime_rl.advantage_trainer.ckpt import load_warm_start
@@ -56,7 +58,18 @@ KINDS = ("fine", "beaten", "unclear")
 class PushEvalConfig(BaseConfig):
     """Score a value_state.pt on a gold test set, or read the set's truth alone."""
 
-    dataset: Annotated[Path, Field(description="records.msgpack of an all_actions collect.")]
+    dataset: Annotated[
+        Path | None, Field(description="records.msgpack of an all_actions collect (or use gold_dirs).")
+    ] = None
+    gold_dirs: Annotated[
+        list[Path],
+        Field(
+            description=(
+                "Collect folders of ONE gold set, read together without a merged copy: each holds "
+                "records.msgpack and nodes/. A state's source is its folder's name. Use instead of dataset."
+            )
+        ),
+    ] = []
     nodes_dir: Annotated[
         Path | None,
         Field(description="The collect's nodes/ directory (policy probabilities). None = next to the dataset."),
@@ -104,6 +117,14 @@ class PushEvalConfig(BaseConfig):
     out: Annotated[Path, Field(description="Output JSON path.")] = Path("gate/push.json")
     log: Annotated[LogConfig, Field(description="Logging configuration.")] = LogConfig()
 
+    @model_validator(mode="after")
+    def _one_input(self) -> "PushEvalConfig":
+        if (self.dataset is None) == (not self.gold_dirs):
+            raise ValueError("set exactly one of dataset and gold_dirs")
+        if self.gold_dirs and self.nodes_dir is not None:
+            raise ValueError("nodes_dir goes with dataset; each of gold_dirs has its own nodes/")
+        return self
+
 
 @dataclass
 class GoldState:
@@ -116,6 +137,7 @@ class GoldState:
     admissible: list[str]
     a_taken: str
     returns: dict[str, list[float]] = field(default_factory=dict)  # action -> one return per replay
+    source: str = ""  # the gold folder the state came from (gold_dirs), else ""
 
 
 @dataclass
@@ -208,6 +230,15 @@ def truth_of(
     if coverage >= min_coverage - 1e-12 and all(d <= fine_gap + 1e-12 for d in leads.values()):
         return Truth("fine", rt, rates, [], coverage)
     return Truth("unclear", rt, rates, [], coverage)
+
+
+def fine_kind(truth: Truth) -> str | None:
+    """The two halves of the fine states: "dead" when no labelled action ever won
+    (nothing can be learned there, a push is noise), "live" when the played action
+    wins and nothing beats it (a push down removes a good action). None otherwise."""
+    if truth.kind != "fine":
+        return None
+    return "live" if any(r > 0.0 for r in truth.rates.values()) else "dead"
 
 
 def label_noise(states: list[GoldState], *, min_replays: int = 2) -> dict:
@@ -304,6 +335,8 @@ def score_states(
             "a_taken": st.a_taken,
             "n_admissible": len(st.admissible),
             "kind": truth.kind,
+            "fine_kind": fine_kind(truth),
+            "source": st.source,
             "rate_taken": truth.rate_taken,
             "rates": truth.rates,
             "better": truth.better,
@@ -344,12 +377,42 @@ def score_states(
 def rows_by_source(rows: list[dict], source_of: dict[str, str]) -> dict[str, list[dict]]:
     """The scored rows split by the source of their game (a merged gold set's
     sources.json). {} when the set has no sources; a game outside the map is "other"."""
-    if not source_of:
+    own = any(r.get("source") for r in rows)
+    if not source_of and not own:
         return {}
     out: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
-        out[source_of.get(r["game_id"], "other")].append(r)
+        out[r.get("source") or source_of.get(r["game_id"], "other")].append(r)
     return dict(out)
+
+
+def breakdowns(rows: list[dict]) -> dict:
+    """Plain rates (no intervals) for reading where the score comes from: harm on
+    live and on dead fine states, and the three numbers turn by turn."""
+
+    def cell(part: list[dict], key: str) -> dict:
+        rate, n = _rate(part, key)
+        return {"rate": rate, "n": n}
+
+    scored = [r for r in rows if r.get("scored")]
+    out: dict = {
+        "harm_live": cell([r for r in scored if r.get("fine_kind") == "live"], "harm"),
+        "harm_dead": cell([r for r in scored if r.get("fine_kind") == "dead"], "harm"),
+        "by_turn": {},
+    }
+    for t in sorted({int(r["turn"]) for r in rows}):
+        part = [r for r in rows if int(r["turn"]) == t]
+        sc = [r for r in part if r.get("scored")]
+        out["by_turn"][str(t)] = {
+            "states": len(part),
+            "kinds": {k: sum(1 for r in part if r["kind"] == k) for k in KINDS},
+            "live": sum(1 for r in part if r.get("fine_kind") == "live"),
+            "dead": sum(1 for r in part if r.get("fine_kind") == "dead"),
+            "harm": cell(sc, "harm"),
+            "catch": cell(sc, "catch"),
+            "lift": cell(sc, "lift"),
+        }
+    return out
 
 
 def _rate(rows: list[dict], key: str) -> tuple[float | None, int]:
@@ -449,11 +512,15 @@ def build_value_fn(
     return value_fn
 
 
-def node_pi_hat_fn(nodes_dir: Path) -> Callable[[GoldState], list[float] | None]:
-    """Policy probabilities from the collect's node files: nodes/<game>/<trunk>/t<turn>.json."""
+def node_pi_hat_fn(nodes_dir: Path | dict[str, Path]) -> Callable[[GoldState], list[float] | None]:
+    """Policy probabilities from the collect's node files: nodes/<game>/<trunk>/t<turn>.json.
+    With several gold folders, a dict {source: its nodes folder}."""
 
     def fn(state: GoldState) -> list[float] | None:
-        path = Path(nodes_dir) / state.game_id / state.trunk_id / f"t{state.turn}.json"
+        base = nodes_dir.get(state.source) if isinstance(nodes_dir, dict) else nodes_dir
+        if base is None:
+            return None
+        path = Path(base) / state.game_id / state.trunk_id / f"t{state.turn}.json"
         try:
             node = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -463,13 +530,42 @@ def node_pi_hat_fn(nodes_dir: Path) -> Callable[[GoldState], list[float] | None]
     return fn
 
 
+def load_gold(config: PushEvalConfig) -> tuple[list[GoldState], Path | dict[str, Path]]:
+    """The gold states and where their node files are. With gold_dirs every state
+    carries its folder's name as source; a game found in two folders is an error."""
+    if not config.gold_dirs:
+        states = gold_states(
+            read_branch_records(config.dataset), holdout_only=config.holdout_only, include_trunk=config.include_trunk
+        )
+        nodes = config.nodes_dir if config.nodes_dir is not None else Path(config.dataset).parent / "nodes"
+        return states, nodes
+    names = [Path(d).name for d in config.gold_dirs]
+    if len(set(names)) != len(names):
+        raise ValueError(f"gold_dirs must have different folder names: {names}")
+    states: list[GoldState] = []
+    nodes_by_source: dict[str, Path] = {}
+    owner: dict[str, str] = {}
+    for d, name in zip(config.gold_dirs, names):
+        part = gold_states(
+            read_branch_records(Path(d) / "records.msgpack"),
+            holdout_only=config.holdout_only,
+            include_trunk=config.include_trunk,
+        )
+        for st in part:
+            if owner.setdefault(st.game_id, name) != name:
+                raise ValueError(f"game {st.game_id} is in both {owner[st.game_id]!r} and {name!r}")
+            st.source = name
+        states += part
+        nodes_by_source[name] = Path(d) / "nodes"
+    return states, nodes_by_source
+
+
 def push_eval(config: PushEvalConfig) -> dict:
     logger = setup_logger(config.log.level)
-    states = gold_states(
-        read_branch_records(config.dataset), holdout_only=config.holdout_only, include_trunk=config.include_trunk
-    )
+    states, nodes_dir = load_gold(config)
+    where = [str(d) for d in config.gold_dirs] or str(config.dataset)
     if not states:
-        raise ValueError(f"No gold states in {config.dataset} (holdout_only={config.holdout_only}).")
+        raise ValueError(f"No gold states in {where} (holdout_only={config.holdout_only}).")
     truth_kw = dict(
         min_replays=config.min_replays,
         clear_gap=config.clear_gap,
@@ -478,7 +574,7 @@ def push_eval(config: PushEvalConfig) -> dict:
     )
     payload: dict = {
         "schema": 1,
-        "dataset": str(config.dataset),
+        "dataset": where,
         "settings": {
             "margin": config.margin,
             "anchor": config.anchor,
@@ -489,11 +585,15 @@ def push_eval(config: PushEvalConfig) -> dict:
         "label_noise": label_noise(states, min_replays=config.min_replays),
     }
     if config.truth_only:
-        kinds = [truth_of(st, **truth_kw).kind for st in states]
+        truths = [truth_of(st, **truth_kw) for st in states]
+        kinds = [t.kind for t in truths]
+        fine_kinds = [fine_kind(t) for t in truths]
         payload["truth"] = {
             "states": len(states),
             "games": len({st.game_id for st in states}),
             "kinds": {k: kinds.count(k) for k in KINDS},
+            "fine_live": fine_kinds.count("live"),
+            "fine_dead": fine_kinds.count("dead"),
             "actions_per_state": sum(len(st.admissible) for st in states) / len(states),
             "labelled_per_state": sum(len(st.returns) for st in states) / len(states),
         }
@@ -514,7 +614,6 @@ def push_eval(config: PushEvalConfig) -> dict:
         )
         load_warm_start(backbone, config.value_state)
         tokenizer = AutoTokenizer.from_pretrained(config.model.base_model_name)
-        nodes_dir = config.nodes_dir if config.nodes_dir is not None else Path(config.dataset).parent / "nodes"
         logger.info(f"Scoring {len(states)} gold states (policy probabilities from {nodes_dir})")
         rows = score_states(
             states,
@@ -535,7 +634,9 @@ def push_eval(config: PushEvalConfig) -> dict:
             seed=config.seed,
         )
         payload["states"] = rows
-        by_source = rows_by_source(rows, read_sources(Path(config.dataset).parent))
+        payload["breakdowns"] = breakdowns(rows)
+        merged_sources = {} if config.gold_dirs else read_sources(Path(config.dataset).parent)
+        by_source = rows_by_source(rows, merged_sources)
         if by_source:
             payload["by_source"] = {
                 name: summarize(

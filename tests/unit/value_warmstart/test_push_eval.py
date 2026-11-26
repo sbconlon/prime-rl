@@ -333,3 +333,89 @@ def test_push_eval_truth_only_reads_a_records_file(tmp_path):
     assert "summary" not in payload and "states" not in payload
     with pytest.raises(ValueError, match="value_state"):
         push_eval(PushEvalConfig(dataset=path, out=out))
+
+
+def test_fine_states_split_into_live_and_dead():
+    from prime_rl.value_warmstart.push_eval import fine_kind
+
+    def state(returns, turn=1):
+        return GoldState("g", "g-t0", turn, [1], list(ADM), ADM[0], returns)
+
+    dead = truth_of(state({a: [0.0, 0.0] for a in ADM}))
+    live = truth_of(state({ADM[0]: [1.0, 1.0], ADM[1]: [1.0, 0.0], ADM[2]: [0.0, 0.0], ADM[3]: [0.0, 0.0]}))
+    beaten = truth_of(state({ADM[0]: [0.0, 0.0], ADM[1]: [1.0, 1.0], ADM[2]: [0.0, 0.0], ADM[3]: [0.0, 0.0]}))
+    assert (dead.kind, fine_kind(dead)) == ("fine", "dead")
+    assert (live.kind, fine_kind(live)) == ("fine", "live")
+    assert (beaten.kind, fine_kind(beaten)) == ("beaten", None)
+
+
+def test_breakdowns_split_harm_and_read_by_turn():
+    from prime_rl.value_warmstart.push_eval import breakdowns
+
+    def row(turn, kind, fk=None, **verdicts):
+        base = {"harm": None, "catch": None, "lift": None}
+        return {"game_id": "g", "turn": turn, "kind": kind, "fine_kind": fk, "scored": True, **base, **verdicts}
+
+    rows = [
+        row(0, "fine", "live", harm=True),
+        row(0, "fine", "live", harm=False),
+        row(2, "beaten", catch=True, lift=False),
+        row(7, "fine", "dead", harm=False),
+        row(7, "unclear"),
+        {"game_id": "g", "turn": 7, "kind": "fine", "fine_kind": "dead", "scored": False},
+    ]
+    b = breakdowns(rows)
+    assert b["harm_live"] == {"rate": 0.5, "n": 2} and b["harm_dead"] == {"rate": 0.0, "n": 1}
+    assert list(b["by_turn"]) == ["0", "2", "7"]
+    assert b["by_turn"]["2"]["catch"] == {"rate": 1.0, "n": 1} and b["by_turn"]["2"]["lift"]["rate"] == 0.0
+    t7 = b["by_turn"]["7"]
+    assert t7["states"] == 3 and t7["dead"] == 2 and t7["kinds"]["unclear"] == 1 and t7["harm"]["n"] == 1
+
+
+def test_push_eval_reads_several_gold_folders(tmp_path):
+    """Two collect folders of one gold set, read without a merged copy: every
+    state carries its folder's name, and a game in two folders is refused."""
+    from prime_rl.value_warmstart.dataset_io import RecordWriter
+    from prime_rl.value_warmstart.push_eval import PushEvalConfig, load_gold, push_eval, rows_by_source
+
+    def folder(name, game):
+        d = tmp_path / name
+        d.mkdir()
+        recs = [_trunk(game=game, reward=0.0)]
+        for idx, rewards in ((0, [0, 0]), (1, [1, 1]), (2, [0, 0]), (3, [0, 0])):
+            recs += [_branch(idx, float(x), f"{game}-b{idx}-r{j}", game=game) for j, x in enumerate(rewards)]
+        with RecordWriter(d / "records.msgpack") as w:
+            for r in recs:
+                w.write(r)
+        return d
+
+    a, b = folder("heldout", "g1"), folder("valid-unseen", "g2")
+    cfg = PushEvalConfig(gold_dirs=[a, b], truth_only=True, out=tmp_path / "truth.json")
+    states, nodes = load_gold(cfg)
+    assert [(s.game_id, s.source) for s in states] == [("g1", "heldout"), ("g2", "valid-unseen")]
+    assert nodes == {"heldout": a / "nodes", "valid-unseen": b / "nodes"}
+    payload = push_eval(cfg)
+    assert payload["truth"]["states"] == 2 and payload["truth"]["kinds"]["beaten"] == 2
+    assert payload["dataset"] == [str(a), str(b)]
+    rows = [{"game_id": "g1", "source": "heldout"}, {"game_id": "g2", "source": "valid-unseen"}]
+    assert set(rows_by_source(rows, {})) == {"heldout", "valid-unseen"}
+
+    twice = folder("again", "g1")
+    with pytest.raises(ValueError, match="g1 is in both 'heldout' and 'again'"):
+        load_gold(PushEvalConfig(gold_dirs=[a, twice], truth_only=True, out=tmp_path / "x.json"))
+    with pytest.raises(ValueError, match="exactly one"):
+        PushEvalConfig(truth_only=True, out=tmp_path / "x.json")
+    with pytest.raises(ValueError, match="exactly one"):
+        PushEvalConfig(dataset=a / "records.msgpack", gold_dirs=[b], truth_only=True, out=tmp_path / "x.json")
+
+
+def test_node_probabilities_per_source(tmp_path):
+    node = {"admissible": list(ADM), "blocks": [{"row": [1, 0, 0, 0]}, {"row": [0.5, 0.5, 0, 0], "mass": 1.0}]}
+    p = tmp_path / "b" / "nodes" / "g" / "g-t0"
+    p.mkdir(parents=True)
+    (p / "t1.json").write_text(json.dumps(node))
+    fn = node_pi_hat_fn({"b": tmp_path / "b" / "nodes"})
+    st = GoldState("g", "g-t0", 1, [1], list(ADM), ADM[0], {}, "b")
+    assert fn(st) == [0.5, 0.5, 0.0, 0.0]
+    st.source = "elsewhere"
+    assert fn(st) is None
