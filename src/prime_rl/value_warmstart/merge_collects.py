@@ -25,7 +25,7 @@ from prime_rl.configs.shared import LogConfig
 from prime_rl.utils.config import BaseConfig, cli
 from prime_rl.utils.logger import setup_logger
 from prime_rl.value_warmstart.branch_records import CollectStats
-from prime_rl.value_warmstart.dataset_io import _BRANCH_DECODER
+from prime_rl.value_warmstart.dataset_io import _BRANCH_DECODER, open_records, records_exist
 
 
 class MergeCollectsConfig(BaseConfig):
@@ -42,7 +42,7 @@ class MergeCollectsConfig(BaseConfig):
 
 def _whole_frames(path: Path):
     """(header, blob) of every complete frame; a cut-off last frame is skipped."""
-    with open(path, "rb") as f:
+    with open_records(path) as f:
         while True:
             header = f.read(4)
             if len(header) < 4:
@@ -83,7 +83,7 @@ def merge_collects(inputs: list[Path], out: Path, names: list[str] | None = None
     done: dict[str, list[str]] = {}
     owner: dict[str, str] = {}
     for name, src in zip(names, inputs):
-        if not (src / "records.msgpack").exists():
+        if not records_exist(src / "records.msgpack"):
             raise FileNotFoundError(f"no records.msgpack in {src}")
         ids = sorted(p.stem for p in (src / "done").glob("*.json")) if (src / "done").is_dir() else []
         for g in ids:

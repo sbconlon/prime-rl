@@ -15,13 +15,17 @@ Readers: read_records yields WarmStartRecords from either file kind (a
 BranchRecord's trailing fields are ignored); read_branch_records yields
 BranchRecords and promotes a legacy WarmStartRecord to a trunk-like
 BranchRecord (label_from_dp=0, root_forced=False).
+
+A records file may be packed (pack_records): the xz copy <name>.xz stands in for
+the plain file once that one is gone, and every reader here opens it the same way.
 """
 
 from __future__ import annotations
 
+import lzma
 import struct
 from pathlib import Path
-from typing import Iterator
+from typing import BinaryIO, Iterator
 
 import msgspec
 
@@ -90,8 +94,35 @@ class RecordWriter:
         self._f.flush()
 
 
+PACKED_SUFFIX = ".xz"
+
+
+def packed_path(path: Path) -> Path:
+    """Where the packed (xz) copy of a records file lives: <name>.xz."""
+    return Path(str(path) + PACKED_SUFFIX)
+
+
+def records_exist(path: Path) -> bool:
+    """True when the records file or its packed copy is there."""
+    return Path(path).exists() or packed_path(path).exists()
+
+
+def open_records(path: Path) -> BinaryIO:
+    """A records file opened for reading: the plain file when it is there, else its
+    packed copy. A path that itself ends in .xz is read as a packed file."""
+    path = Path(path)
+    if path.suffix == PACKED_SUFFIX:
+        return lzma.open(path, "rb")
+    if path.exists():
+        return open(path, "rb")
+    packed = packed_path(path)
+    if packed.exists():
+        return lzma.open(packed, "rb")
+    raise FileNotFoundError(f"no {path} and no packed copy {packed.name}")
+
+
 def _frames(path: Path) -> Iterator[bytes]:
-    with open(path, "rb") as f:
+    with open_records(path) as f:
         while True:
             header = f.read(4)
             if not header:

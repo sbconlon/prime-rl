@@ -64,7 +64,7 @@ from prime_rl.value_warmstart.branch_records import (
     write_node_json,
 )
 from prime_rl.value_warmstart.collect import keep_output
-from prime_rl.value_warmstart.dataset_io import RecordWriter, compact_records
+from prime_rl.value_warmstart.dataset_io import RecordWriter, compact_records, packed_path
 
 
 def _pick_actions(own, admissible, a_taken, k, n_unif, rng):
@@ -486,6 +486,17 @@ def _read_game_ids(path: Path) -> set[str]:
     return {str(g) for g in (raw.get("game_ids", []) if isinstance(raw, dict) else raw)}
 
 
+def check_not_packed(out_dir: Path) -> None:
+    """A folder whose records were packed is closed: a collect would start a new
+    plain file next to the packed one, and readers would then see only the new one."""
+    packed = packed_path(Path(out_dir) / "records.msgpack")
+    if packed.exists():
+        raise RuntimeError(
+            f"{packed} exists: this folder's records were packed. Unpack them (xz -dk) "
+            "or collect into a new folder."
+        )
+
+
 def check_allowed_games(
     inputs: list[dict], game_start: int, allowed_ids_path: Path | None, game_end: int | None = None
 ) -> None:
@@ -644,6 +655,7 @@ async def branch_collect(config: BranchCollectConfig) -> None:
     logger = setup_logger(config.log.level)
     out_dir = Path(config.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    check_not_packed(out_dir)
     env_args = _branch_env_args(config)
     logger.info(
         f"Branch collect: env={config.env.id} split={env_args.get('split')} allocation={config.allocation} "
