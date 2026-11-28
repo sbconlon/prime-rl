@@ -419,3 +419,183 @@ def test_node_probabilities_per_source(tmp_path):
     assert fn(st) == [0.5, 0.5, 0.0, 0.0]
     st.source = "elsewhere"
     assert fn(st) is None
+
+
+# ---------------------------------------------------------------------------
+# the task statement in the context
+# ---------------------------------------------------------------------------
+
+
+def _trunk_two_samples(game="g1"):
+    # the window drops its oldest message after turn 1: turns 0-1 are in the
+    # first sample, turns 2-3 in a second one with its own (shorter) prompt
+    return BranchRecord(
+        samples=[_sample([(ADM, 0), (ADM, 0)]), _sample([(ADM, 0), (ADM, 1)], prompt=(7, 8, 9))],
+        reward=0.0,
+        is_truncated=False,
+        game_id=game,
+        trunk_id=f"{game}-t0",
+        holdout=True,
+    )
+
+
+def _late_replays(action_idx, rewards, game="g1"):
+    # forced at turn 2, the first turn after the drop
+    return [
+        BranchRecord(
+            samples=[_sample([(ADM, 0), (ADM, 0), (ADM, action_idx)])],
+            reward=float(r),
+            is_truncated=False,
+            label_from_dp=2,
+            root_dp=2,
+            root_forced=True,
+            game_id=game,
+            trunk_id=f"{game}-t0",
+            branch_id=f"{game}-t2-b{action_idx}-r{j}",
+            root_turn=2,
+            action_source="tail",
+            holdout=True,
+        )
+        for j, r in enumerate(rewards)
+    ]
+
+
+def _two_sided_records(game="g1"):
+    recs = [_trunk_two_samples(game)]
+    for idx, rewards in ((0, [0, 0]), (1, [1, 1]), (2, [0, 0]), (3, [0, 0])):
+        recs += _replays(idx, rewards, game=game, t=1)
+        recs += _late_replays(idx, [0, 0], game=game)
+    return recs
+
+
+def test_gold_states_count_the_window_drops_before_a_turn():
+    early, late = gold_states(_two_sided_records())
+    assert (early.turn, early.window_drops) == (1, 0)
+    assert (late.turn, late.window_drops) == (2, 1)
+    # the later state's context is the second sample's
+    assert early.o_ids == [1, 2, 10, 11] and late.o_ids == [7, 8, 9]
+    rows = score_states([early, late], _values({a: 0.3 for a in ADM}), lambda st: PEAKED)
+    assert [r["task_in_context"] for r in rows] == [True, False]
+    assert [r["window_drops"] for r in rows] == [0, 1]
+    assert [(r["kind"], r["fine_kind"]) for r in rows] == [("beaten", None), ("fine", "dead")]
+
+
+def test_the_line_counts_where_the_task_is_in_the_context():
+    from prime_rl.value_warmstart.push_eval import line_verdict, rows_by_task
+
+    def row(g, in_ctx, **verdicts):
+        base = {"harm": None, "catch": None, "lift": None, "lift_weak": None}
+        kind = "fine" if "harm" in verdicts else "beaten"
+        return {"game_id": g, "kind": kind, "scored": True, "task_in_context": in_ctx, **base, **verdicts}
+
+    rows = []
+    for g in range(40):
+        # task in the context: never harms, always catches and lifts
+        rows.append(row(f"a{g}", True, harm=False))
+        rows.append(row(f"a{g}", True, catch=True, lift=True))
+        # task gone: quiet in the fine states, blind in the beaten ones
+        rows.append(row(f"a{g}", False, harm=False))
+        rows.append(row(f"a{g}", False, catch=False, lift=False))
+    split = rows_by_task(rows)
+    assert len(split["in_context"]) == 80 and len(split["gone"]) == 80
+    inc, gone = summarize(split["in_context"], seed=1), summarize(split["gone"], seed=1)
+    verdict = line_verdict(inc, gone)
+    assert verdict["basis"] == "task_in_context" and verdict["passed"] is True
+    assert verdict["catch"]["rate"] == 1.0 and verdict["lift"]["verdict"] == "PASS"
+    assert verdict["quiet"]["rate"] == 0.0 and verdict["quiet_passed"] is True
+    # all states together would fail: the blind half drags catch and lift down
+    assert summarize(rows, seed=1)["passed"] is False
+    # a pushy network after the drop fails the quiet check and nothing else
+    loud = [dict(r, harm=True) if (not r["task_in_context"] and r["kind"] == "fine") else r for r in rows]
+    s2 = rows_by_task(loud)
+    v2 = line_verdict(summarize(s2["in_context"], seed=1), summarize(s2["gone"], seed=1))
+    assert v2["passed"] is True and v2["quiet_passed"] is False
+    # a row written before the split existed counts as in the context
+    old = {k: x for k, x in rows[3].items() if k != "task_in_context"}
+    assert rows_by_task([old]) == {"in_context": [old], "gone": []}
+    # no state after a drop: the quiet check does not apply
+    none = line_verdict(inc, summarize([], seed=1))
+    assert none["quiet_passed"] is None and none["passed"] is True
+
+
+def test_push_eval_truth_only_counts_states_on_both_sides(tmp_path):
+    from prime_rl.value_warmstart.dataset_io import RecordWriter
+    from prime_rl.value_warmstart.push_eval import PushEvalConfig, push_eval
+
+    path = tmp_path / "records.msgpack"
+    with RecordWriter(path) as w:
+        for r in _two_sided_records():
+            w.write(r)
+    payload = push_eval(PushEvalConfig(dataset=path, truth_only=True, out=tmp_path / "truth.json"))
+    by = payload["truth"]["by_task"]
+    assert by["in_context"] == {
+        "states": 1,
+        "kinds": {"fine": 0, "beaten": 1, "unclear": 0},
+        "fine_live": 0,
+        "fine_dead": 0,
+    }
+    assert by["gone"] == {"states": 1, "kinds": {"fine": 1, "beaten": 0, "unclear": 0}, "fine_live": 0, "fine_dead": 1}
+
+
+def test_push_eval_scores_both_sides_and_judges_the_line_in_context(tmp_path, monkeypatch):
+    """The whole scoring path with a stub network: the payload carries the split,
+    the verdict reads the in-context side, and the after-drop side is the quiet check."""
+    import transformers
+
+    from prime_rl.value_warmstart import push_eval as pe
+    from prime_rl.value_warmstart.dataset_io import RecordWriter
+
+    gold = tmp_path / "heldout"
+    gold.mkdir()
+    with RecordWriter(gold / "records.msgpack") as w:
+        for g in ("g1", "g2", "g3"):
+            for r in _two_sided_records(g):
+                w.write(r)
+    node = {"admissible": list(ADM), "blocks": [{"row": [0.94, 0.02, 0.02, 0.02]}]}
+    for g in ("g1", "g2", "g3"):
+        d = gold / "nodes" / g / f"{g}-t0"
+        d.mkdir(parents=True)
+        for t in (1, 2):
+            (d / f"t{t}.json").write_text(json.dumps(node))
+
+    class Backbone:
+        def __init__(self, base, lora_config=None, polyak_tau=0.0):
+            pass
+
+        def to(self, **kw):
+            return self
+
+    def value_fn(o_ids, admissible):
+        # "open drawer 1" looks good everywhere: right before the drop, a wrong push after it
+        return 0.3, [0.9 if a == "open drawer 1" else 0.3 for a in admissible]
+
+    monkeypatch.setattr(pe, "ValueNetworkBackbone", Backbone)
+    monkeypatch.setattr(pe, "load_warm_start", lambda backbone, path: None)
+    monkeypatch.setattr(pe, "build_value_fn", lambda backbone, tokenizer, device: value_fn)
+    monkeypatch.setattr(transformers.AutoModel, "from_pretrained", staticmethod(lambda *a, **k: object()))
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", staticmethod(lambda *a, **k: object()))
+
+    out = tmp_path / "gate" / "push.json"
+    payload = pe.push_eval(
+        pe.PushEvalConfig(
+            gold_dirs=[gold],
+            value_state=tmp_path / "value_state.pt",
+            model={"base_model_name": "stub", "lora": {"rank": 16, "alpha": 32.0, "dropout": 0.0}},
+            bootstrap=200,
+            out=out,
+        )
+    )
+    assert json.loads(out.read_text()) == payload and payload["schema"] == 2
+    assert [r["task_in_context"] for r in payload["states"]] == [True, False] * 3
+    inc, gone = payload["by_task"]["in_context"], payload["by_task"]["gone"]
+    assert (inc["states"], gone["states"]) == (3, 3)
+    assert inc["catch"]["rate"] == 1.0 and inc["lift"]["rate"] == 1.0 and inc["harm"]["rate"] is None
+    assert gone["harm"]["rate"] == 1.0 and gone["harm"]["n"] == 3 and gone["catch"]["rate"] is None
+    verdict = payload["verdict"]
+    assert verdict["basis"] == "task_in_context"
+    assert verdict["catch"] == inc["catch"] and verdict["quiet"] == gone["harm"]
+    assert verdict["passed"] is inc["passed"] and verdict["quiet_passed"] is False
+    # the all-states summary is still there, and the per-folder split has an in-context twin
+    assert payload["summary"]["harm"]["n"] == 3 and payload["summary"]["catch"]["n"] == 3
+    assert payload["by_source"]["heldout"]["states"] == 6
+    assert payload["by_source_in_context"]["heldout"]["states"] == 3

@@ -25,6 +25,15 @@ the policy's probabilities taken from the node file the collect wrote. Then:
 * catch -- beaten states where the played action is pushed down;
 * lift  -- beaten states where the most-lifted action is clearly better.
 
+The pass line counts on the states where the task statement is still in the
+context (decided 2026-11-28). The ALFWorld window drops its oldest message first,
+and that message is the one stating the task; after the first drop neither the
+policy nor the value networks, which read the same context, can know the target.
+Those later states are scored apart: only "stays quiet" (harm) is read there. A
+state's `window_drops` is the index of the trunk sample holding its turn, because
+the trunk starts a new sample at every drop (checked against the decoded prompts
+of gold set v1: the task line is gone from exactly the samples after the first).
+
 Pure functions first (records -> states -> truth -> score); the CLI loads the
 networks and writes gate/push.json. `truth_only` skips the networks and reports the
 kinds and the label noise, which is what the pilot needs.
@@ -138,6 +147,9 @@ class GoldState:
     a_taken: str
     returns: dict[str, list[float]] = field(default_factory=dict)  # action -> one return per replay
     source: str = ""  # the gold folder the state came from (gold_dirs), else ""
+    # Window drops before this turn (the index of the trunk sample holding it).
+    # 0 = the first message, the task statement, is still in the context.
+    window_drops: int = 0
 
 
 @dataclass
@@ -188,6 +200,7 @@ def gold_states(
             o_ids=list(s.prompt_ids) + list(s.completion_ids[: dp.response_start]),
             admissible=admissible,
             a_taken=admissible[dp.executed_action_idx],
+            window_drops=next(i for i, x in enumerate(trunk.samples) if x is s),
         )
         for b in branches:
             fb = _joint_dp(b, b.root_dp)
@@ -337,6 +350,8 @@ def score_states(
             "kind": truth.kind,
             "fine_kind": fine_kind(truth),
             "source": st.source,
+            "window_drops": st.window_drops,
+            "task_in_context": st.window_drops == 0,
             "rate_taken": truth.rate_taken,
             "rates": truth.rates,
             "better": truth.better,
@@ -483,6 +498,31 @@ def summarize(
     return out
 
 
+def rows_by_task(rows: list[dict]) -> dict[str, list[dict]]:
+    """The rows split by whether the task statement is still in the context. A row
+    without the flag (written before the split existed) counts as in the context."""
+    out: dict[str, list[dict]] = {"in_context": [], "gone": []}
+    for r in rows:
+        out["in_context" if r.get("task_in_context", True) else "gone"].append(r)
+    return out
+
+
+def line_verdict(in_context: dict, gone: dict) -> dict:
+    """The pass line on two summaries (see the module docstring): the three numbers
+    count where the task is still in the context; where it is gone only harm is
+    read, as the separate "stays quiet" check against the same harm line."""
+    quiet = gone["harm"]
+    return {
+        "basis": "task_in_context",
+        "harm": in_context["harm"],
+        "catch": in_context["catch"],
+        "lift": in_context["lift"],
+        "passed": in_context["passed"],
+        "quiet": quiet,
+        "quiet_passed": None if quiet["rate"] is None else quiet["verdict"] == "PASS",
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -573,7 +613,7 @@ def push_eval(config: PushEvalConfig) -> dict:
         min_coverage=config.min_coverage,
     )
     payload: dict = {
-        "schema": 1,
+        "schema": 2,
         "dataset": where,
         "settings": {
             "margin": config.margin,
@@ -596,6 +636,22 @@ def push_eval(config: PushEvalConfig) -> dict:
             "fine_dead": fine_kinds.count("dead"),
             "actions_per_state": sum(len(st.admissible) for st in states) / len(states),
             "labelled_per_state": sum(len(st.returns) for st in states) / len(states),
+            "by_task": {
+                name: {
+                    "states": sum(1 for st in states if (st.window_drops == 0) == flag),
+                    "kinds": {
+                        k: sum(1 for st, kind in zip(states, kinds) if (st.window_drops == 0) == flag and kind == k)
+                        for k in KINDS
+                    },
+                    "fine_live": sum(
+                        1 for st, fk in zip(states, fine_kinds) if (st.window_drops == 0) == flag and fk == "live"
+                    ),
+                    "fine_dead": sum(
+                        1 for st, fk in zip(states, fine_kinds) if (st.window_drops == 0) == flag and fk == "dead"
+                    ),
+                }
+                for name, flag in (("in_context", True), ("gone", False))
+            },
         }
         logger.success(f"truth only: {payload['truth']} | label noise: {payload['label_noise']}")
     else:
@@ -635,6 +691,16 @@ def push_eval(config: PushEvalConfig) -> dict:
         )
         payload["states"] = rows
         payload["breakdowns"] = breakdowns(rows)
+        line_kw = dict(
+            harm_max=config.harm_max,
+            catch_min=config.catch_min,
+            lift_min=config.lift_min,
+            bootstrap=config.bootstrap,
+            seed=config.seed,
+        )
+        split = rows_by_task(rows)
+        payload["by_task"] = {name: summarize(part, **line_kw) for name, part in split.items()}
+        payload["verdict"] = line_verdict(payload["by_task"]["in_context"], payload["by_task"]["gone"])
         merged_sources = {} if config.gold_dirs else read_sources(Path(config.dataset).parent)
         by_source = rows_by_source(rows, merged_sources)
         if by_source:
@@ -649,7 +715,12 @@ def push_eval(config: PushEvalConfig) -> dict:
                 )
                 for name, part in by_source.items()
             }
-        s = payload["summary"]
+            payload["by_source_in_context"] = {
+                name: summarize([r for r in part if r.get("task_in_context", True)], **line_kw)
+                for name, part in by_source.items()
+            }
+        s = payload["by_task"]["in_context"]
+        quiet = payload["verdict"]["quiet"]
 
         def show(key: str) -> str:
             d = s[key]
@@ -659,9 +730,15 @@ def push_eval(config: PushEvalConfig) -> dict:
             band = f" [{ci[0]:.3f}, {ci[1]:.3f}]" if ci else ""
             return f"{key} {d['rate']:.3f}{band} (n={d['n']}, {d['verdict']})"
 
+        quiet_txt = "n/a" if quiet["rate"] is None else f"{quiet['rate']:.3f} (n={quiet['n']}, {quiet['verdict']})"
         logger.success(
-            f"push score: {show('harm')} | {show('catch')} | {show('lift')} | kinds {s['kinds']} | "
-            f"passed={s['passed']} -> {config.out}"
+            f"push score, task in context: {show('harm')} | {show('catch')} | {show('lift')} | kinds {s['kinds']} | "
+            f"passed={s['passed']} | task gone, harm {quiet_txt} | all states: "
+            + ", ".join(
+                f"{k} n/a" if payload["summary"][k]["rate"] is None else f"{k} {payload['summary'][k]['rate']:.3f}"
+                for k in ("harm", "catch", "lift")
+            )
+            + f" -> {config.out}"
         )
     Path(config.out).parent.mkdir(parents=True, exist_ok=True)
     with open(config.out, "w") as f:
